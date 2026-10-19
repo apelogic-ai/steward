@@ -8,7 +8,7 @@ use std::time::Duration;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
@@ -16,8 +16,8 @@ use steward_admission::{
     add_budget_amount, envelope_is_within, evaluate, validate_envelope, validate_user_envelope,
 };
 use steward_types::direct_package::{
-    BrowserTaskEvidence, DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES,
-    SOURCE_PROVENANCE_CONTRACT_VERSION, SourceProvenance, TaskOrigin,
+    BoundedText, BrowserTaskEvidence, DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES,
+    SOURCE_PROVENANCE_CONTRACT_VERSION, Slug, SourceProvenance, TaskOrigin,
 };
 use steward_types::task_output_archive::TASK_OUTPUT_ARCHIVE_CONTRACT;
 use steward_types::{
@@ -888,6 +888,20 @@ mod migration_tests {
                 migration.version == 74 && migration.description.contains("personal agents")
             }),
             "migration 74 must add owner-scoped personal agents, turns, inbox messages, and durable events without rewriting existing rows"
+        );
+    }
+
+    #[test]
+    fn personal_agent_claim_attempts_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 75
+                    && migration
+                        .description
+                        .contains("personal agent claim attempts")
+            }),
+            "migration 75 must add a bounded claim counter without rewriting existing turns"
         );
     }
 }
@@ -11416,7 +11430,7 @@ impl PgStore {
     ) -> Result<PersonalAgentRecord, StoreError> {
         if request.name.trim() != request.name
             || request.name.is_empty()
-            || request.name.len() > limits.max_name_bytes
+            || request.name.chars().count() > limits.max_name_characters
             || request.agent_ref.trim() != request.agent_ref
             || request.agent_ref.is_empty()
             || request.agent_ref.len() > 255
@@ -11458,6 +11472,8 @@ impl PgStore {
             (None, [only]) => only.clone(),
             (None, _) => return Err(StoreError::PersonalAgentModelRequired),
         };
+        Slug::parse(model.provider.clone()).map_err(|_| StoreError::InvalidPersonalAgent)?;
+        BoundedText::parse(model.model.clone()).map_err(|_| StoreError::InvalidPersonalAgent)?;
         let row = sqlx::query(
             "INSERT INTO personal_agents \
              (id, owner_user_id, name, agent_ref, instructions, model_provider, model_name, \
@@ -11559,6 +11575,111 @@ impl PgStore {
         Ok(Some(turns))
     }
 
+    pub async fn personal_agent_thread_snapshot(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        agent_id: Uuid,
+    ) -> Result<Option<PersonalAgentThreadSnapshot>, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let owned = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM personal_agents WHERE id = $1 AND owner_user_id = $2",
+        )
+        .bind(agent_id)
+        .bind(owner_user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if owned.is_none() {
+            return Ok(None);
+        }
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM personal_agent_turns WHERE agent_id = $1 \
+             ORDER BY created_at, id",
+        )
+        .bind(agent_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let mut turns = Vec::with_capacity(ids.len());
+        for turn_id in ids {
+            turns.push(personal_agent_turn_in_transaction(&mut transaction, turn_id).await?);
+        }
+        let event_sequence = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(max(seq), 0)::bigint FROM personal_agent_turn_events \
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(Some(PersonalAgentThreadSnapshot {
+            event_sequence,
+            turns,
+        }))
+    }
+
+    pub async fn personal_agent_events_after(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        agent_id: Uuid,
+        after_sequence: i64,
+    ) -> Result<Option<Vec<PersonalAgentEventRecord>>, StoreError> {
+        if after_sequence < 0 {
+            return Err(StoreError::InvalidPersonalAgent);
+        }
+        let owned = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM personal_agents WHERE id = $1 AND owner_user_id = $2",
+        )
+        .bind(agent_id)
+        .bind(owner_user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if owned.is_none() {
+            return Ok(None);
+        }
+        let events = sqlx::query(
+            "SELECT seq, payload FROM personal_agent_turn_events \
+             WHERE agent_id = $1 AND seq > $2 ORDER BY seq",
+        )
+        .bind(agent_id)
+        .bind(after_sequence)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            let seq = row.try_get("seq").map_err(database_error)?;
+            let payload = row
+                .try_get::<Json<serde_json::Value>, _>("payload")
+                .map_err(database_error)?
+                .0;
+            let turn =
+                serde_json::from_value(payload).map_err(|_| StoreError::InvalidPersonalAgent)?;
+            Ok(PersonalAgentEventRecord { seq, turn })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(Some(events))
+    }
+
+    pub async fn personal_agent_event_listener(
+        &self,
+    ) -> Result<PersonalAgentEventListener, StoreError> {
+        let mut listener = PgListener::connect_with(&self.pool)
+            .await
+            .map_err(database_error)?;
+        listener
+            .listen("steward_personal_agent_turn_events")
+            .await
+            .map_err(database_error)?;
+        Ok(PersonalAgentEventListener { listener })
+    }
+
     pub async fn post_personal_agent_message(
         &self,
         owner_user_id: &CanonicalUserId,
@@ -11646,7 +11767,7 @@ impl PgStore {
         .map_err(database_error)?;
         let queued_bytes = queued_messages.iter().map(String::len).sum::<usize>();
         if queued_bytes.saturating_add(content.len()) > limits.max_queued_bytes {
-            return Err(StoreError::PersonalAgentConversationTooLarge);
+            return Err(StoreError::PersonalAgentMessageQueueFull);
         }
         queued_messages.push(content.to_owned());
         if personal_agent_prompt_from_strings(
@@ -11683,99 +11804,119 @@ impl PgStore {
 
     pub async fn claim_personal_agent_turn(
         &self,
-        worker: &str,
+        lease_id: &str,
         lease_seconds: i64,
         recent_turn_limit: i64,
+        max_claims_per_turn: i32,
+        excluded_turn_ids: &[Uuid],
     ) -> Result<Option<PersonalAgentDispatchRecord>, StoreError> {
-        if worker.is_empty() || lease_seconds <= 0 || recent_turn_limit <= 0 {
+        if lease_id.is_empty()
+            || lease_seconds <= 0
+            || recent_turn_limit <= 0
+            || max_claims_per_turn <= 0
+        {
             return Err(StoreError::InvalidPersonalAgent);
         }
+        loop {
+            let mut transaction = self.pool.begin().await.map_err(database_error)?;
+            let candidate = sqlx::query_as::<_, (Uuid, i32)>(
+                "SELECT turns.id, turns.claim_attempts FROM personal_agent_turns turns \
+                 WHERE NOT (turns.id = ANY($1)) AND turns.not_before <= now() AND ( \
+                    (turns.status = 'running' AND (turns.lease_expires_at IS NULL \
+                                                   OR turns.lease_expires_at <= now())) \
+                    OR (turns.status = 'queued' AND NOT EXISTS ( \
+                        SELECT 1 FROM personal_agent_turns active \
+                        WHERE active.agent_id = turns.agent_id AND active.status = 'running' \
+                    ))) \
+                 ORDER BY CASE WHEN turns.status = 'running' THEN 0 ELSE 1 END, \
+                          turns.created_at, turns.id \
+                 FOR UPDATE OF turns SKIP LOCKED LIMIT 1",
+            )
+            .bind(excluded_turn_ids.to_vec())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            let Some((turn_id, claim_attempts)) = candidate else {
+                transaction.commit().await.map_err(database_error)?;
+                return Ok(None);
+            };
+            if claim_attempts >= max_claims_per_turn {
+                let agent_id = sqlx::query_scalar::<_, Uuid>(
+                    "UPDATE personal_agent_turns \
+                     SET status = 'failed', \
+                         failure_reason = 'This turn stopped unexpectedly too many times. Try again.', \
+                         completed_at = now(), lease_owner = NULL, lease_expires_at = NULL \
+                     WHERE id = $1 RETURNING agent_id",
+                )
+                .bind(turn_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                let turn = personal_agent_turn_in_transaction(&mut transaction, turn_id).await?;
+                append_personal_agent_turn_event(&mut transaction, agent_id, &turn).await?;
+                transaction.commit().await.map_err(database_error)?;
+                continue;
+            }
+            let agent_id = sqlx::query_scalar::<_, Uuid>(
+                "UPDATE personal_agent_turns \
+                 SET status = 'running', started_at = COALESCE(started_at, now()), \
+                     claim_attempts = claim_attempts + 1, lease_owner = $2, \
+                     lease_expires_at = now() + make_interval(secs => $3), \
+                     not_before = now() \
+                 WHERE id = $1 RETURNING agent_id",
+            )
+            .bind(turn_id)
+            .bind(lease_id)
+            .bind(lease_seconds as f64)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            let turn = personal_agent_turn_in_transaction(&mut transaction, turn_id).await?;
+            append_personal_agent_turn_event(&mut transaction, agent_id, &turn).await?;
+            match personal_agent_dispatch_in_transaction(
+                &mut transaction,
+                agent_id,
+                turn_id,
+                turn,
+                recent_turn_limit,
+            )
+            .await
+            {
+                Ok(dispatch) => {
+                    transaction.commit().await.map_err(database_error)?;
+                    return Ok(Some(dispatch));
+                }
+                Err(error) => {
+                    transaction.rollback().await.map_err(database_error)?;
+                    eprintln!(
+                        "personal agent turn context could not be read; turn_id={turn_id}: {error}"
+                    );
+                    self.fail_unreadable_personal_agent_turn(turn_id).await?;
+                }
+            }
+        }
+    }
+
+    async fn fail_unreadable_personal_agent_turn(&self, turn_id: Uuid) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let candidate = sqlx::query_scalar::<_, Uuid>(
-            "SELECT turns.id FROM personal_agent_turns turns \
-             WHERE (turns.status = 'running' AND turns.lease_expires_at <= now()) \
-                OR (turns.status = 'queued' AND NOT EXISTS ( \
-                    SELECT 1 FROM personal_agent_turns active \
-                    WHERE active.agent_id = turns.agent_id AND active.status = 'running' \
-                )) \
-             ORDER BY CASE WHEN turns.status = 'running' THEN 0 ELSE 1 END, \
-                      turns.created_at, turns.id \
-             FOR UPDATE OF turns SKIP LOCKED LIMIT 1",
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE personal_agent_turns \
+             SET status = 'failed', started_at = COALESCE(started_at, now()), \
+                 failure_reason = 'This agent''s settings couldn''t be read.', \
+                 completed_at = now(), lease_owner = NULL, lease_expires_at = NULL \
+             WHERE id = $1 AND (status = 'queued' OR ( \
+                 status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= now()))) \
+             RETURNING agent_id",
         )
+        .bind(turn_id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let Some(turn_id) = candidate else {
-            transaction.commit().await.map_err(database_error)?;
-            return Ok(None);
-        };
-        let agent_id = sqlx::query_scalar::<_, Uuid>(
-            "UPDATE personal_agent_turns \
-             SET status = 'running', started_at = COALESCE(started_at, now()), \
-                 lease_owner = $2, \
-                 lease_expires_at = now() + make_interval(secs => $3), \
-                 dispatch_attempts = dispatch_attempts + 1 \
-             WHERE id = $1 RETURNING agent_id",
-        )
-        .bind(turn_id)
-        .bind(worker)
-        .bind(lease_seconds as f64)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let turn = personal_agent_turn_in_transaction(&mut transaction, turn_id).await?;
-        append_personal_agent_turn_event(&mut transaction, agent_id, &turn).await?;
-        transaction.commit().await.map_err(database_error)?;
-
-        let row = sqlx::query(
-            "SELECT agents.id, agents.name, agents.agent_ref, agents.instructions, \
-                    agents.model_provider, agents.model_name, agents.envelope_request_id, \
-                    agents.owner_user_id, users.display_email, \
-               to_char(agents.created_at AT TIME ZONE 'UTC', \
-                       'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
-               to_char(agents.updated_at AT TIME ZONE 'UTC', \
-                       'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
-             FROM personal_agents agents \
-             JOIN canonical_users users ON users.user_id = agents.owner_user_id \
-             WHERE agents.id = $1",
-        )
-        .bind(agent_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(database_error)?;
-        let owner_user_id = CanonicalUserId::parse(
-            row.try_get::<String, _>("owner_user_id")
-                .map_err(database_error)?,
-        )
-        .map_err(|_| StoreError::InvalidPersonalAgent)?;
-        let owner_display_email = Email(row.try_get("display_email").map_err(database_error)?);
-        let agent = personal_agent_record(row)?;
-        let envelope_request = self
-            .envelope_request(&owner_user_id, agent.envelope_request_id)
-            .await?;
-        let recent_ids = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM personal_agent_turns \
-             WHERE agent_id = $1 AND status = 'done' AND id <> $2 \
-             ORDER BY created_at DESC, id DESC LIMIT $3",
-        )
-        .bind(agent_id)
-        .bind(turn_id)
-        .bind(recent_turn_limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(database_error)?;
-        let mut recent_turns = Vec::with_capacity(recent_ids.len());
-        for recent_id in recent_ids.into_iter().rev() {
-            recent_turns.push(personal_agent_turn_from_pool(&self.pool, recent_id).await?);
+        if let Some(agent_id) = agent_id {
+            let turn = personal_agent_turn_in_transaction(&mut transaction, turn_id).await?;
+            append_personal_agent_turn_event(&mut transaction, agent_id, &turn).await?;
         }
-        Ok(Some(PersonalAgentDispatchRecord {
-            agent,
-            owner_user_id,
-            owner_display_email,
-            turn,
-            recent_turns,
-            envelope_request,
-        }))
+        transaction.commit().await.map_err(database_error)
     }
 
     pub async fn attach_personal_agent_task(
@@ -11834,23 +11975,39 @@ impl PgStore {
     pub async fn retry_personal_agent_turn(
         &self,
         turn_id: Uuid,
-        worker: &str,
+        lease_id: &str,
+        delay_seconds: i64,
+        max_attempts: i32,
     ) -> Result<(), StoreError> {
-        let affected = sqlx::query(
-            "UPDATE personal_agent_turns SET lease_expires_at = now() \
-             WHERE id = $1 AND status = 'running' AND lease_owner = $2",
+        if delay_seconds <= 0 || max_attempts <= 0 {
+            return Err(StoreError::InvalidPersonalAgent);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query(
+            "UPDATE personal_agent_turns \
+             SET dispatch_attempts = dispatch_attempts + 1, \
+                 status = CASE WHEN dispatch_attempts + 1 >= $4 THEN 'failed' ELSE status END, \
+                 failure_reason = CASE WHEN dispatch_attempts + 1 >= $4 \
+                    THEN 'This turn could not start after several attempts. Try again.' \
+                    ELSE NULL END, \
+                 completed_at = CASE WHEN dispatch_attempts + 1 >= $4 THEN now() ELSE NULL END, \
+                 not_before = now() + make_interval(secs => $3), \
+                 lease_owner = NULL, lease_expires_at = NULL \
+             WHERE id = $1 AND status = 'running' AND lease_owner = $2 AND task_uid IS NULL \
+             RETURNING agent_id",
         )
         .bind(turn_id)
-        .bind(worker)
-        .execute(&self.pool)
+        .bind(lease_id)
+        .bind(delay_seconds as f64)
+        .bind(max_attempts)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?
-        .rows_affected();
-        if affected == 1 {
-            Ok(())
-        } else {
-            Err(StoreError::PersonalAgentLeaseLost)
-        }
+        .ok_or(StoreError::PersonalAgentLeaseLost)?;
+        let agent_id = row.try_get("agent_id").map_err(database_error)?;
+        let turn = personal_agent_turn_in_transaction(&mut transaction, turn_id).await?;
+        append_personal_agent_turn_event(&mut transaction, agent_id, &turn).await?;
+        transaction.commit().await.map_err(database_error)
     }
 
     pub async fn complete_personal_agent_turn(
@@ -11860,7 +12017,7 @@ impl PgStore {
         reply: &str,
         max_reply_bytes: usize,
     ) -> Result<(), StoreError> {
-        if reply.is_empty() {
+        if reply.is_empty() || reply.contains('\0') {
             return Err(StoreError::InvalidPersonalAgentMessage);
         }
         if reply.len() > max_reply_bytes {
@@ -11876,7 +12033,10 @@ impl PgStore {
         worker: &str,
         failure_reason: &str,
     ) -> Result<(), StoreError> {
-        if failure_reason.is_empty() || failure_reason.chars().count() > 500 {
+        if failure_reason.is_empty()
+            || failure_reason.contains('\0')
+            || failure_reason.chars().count() > 500
+        {
             return Err(StoreError::InvalidPersonalAgentMessage);
         }
         self.finish_personal_agent_turn(turn_id, worker, None, Some(failure_reason))
@@ -11927,6 +12087,73 @@ fn personal_agent_record(row: sqlx::postgres::PgRow) -> Result<PersonalAgentReco
         envelope_request_id: row.try_get("envelope_request_id").map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
         updated_at: row.try_get("updated_at").map_err(database_error)?,
+    })
+}
+
+async fn personal_agent_dispatch_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    agent_id: Uuid,
+    turn_id: Uuid,
+    turn: PersonalAgentTurnRecord,
+    recent_turn_limit: i64,
+) -> Result<PersonalAgentDispatchRecord, StoreError> {
+    let row = sqlx::query(
+        "SELECT agents.id, agents.name, agents.agent_ref, agents.instructions, \
+                agents.model_provider, agents.model_name, agents.envelope_request_id, \
+                agents.owner_user_id, users.display_email, \
+           to_char(agents.created_at AT TIME ZONE 'UTC', \
+                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+           to_char(agents.updated_at AT TIME ZONE 'UTC', \
+                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+         FROM personal_agents agents \
+         JOIN canonical_users users ON users.user_id = agents.owner_user_id \
+         WHERE agents.id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let owner_user_id = CanonicalUserId::parse(
+        row.try_get::<String, _>("owner_user_id")
+            .map_err(database_error)?,
+    )
+    .map_err(|_| StoreError::InvalidPersonalAgent)?;
+    let owner_display_email = Email(row.try_get("display_email").map_err(database_error)?);
+    let agent = personal_agent_record(row)?;
+    let mut envelope_statement = QueryBuilder::<Postgres>::new(ENVELOPE_REQUEST_COLUMNS);
+    envelope_statement.push("WHERE requests.owner_user_id = ");
+    envelope_statement.push_bind(owner_user_id.as_str());
+    envelope_statement.push(" AND requests.id = ");
+    envelope_statement.push_bind(agent.envelope_request_id);
+    let envelope_request = envelope_statement
+        .build()
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?
+        .map(envelope_request_record)
+        .transpose()?;
+    let recent_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM personal_agent_turns \
+         WHERE agent_id = $1 AND status = 'done' AND id <> $2 \
+         ORDER BY created_at DESC, id DESC LIMIT $3",
+    )
+    .bind(agent_id)
+    .bind(turn_id)
+    .bind(recent_turn_limit)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let mut recent_turns = Vec::with_capacity(recent_ids.len());
+    for recent_id in recent_ids.into_iter().rev() {
+        recent_turns.push(personal_agent_turn_in_transaction(transaction, recent_id).await?);
+    }
+    Ok(PersonalAgentDispatchRecord {
+        agent,
+        owner_user_id,
+        owner_display_email,
+        turn,
+        recent_turns,
+        envelope_request,
     })
 }
 
@@ -12355,6 +12582,34 @@ pub struct PersonalAgentMessageResult {
     pub duplicate: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersonalAgentThreadSnapshot {
+    pub event_sequence: i64,
+    pub turns: Vec<PersonalAgentTurnRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersonalAgentEventRecord {
+    pub seq: i64,
+    pub turn: PersonalAgentTurnRecord,
+}
+
+pub struct PersonalAgentEventListener {
+    listener: PgListener,
+}
+
+impl PersonalAgentEventListener {
+    pub async fn recv_sequence(&mut self) -> Result<i64, StoreError> {
+        let notification = self.listener.recv().await.map_err(database_error)?;
+        notification
+            .payload()
+            .parse::<i64>()
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or(StoreError::InvalidPersonalAgent)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PersonalAgentDispatchRecord {
     pub agent: PersonalAgentRecord,
@@ -12377,7 +12632,7 @@ pub struct CreatePersonalAgentRequest<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersonalAgentLimits {
-    pub max_name_bytes: usize,
+    pub max_name_characters: usize,
     pub max_instructions_bytes: usize,
     pub max_message_bytes: usize,
     pub max_queued_bytes: usize,
@@ -14217,6 +14472,7 @@ pub enum StoreError {
     PersonalAgentModelRequired,
     PersonalAgentModelUnavailable,
     PersonalAgentMessageConflict,
+    PersonalAgentMessageQueueFull,
     PersonalAgentConversationTooLarge,
     PersonalAgentReplyTooLarge,
     PersonalAgentLeaseLost,
@@ -14440,6 +14696,9 @@ impl fmt::Display for StoreError {
                     formatter,
                     "personal agent message idempotency key conflicts"
                 )
+            }
+            Self::PersonalAgentMessageQueueFull => {
+                write!(formatter, "personal agent message queue is full")
             }
             Self::PersonalAgentConversationTooLarge => {
                 write!(formatter, "personal agent conversation is too large")

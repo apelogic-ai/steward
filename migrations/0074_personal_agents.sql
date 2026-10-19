@@ -29,6 +29,7 @@ CREATE TABLE personal_agent_turns (
     ),
     lease_owner text,
     lease_expires_at timestamptz,
+    not_before timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now(),
     started_at timestamptz,
     completed_at timestamptz,
@@ -50,7 +51,7 @@ CREATE UNIQUE INDEX personal_agent_one_running_turn
 CREATE INDEX personal_agent_turns_thread
     ON personal_agent_turns (agent_id, created_at, id);
 CREATE INDEX personal_agent_turns_dispatch
-    ON personal_agent_turns (status, lease_expires_at, created_at, id);
+    ON personal_agent_turns (status, not_before, lease_expires_at, created_at, id);
 
 CREATE TABLE personal_agent_messages (
     id uuid PRIMARY KEY,

@@ -505,7 +505,10 @@ spec:
             - { name: STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS, value: {{ .Values.config.apiserver.personalAgents.pollIntervalSeconds | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS, value: {{ .Values.config.apiserver.personalAgents.maxConcurrentTurns | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS, value: {{ .Values.config.apiserver.personalAgents.maxTransientAttempts | int64 | quote }} }
-            - { name: STEWARD_PERSONAL_AGENT_MAX_NAME_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxNameBytes | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS, value: {{ .Values.config.apiserver.personalAgents.retryBackoffSeconds | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN, value: {{ .Values.config.apiserver.personalAgents.maxClaimsPerTurn | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS, value: {{ .Values.config.apiserver.personalAgents.monitoringGraceSeconds | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_NAME_CHARACTERS, value: {{ .Values.config.apiserver.personalAgents.maxNameCharacters | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_MAX_INSTRUCTIONS_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxInstructionsBytes | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_MAX_MESSAGE_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxMessageBytes | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_MAX_QUEUED_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxQueuedBytes | int64 | quote }} }

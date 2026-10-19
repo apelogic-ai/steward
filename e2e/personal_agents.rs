@@ -17,12 +17,15 @@ use steward_apiserver::browser_auth::{
     BrowserOidcProvider, BrowserPrincipal, BrowserRole, GoogleOidcConfig,
     VerifiedOrganizationClaims, browser_auth_router,
 };
-use steward_apiserver::personal_agents::{PersonalAgentConfig, protected_router, spawn_dispatcher};
+use steward_apiserver::personal_agents::{
+    PersonalAgentConfig, PersonalAgentDispatchSettings, protected_router, spawn_dispatcher,
+};
 use steward_store::{
     CreatePersonalAgentRequest, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
     EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, PersonalAgentLimits,
     PersonalAgentTurnStatus, PgStore, StoreError,
 };
+use steward_types::task_output_archive::TASK_OUTPUT_ARCHIVE_CONTRACT;
 use steward_types::{
     Budget, CanonicalUserId, Duration, Email, GOOGLE_ORGANIZATION_ISSUER, ModelRef, OrganizationId,
     OrganizationIdentity, OrganizationIdentityPolicy, RunnerRequirements, ToolGrant,
@@ -41,8 +44,20 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
     let store = PgStore::new(pool.clone());
     store.migrate().await?;
     let limits = test_limits();
-    let dispatcher_config =
-        PersonalAgentConfig::new(8, 5, 1, 2, 3, limits).map_err(io::Error::other)?;
+    let dispatcher_config = PersonalAgentConfig::new(
+        PersonalAgentDispatchSettings {
+            recent_turn_limit: 8,
+            lease_seconds: 5,
+            poll_interval_seconds: 1,
+            max_concurrent_turns: 2,
+            max_transient_attempts: 3,
+            retry_backoff_seconds: 1,
+            max_claims_per_turn: 3,
+            monitoring_grace_seconds: 1,
+        },
+        limits,
+    )
+    .map_err(io::Error::other)?;
     let cascading_history_links = sqlx::query_scalar::<_, i64>(
         "SELECT count(*)::bigint FROM pg_constraint \
          WHERE contype = 'f' AND confdeltype <> 'r' \
@@ -58,6 +73,8 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
     let suffix = Uuid::new_v4().simple().to_string();
     let alice = register_user(&store, "alice", &suffix).await?;
     let bob = register_user(&store, "bob", &suffix).await?;
+    let carol = register_user(&store, "carol", &suffix).await?;
+    let dave = register_user(&store, "dave", &suffix).await?;
     let envelope = provision_envelope(&store, &alice, &suffix).await?;
     let inactive_envelope = reserve_envelope(&store, &alice, &format!("inactive-{suffix}")).await?;
 
@@ -114,6 +131,50 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         )
         .await?;
     assert_eq!(agent.model, test_envelope().spec.llms[0]);
+    let unicode_name = store
+        .create_personal_agent(
+            CreatePersonalAgentRequest {
+                id: Uuid::new_v4(),
+                owner_user_id: &alice,
+                name: "éééé",
+                agent_ref: "example-agent@1",
+                instructions: "Reply briefly.",
+                model: None,
+                envelope_request_id: envelope,
+            },
+            PersonalAgentLimits {
+                max_name_characters: 4,
+                ..limits
+            },
+        )
+        .await?;
+    assert_eq!(unicode_name.name, "éééé");
+    let mut invalid_model_envelope = test_envelope();
+    invalid_model_envelope.spec.llms[0].provider = "not a valid provider".to_owned();
+    let invalid_model_request = provision_envelope_with(
+        &store,
+        &alice,
+        &format!("invalid-model-{suffix}"),
+        &invalid_model_envelope,
+    )
+    .await?;
+    assert!(matches!(
+        store
+            .create_personal_agent(
+                CreatePersonalAgentRequest {
+                    id: Uuid::new_v4(),
+                    owner_user_id: &alice,
+                    name: "Invalid model",
+                    agent_ref: "example-agent@1",
+                    instructions: "Reply briefly.",
+                    model: None,
+                    envelope_request_id: invalid_model_request,
+                },
+                limits,
+            )
+            .await,
+        Err(StoreError::InvalidPersonalAgent)
+    ));
     let mut multiple_models = test_envelope();
     multiple_models.spec.llms.push(ModelRef {
         provider: "future-provider".to_owned(),
@@ -201,6 +262,363 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         Err(StoreError::PersonalAgentConversationTooLarge)
     ));
 
+    let retry_turn = store
+        .post_personal_agent_message(
+            &alice,
+            unicode_name.id,
+            Uuid::new_v4(),
+            "Retry this turn",
+            "retry-message",
+            limits,
+        )
+        .await?;
+    let retry_claim = store
+        .claim_personal_agent_turn("retry-a", 5, 8, 10, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("retry fixture was not claimable"))?;
+    assert_eq!(retry_claim.turn.id, retry_turn.turn.id);
+    assert_eq!(retry_claim.turn.dispatch_attempts, 0);
+    store
+        .retry_personal_agent_turn(retry_claim.turn.id, "retry-a", 5, 3)
+        .await?;
+    assert!(
+        store
+            .claim_personal_agent_turn("retry-too-early", 5, 8, 10, &[])
+            .await?
+            .is_none(),
+        "a failed start must wait for its backoff"
+    );
+    sqlx::query("UPDATE personal_agent_turns SET not_before = now() WHERE id = $1")
+        .bind(retry_claim.turn.id)
+        .execute(&pool)
+        .await?;
+    let retry_claim = store
+        .claim_personal_agent_turn("retry-b", 5, 8, 10, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("backoff turn was not reclaimable"))?;
+    assert_eq!(retry_claim.turn.dispatch_attempts, 1);
+    store
+        .fail_personal_agent_turn(
+            retry_claim.turn.id,
+            "retry-b",
+            "This retry fixture is finished.",
+        )
+        .await?;
+
+    let queue_limits = PersonalAgentLimits {
+        max_message_bytes: 10,
+        max_queued_bytes: 10,
+        ..limits
+    };
+    store
+        .post_personal_agent_message(
+            &alice,
+            selected_agent.id,
+            Uuid::new_v4(),
+            "123456",
+            "queue-message-1",
+            queue_limits,
+        )
+        .await?;
+    assert!(matches!(
+        store
+            .post_personal_agent_message(
+                &alice,
+                selected_agent.id,
+                Uuid::new_v4(),
+                "abcdef",
+                "queue-message-2",
+                queue_limits,
+            )
+            .await,
+        Err(StoreError::PersonalAgentMessageQueueFull)
+    ));
+    let queue_claim = store
+        .claim_personal_agent_turn("queue-cleanup", 5, 8, 10, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("queue fixture was not claimable"))?;
+    store
+        .fail_personal_agent_turn(
+            queue_claim.turn.id,
+            "queue-cleanup",
+            "This queue fixture is finished.",
+        )
+        .await?;
+
+    let poison_envelope = provision_envelope(&store, &carol, &format!("poison-{suffix}")).await?;
+    let poison_agent = store
+        .create_personal_agent(
+            CreatePersonalAgentRequest {
+                id: Uuid::new_v4(),
+                owner_user_id: &carol,
+                name: "Unreadable settings",
+                agent_ref: "example-agent@1",
+                instructions: "Reply briefly.",
+                model: None,
+                envelope_request_id: poison_envelope,
+            },
+            limits,
+        )
+        .await?;
+    let poison_turn = store
+        .post_personal_agent_message(
+            &carol,
+            poison_agent.id,
+            Uuid::new_v4(),
+            "Read these settings",
+            "poison-message",
+            limits,
+        )
+        .await?;
+    sqlx::query(
+        "INSERT INTO envelope_request_events \
+         (request_id, status, approval_id, envelope_instance_id, envelope_digest, \
+          approved_envelope, actor, template_revision) \
+         SELECT request_id, status, approval_id, envelope_instance_id, envelope_digest, \
+                '{}'::jsonb, 'test-bootstrap', template_revision \
+         FROM envelope_request_events WHERE request_id = $1 \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(poison_envelope)
+    .execute(&pool)
+    .await?;
+    let healthy_turn = store
+        .post_personal_agent_message(
+            &alice,
+            selected_agent.id,
+            Uuid::new_v4(),
+            "Keep making progress",
+            "healthy-after-poison",
+            limits,
+        )
+        .await?;
+    let healthy_claim = store
+        .claim_personal_agent_turn("after-poison", 5, 8, 10, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("healthy turn was blocked by unreadable settings"))?;
+    assert_eq!(healthy_claim.turn.id, healthy_turn.turn.id);
+    let failed_poison = store
+        .personal_agent_thread(&carol, poison_agent.id)
+        .await?
+        .and_then(|turns| {
+            turns
+                .into_iter()
+                .find(|turn| turn.id == poison_turn.turn.id)
+        })
+        .ok_or_else(|| io::Error::other("unreadable turn disappeared"))?;
+    assert_eq!(failed_poison.status, PersonalAgentTurnStatus::Failed);
+    assert_eq!(
+        failed_poison.failure_reason.as_deref(),
+        Some("This agent's settings couldn't be read.")
+    );
+    store
+        .fail_personal_agent_turn(
+            healthy_claim.turn.id,
+            "after-poison",
+            "This healthy fixture is finished.",
+        )
+        .await?;
+
+    let reclaim_turn = store
+        .post_personal_agent_message(
+            &alice,
+            unicode_name.id,
+            Uuid::new_v4(),
+            "Bound this reclaim",
+            "reclaim-message-1",
+            limits,
+        )
+        .await?;
+    let first_reclaim = store
+        .claim_personal_agent_turn("reclaim-a", 5, 8, 2, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("reclaim fixture was not claimable"))?;
+    assert_eq!(first_reclaim.turn.id, reclaim_turn.turn.id);
+    let next_reclaim_turn = store
+        .post_personal_agent_message(
+            &alice,
+            unicode_name.id,
+            Uuid::new_v4(),
+            "Run after the bounded reclaim",
+            "reclaim-message-2",
+            limits,
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE personal_agent_turns SET lease_owner = NULL, lease_expires_at = NULL \
+         WHERE id = $1",
+    )
+    .bind(reclaim_turn.turn.id)
+    .execute(&pool)
+    .await?;
+    let second_reclaim = store
+        .claim_personal_agent_turn("reclaim-b", 5, 8, 2, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("turn did not receive its final allowed claim"))?;
+    assert_eq!(second_reclaim.turn.id, reclaim_turn.turn.id);
+    sqlx::query(
+        "UPDATE personal_agent_turns SET lease_owner = NULL, lease_expires_at = NULL \
+         WHERE id = $1",
+    )
+    .bind(reclaim_turn.turn.id)
+    .execute(&pool)
+    .await?;
+    let after_reclaim_cap = store
+        .claim_personal_agent_turn("reclaim-c", 5, 8, 2, &[])
+        .await?
+        .ok_or_else(|| io::Error::other("claim cap blocked the next queued turn"))?;
+    assert_eq!(after_reclaim_cap.turn.id, next_reclaim_turn.turn.id);
+    let failed_reclaim = store
+        .personal_agent_thread(&alice, unicode_name.id)
+        .await?
+        .and_then(|turns| {
+            turns
+                .into_iter()
+                .find(|turn| turn.id == reclaim_turn.turn.id)
+        })
+        .ok_or_else(|| io::Error::other("reclaim-capped turn disappeared"))?;
+    assert_eq!(failed_reclaim.status, PersonalAgentTurnStatus::Failed);
+    assert_eq!(
+        failed_reclaim.failure_reason.as_deref(),
+        Some("This turn stopped unexpectedly too many times. Try again.")
+    );
+    store
+        .fail_personal_agent_turn(
+            after_reclaim_cap.turn.id,
+            "reclaim-c",
+            "This reclaim follower is finished.",
+        )
+        .await?;
+
+    let mut short_envelope = test_envelope();
+    short_envelope.spec.ttl = Duration("1s".to_owned());
+    let short_envelope_id =
+        provision_envelope_with(&store, &dave, &format!("short-{suffix}"), &short_envelope).await?;
+    let short_agent = store
+        .create_personal_agent(
+            CreatePersonalAgentRequest {
+                id: Uuid::new_v4(),
+                owner_user_id: &dave,
+                name: "Short turn",
+                agent_ref: "example-agent@1",
+                instructions: "Reply briefly.",
+                model: None,
+                envelope_request_id: short_envelope_id,
+            },
+            limits,
+        )
+        .await?;
+    let short_turn = store
+        .post_personal_agent_message(
+            &dave,
+            short_agent.id,
+            Uuid::new_v4(),
+            "Wait for the deadline",
+            "short-message",
+            limits,
+        )
+        .await?;
+    let deadline_dispatcher = spawn_dispatcher(
+        store.clone(),
+        super::published_workflow_task_config("example")?,
+        dispatcher_config,
+    );
+    let mut deadline_failure = None;
+    for _ in 0..50 {
+        deadline_failure = store
+            .personal_agent_thread(&dave, short_agent.id)
+            .await?
+            .and_then(|turns| turns.into_iter().find(|turn| turn.id == short_turn.turn.id))
+            .filter(|turn| turn.status == PersonalAgentTurnStatus::Failed);
+        if deadline_failure.is_some() {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    let deadline_failure = deadline_failure
+        .ok_or_else(|| io::Error::other("dispatcher did not enforce the turn deadline"))?;
+    assert_eq!(
+        deadline_failure.failure_reason.as_deref(),
+        Some("This turn took too long and was stopped watching.")
+    );
+    deadline_dispatcher.abort();
+    let _deadline_dispatcher_result = deadline_dispatcher.await;
+
+    let nul_envelope = provision_envelope(&store, &bob, &format!("nul-{suffix}")).await?;
+    let nul_agent = store
+        .create_personal_agent(
+            CreatePersonalAgentRequest {
+                id: Uuid::new_v4(),
+                owner_user_id: &bob,
+                name: "Invalid reply",
+                agent_ref: "example-agent@1",
+                instructions: "Reply briefly.",
+                model: None,
+                envelope_request_id: nul_envelope,
+            },
+            limits,
+        )
+        .await?;
+    let nul_turn = store
+        .post_personal_agent_message(
+            &bob,
+            nul_agent.id,
+            Uuid::new_v4(),
+            "Return the fixture reply",
+            "nul-message",
+            limits,
+        )
+        .await?;
+    let nul_dispatcher = spawn_dispatcher(
+        store.clone(),
+        super::published_workflow_task_config("example")?,
+        dispatcher_config,
+    );
+    let nul_task_uid = wait_for_attached_task(&store, &bob, nul_agent.id).await?;
+    let queued_nul_task = sqlx::query(
+        "UPDATE task_submissions SET phase = 'queued', updated_at = now() \
+         WHERE task_uid = $1 AND phase = 'submitted'",
+    )
+    .bind(nul_task_uid)
+    .execute(&pool)
+    .await?;
+    assert!(queued_nul_task.rows_affected() <= 1);
+    let completed_nul_task = sqlx::query(
+        "UPDATE task_submissions \
+         SET phase = 'succeeded', output_archive = $2, output_archive_contract = $3, \
+             updated_at = now() \
+         WHERE task_uid = $1 AND phase = 'queued'",
+    )
+    .bind(nul_task_uid)
+    .bind(task_output_archive(&[(
+        "out/reply.txt",
+        b"reply with a NUL \0 byte",
+    )]))
+    .bind(TASK_OUTPUT_ARCHIVE_CONTRACT)
+    .execute(&pool)
+    .await?;
+    assert_eq!(completed_nul_task.rows_affected(), 1);
+    let mut failed_nul = None;
+    for _ in 0..50 {
+        failed_nul = store
+            .personal_agent_thread(&bob, nul_agent.id)
+            .await?
+            .and_then(|turns| turns.into_iter().find(|turn| turn.id == nul_turn.turn.id))
+            .filter(|turn| turn.status == PersonalAgentTurnStatus::Failed);
+        if failed_nul.is_some() {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    let failed_nul = failed_nul
+        .ok_or_else(|| io::Error::other("dispatcher did not fail the reply containing NUL"))?;
+    assert_eq!(
+        failed_nul.failure_reason.as_deref(),
+        Some("The reply couldn't be saved.")
+    );
+    nul_dispatcher.abort();
+    let _nul_dispatcher_result = nul_dispatcher.await;
+
     let first = store
         .post_personal_agent_message(
             &alice,
@@ -269,6 +687,49 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         "the admitted personal-agent Task must remove every Envelope tool"
     );
 
+    dispatcher.abort();
+    let _dispatcher_result = dispatcher.await;
+    sqlx::query(
+        "UPDATE personal_agent_turns \
+         SET task_uid = NULL, lease_owner = NULL, lease_expires_at = NULL, not_before = now() \
+         WHERE id = $1",
+    )
+    .bind(running.id)
+    .execute(&pool)
+    .await?;
+    let dispatcher = spawn_dispatcher(
+        store.clone(),
+        super::published_workflow_task_config("example")?,
+        dispatcher_config,
+    );
+    let mut recovered_task_uid = None;
+    for _ in 0..50 {
+        recovered_task_uid = store
+            .personal_agent_thread(&alice, agent.id)
+            .await?
+            .and_then(|turns| turns.into_iter().find(|turn| turn.id == running.id))
+            .and_then(|turn| turn.task_uid);
+        if recovered_task_uid.is_some() {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    assert_eq!(
+        recovered_task_uid,
+        Some(task_uid),
+        "a crash after Task submission must recover the same Task"
+    );
+    let matching_tasks = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)::bigint FROM task_submissions \
+         WHERE submitter_service = 'steward-personal-agent' \
+           AND owner_user_id = $1 AND idempotency_key = $2",
+    )
+    .bind(alice.as_str())
+    .bind(format!("personal-agent-turn:{}", running.id))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(matching_tasks, 1, "Task resubmission must be idempotent");
+
     let second = store
         .post_personal_agent_message(
             &alice,
@@ -314,9 +775,9 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
     assert_eq!(second.turn.id, third.turn.id);
     assert_ne!(second.turn.id, running.id);
     let (claim_a, claim_b, claim_c) = tokio::join!(
-        store.claim_personal_agent_turn("worker-b-a", 1, 8),
-        store.claim_personal_agent_turn("worker-b-b", 1, 8),
-        store.claim_personal_agent_turn("worker-b-c", 1, 8),
+        store.claim_personal_agent_turn("worker-b-a", 1, 8, 10, &[]),
+        store.claim_personal_agent_turn("worker-b-b", 1, 8, 10, &[]),
+        store.claim_personal_agent_turn("worker-b-c", 1, 8, 10, &[]),
     );
     assert!(claim_a?.is_none() && claim_b?.is_none() && claim_c?.is_none());
     let (queued_count, running_count) = sqlx::query_as::<_, (i64, i64)>(
@@ -332,12 +793,23 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
     dispatcher.abort();
     let _dispatcher_result = dispatcher.await;
     tokio::time::sleep(StdDuration::from_millis(5_100)).await;
+    assert!(
+        store
+            .claim_personal_agent_turn("same-replica", 1, 8, 10, &[running.id])
+            .await?
+            .is_none(),
+        "a replica must not reclaim one of its in-flight turns"
+    );
     let restarted = store
-        .claim_personal_agent_turn("worker-b", 1, 8)
+        .claim_personal_agent_turn("worker-b", 1, 8, 10, &[])
         .await?
         .ok_or_else(|| io::Error::other("expired turn was not reclaimable"))?;
     assert_eq!(restarted.turn.id, running.id);
     assert_eq!(restarted.turn.task_uid, Some(task_uid));
+    assert_eq!(
+        restarted.turn.dispatch_attempts, 0,
+        "claims and Task monitoring must not consume start attempts"
+    );
     assert_eq!(
         store
             .personal_agent_thread(&alice, agent.id)
@@ -347,6 +819,17 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         2,
         "a restart must resume the running turn instead of creating another one"
     );
+    assert!(matches!(
+        store
+            .complete_personal_agent_turn(
+                restarted.turn.id,
+                "worker-b",
+                "reply with a NUL \0 byte",
+                limits.max_reply_bytes,
+            )
+            .await,
+        Err(StoreError::InvalidPersonalAgentMessage)
+    ));
     store
         .complete_personal_agent_turn(
             restarted.turn.id,
@@ -357,7 +840,7 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         .await?;
 
     let merged = store
-        .claim_personal_agent_turn("worker-c", 1, 8)
+        .claim_personal_agent_turn("worker-c", 1, 8, 10, &[])
         .await?
         .ok_or_else(|| io::Error::other("merged next turn was not claimable"))?;
     assert_eq!(merged.turn.id, second.turn.id);
@@ -369,16 +852,77 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         .collect::<Vec<_>>();
     assert_eq!(&merged_messages[..2], ["Second message", "Third message"]);
     assert_eq!(merged_messages.len(), 8);
-    let event_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)::bigint FROM personal_agent_turn_events WHERE agent_id = $1",
-    )
-    .bind(agent.id)
-    .fetch_one(&pool)
-    .await?;
+    let events = store
+        .personal_agent_events_after(&alice, agent.id, 0)
+        .await?
+        .ok_or_else(|| io::Error::other("event stream disappeared"))?;
     assert!(
-        event_count >= 7,
+        events.len() >= 7,
         "each durable turn change must append an event"
     );
+    assert!(
+        events
+            .windows(2)
+            .all(|events| events[0].seq < events[1].seq),
+        "durable event sequences must be strictly increasing"
+    );
+    assert!(events.iter().any(|event| {
+        event.turn.status == PersonalAgentTurnStatus::Done
+            && event
+                .turn
+                .reply
+                .as_ref()
+                .map(|reply| reply.content.as_str())
+                == Some("First reply")
+    }));
+    assert!(
+        store
+            .personal_agent_events_after(&bob, agent.id, 0)
+            .await?
+            .is_none(),
+        "another owner must not distinguish an existing event stream"
+    );
+    let replay_cursor = events[2].seq;
+    let replayed = store
+        .personal_agent_events_after(&alice, agent.id, replay_cursor)
+        .await?
+        .ok_or_else(|| io::Error::other("event replay disappeared"))?;
+    assert_eq!(
+        replayed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        events
+            .iter()
+            .filter(|event| event.seq > replay_cursor)
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        "Last-Event-ID replay must return each later durable event exactly once"
+    );
+    let snapshot = store
+        .personal_agent_thread_snapshot(&alice, agent.id)
+        .await?
+        .ok_or_else(|| io::Error::other("thread snapshot disappeared"))?;
+    assert_eq!(snapshot.event_sequence, events.last().ok_or("event")?.seq);
+
+    let mut listener = store.personal_agent_event_listener().await?;
+    store
+        .post_personal_agent_message(
+            &alice,
+            agent.id,
+            Uuid::new_v4(),
+            "Fourth message",
+            "message-4",
+            limits,
+        )
+        .await?;
+    let notified_sequence =
+        tokio::time::timeout(StdDuration::from_secs(2), listener.recv_sequence())
+            .await
+            .map_err(|_| io::Error::other("personal-agent event notification timed out"))??;
+    let notified_events = store
+        .personal_agent_events_after(&alice, agent.id, snapshot.event_sequence)
+        .await?
+        .ok_or_else(|| io::Error::other("notified event stream disappeared"))?;
+    assert_eq!(notified_events.len(), 1);
+    assert_eq!(notified_events[0].seq, notified_sequence);
     Ok(())
 }
 
@@ -489,6 +1033,7 @@ async fn personal_agent_router_statuses(
         )
     };
     let unauthorized = routes()
+        .await?
         .oneshot(
             Request::builder()
                 .uri("/app/api/v1/agents")
@@ -535,6 +1080,7 @@ async fn personal_agent_router_statuses(
         .to_owned();
 
     let malformed = routes()
+        .await?
         .oneshot(mutation_request(
             "/app/api/v1/agents",
             &session_cookie,
@@ -545,6 +1091,7 @@ async fn personal_agent_router_statuses(
         .await?;
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     let missing = routes()
+        .await?
         .oneshot(
             Request::builder()
                 .uri(format!("/app/api/v1/agents/{}", Uuid::new_v4()))
@@ -561,6 +1108,7 @@ async fn personal_agent_router_statuses(
     })
     .to_string();
     let conflict = routes()
+        .await?
         .oneshot(mutation_request(
             "/app/api/v1/agents",
             &session_cookie,
@@ -605,13 +1153,60 @@ fn response_cookie(response: &axum::response::Response, name: &str) -> Result<St
 
 fn test_limits() -> PersonalAgentLimits {
     PersonalAgentLimits {
-        max_name_bytes: 200,
+        max_name_characters: 200,
         max_instructions_bytes: 16 * 1024,
         max_message_bytes: 16 * 1024,
         max_queued_bytes: 24 * 1024,
         max_reply_bytes: 1024 * 1024,
         max_prompt_bytes: 32 * 1024,
     }
+}
+
+async fn wait_for_attached_task(
+    store: &PgStore,
+    owner: &CanonicalUserId,
+    agent_id: Uuid,
+) -> Result<Uuid, Box<dyn Error>> {
+    for _ in 0..50 {
+        let task_uid = store
+            .personal_agent_thread(owner, agent_id)
+            .await?
+            .and_then(|turns| turns.into_iter().find_map(|turn| turn.task_uid));
+        if let Some(task_uid) = task_uid {
+            return Ok(task_uid);
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    Err(io::Error::other("dispatcher did not attach a Task").into())
+}
+
+fn task_output_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    for (path, content) in entries {
+        let header_offset = archive.len();
+        archive.resize(header_offset + 512, 0);
+        archive[header_offset..header_offset + path.len()].copy_from_slice(path.as_bytes());
+        archive[header_offset + 100..header_offset + 108].copy_from_slice(b"0000644\0");
+        archive[header_offset + 108..header_offset + 116].copy_from_slice(b"0000000\0");
+        archive[header_offset + 116..header_offset + 124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", content.len());
+        archive[header_offset + 124..header_offset + 136].copy_from_slice(size.as_bytes());
+        archive[header_offset + 136..header_offset + 148].copy_from_slice(b"00000000000\0");
+        archive[header_offset + 148..header_offset + 156].fill(b' ');
+        archive[header_offset + 156] = b'0';
+        archive[header_offset + 257..header_offset + 263].copy_from_slice(b"ustar\0");
+        archive[header_offset + 263..header_offset + 265].copy_from_slice(b"00");
+        let checksum = archive[header_offset..header_offset + 512]
+            .iter()
+            .map(|byte| usize::from(*byte))
+            .sum::<usize>();
+        let checksum = format!("{checksum:06o}\0 ");
+        archive[header_offset + 148..header_offset + 156].copy_from_slice(checksum.as_bytes());
+        archive.extend_from_slice(content);
+        archive.resize(header_offset + 512 + content.len().div_ceil(512) * 512, 0);
+    }
+    archive.resize(archive.len() + 1024, 0);
+    archive
 }
 
 async fn register_user(

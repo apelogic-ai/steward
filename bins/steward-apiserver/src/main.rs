@@ -828,6 +828,14 @@ async fn browser_application_router(
         task_api_config.clone(),
         personal_agent_config,
     );
+    let personal_agent_router = personal_agents::protected_router(
+        store.clone(),
+        personal_agent_refs,
+        auth.clone(),
+        personal_agent_config,
+    )
+    .await
+    .map_err(io::Error::other)?;
     let connections = governed_connections_configuration(
         &origin,
         store.clone(),
@@ -857,12 +865,7 @@ async fn browser_application_router(
         application_config.task_identity_discovery_enabled,
     );
     let app = browser_auth::browser_auth_router(auth.clone())
-        .merge(personal_agents::protected_router(
-            store.clone(),
-            personal_agent_refs,
-            auth.clone(),
-            personal_agent_config,
-        ))
+        .merge(personal_agent_router)
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
                 store.clone(),
@@ -967,8 +970,19 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
     let max_transient_attempts =
         optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS")?
             .unwrap_or_else(|| personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string());
-    let max_name_bytes =
-        personal_agent_limit("MAX_NAME_BYTES", personal_agents::DEFAULT_MAX_NAME_BYTES)?;
+    let retry_backoff_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string());
+    let max_claims_per_turn =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_CLAIMS_PER_TURN.to_string());
+    let monitoring_grace_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MONITORING_GRACE_SECONDS.to_string());
+    let max_name_characters = personal_agent_limit(
+        "MAX_NAME_CHARACTERS",
+        personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
+    )?;
     let max_instructions_bytes = personal_agent_limit(
         "MAX_INSTRUCTIONS_BYTES",
         personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
@@ -988,13 +1002,18 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
         personal_agents::DEFAULT_MAX_PROMPT_BYTES,
     )?;
     personal_agent_configuration_from_all_values(
-        &recent_turn_limit,
-        &lease_seconds,
-        &poll_interval_seconds,
-        &max_concurrent_turns,
-        &max_transient_attempts,
+        PersonalAgentDispatchSettingValues {
+            recent_turn_limit: &recent_turn_limit,
+            lease_seconds: &lease_seconds,
+            poll_interval_seconds: &poll_interval_seconds,
+            max_concurrent_turns: &max_concurrent_turns,
+            max_transient_attempts: &max_transient_attempts,
+            retry_backoff_seconds: &retry_backoff_seconds,
+            max_claims_per_turn: &max_claims_per_turn,
+            monitoring_grace_seconds: &monitoring_grace_seconds,
+        },
         PersonalAgentLimits {
-            max_name_bytes,
+            max_name_characters,
             max_instructions_bytes,
             max_message_bytes,
             max_queued_bytes,
@@ -1019,13 +1038,19 @@ fn personal_agent_configuration_from_values(
     poll_interval_seconds: &str,
 ) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
     personal_agent_configuration_from_all_values(
-        recent_turn_limit,
-        lease_seconds,
-        poll_interval_seconds,
-        &personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string(),
-        &personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string(),
+        PersonalAgentDispatchSettingValues {
+            recent_turn_limit,
+            lease_seconds,
+            poll_interval_seconds,
+            max_concurrent_turns: &personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string(),
+            max_transient_attempts: &personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string(),
+            retry_backoff_seconds: &personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string(),
+            max_claims_per_turn: &personal_agents::DEFAULT_MAX_CLAIMS_PER_TURN.to_string(),
+            monitoring_grace_seconds: &personal_agents::DEFAULT_MONITORING_GRACE_SECONDS
+                .to_string(),
+        },
         PersonalAgentLimits {
-            max_name_bytes: personal_agents::DEFAULT_MAX_NAME_BYTES,
+            max_name_characters: personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
             max_instructions_bytes: personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
             max_message_bytes: personal_agents::DEFAULT_MAX_MESSAGE_BYTES,
             max_queued_bytes: personal_agents::DEFAULT_MAX_QUEUED_BYTES,
@@ -1035,35 +1060,63 @@ fn personal_agent_configuration_from_values(
     )
 }
 
+struct PersonalAgentDispatchSettingValues<'a> {
+    recent_turn_limit: &'a str,
+    lease_seconds: &'a str,
+    poll_interval_seconds: &'a str,
+    max_concurrent_turns: &'a str,
+    max_transient_attempts: &'a str,
+    retry_backoff_seconds: &'a str,
+    max_claims_per_turn: &'a str,
+    monitoring_grace_seconds: &'a str,
+}
+
 fn personal_agent_configuration_from_all_values(
-    recent_turn_limit: &str,
-    lease_seconds: &str,
-    poll_interval_seconds: &str,
-    max_concurrent_turns: &str,
-    max_transient_attempts: &str,
+    values: PersonalAgentDispatchSettingValues<'_>,
     limits: PersonalAgentLimits,
 ) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
-    let recent_turn_limit = recent_turn_limit.parse::<i64>().map_err(|_| {
+    let recent_turn_limit = values.recent_turn_limit.parse::<i64>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT must be an integer")
     })?;
-    let lease_seconds = lease_seconds
+    let lease_seconds = values
+        .lease_seconds
         .parse::<i64>()
         .map_err(|_| io::Error::other("STEWARD_PERSONAL_AGENT_LEASE_SECONDS must be an integer"))?;
-    let poll_interval_seconds = poll_interval_seconds.parse::<u64>().map_err(|_| {
+    let poll_interval_seconds = values.poll_interval_seconds.parse::<u64>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS must be an integer")
     })?;
-    let max_concurrent_turns = max_concurrent_turns.parse::<usize>().map_err(|_| {
+    let max_concurrent_turns = values.max_concurrent_turns.parse::<usize>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS must be an integer")
     })?;
-    let max_transient_attempts = max_transient_attempts.parse::<i32>().map_err(|_| {
+    let max_transient_attempts = values.max_transient_attempts.parse::<i32>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS must be an integer")
     })?;
+    let retry_backoff_seconds = values.retry_backoff_seconds.parse::<i64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS must be an integer")
+    })?;
+    let max_claims_per_turn = values.max_claims_per_turn.parse::<i32>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN must be an integer")
+    })?;
+    let monitoring_grace_seconds =
+        values
+            .monitoring_grace_seconds
+            .parse::<i64>()
+            .map_err(|_| {
+                io::Error::other(
+                    "STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS must be an integer",
+                )
+            })?;
     personal_agents::PersonalAgentConfig::new(
-        recent_turn_limit,
-        lease_seconds,
-        poll_interval_seconds,
-        max_concurrent_turns,
-        max_transient_attempts,
+        personal_agents::PersonalAgentDispatchSettings {
+            recent_turn_limit,
+            lease_seconds,
+            poll_interval_seconds,
+            max_concurrent_turns,
+            max_transient_attempts,
+            retry_backoff_seconds,
+            max_claims_per_turn,
+            monitoring_grace_seconds,
+        },
         limits,
     )
     .map_err(io::Error::other)
