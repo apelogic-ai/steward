@@ -633,7 +633,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.19"
+          test "$version" = "0.3.20"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -756,7 +756,9 @@ jobs:
                 "0068_managed_inference_credentials.sql",
                 "0069_envelope_request_review_context.sql",
                 "0070_template_one_boundary.sql",
-                "0071_browser_task_preferred_envelope.sql"
+                "0071_browser_task_preferred_envelope.sql",
+                "0072_api_task_origin.sql",
+                "0073_task_caller_reference.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -764,14 +766,16 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.19 lets Run clients show the existing safe explanation when bounded workspace preparation fails, while arbitrary internal diagnostics remain private.\n\n'
-            printf 'Runtime cleanup now retries quietly while sandbox deletion is making progress. Cleanup that remains incomplete past the existing deadline still produces an error.\n\n'
-            printf 'This release retains everything shipped in v0.3.18, including catalog-defined provider tools, provider-specific Connections, governed Jira access, reliable repository checkout discovery, and per-run inference limits.\n\n'
+            printf 'Steward v0.3.20 adds governed external Run API callers and signed Jira webhook Triggers. The isolated trigger receiver validates signatures and configured filters, checks a read-only Envelope, starts Tasks idempotently, polls within a fixed deadline, and cleans up each completed delivery.\n\n'
+            printf 'Run views can show bounded caller context without using it to decide whether a request is accepted. API Runs carry an explicit origin, and failed Tasks can offer validated partial output plus requested bounded diagnostics.\n\n'
+            printf 'Receiver startup, delivery recovery, numeric chart settings, caller refusal coverage, coding-agent execution evidence, and the Codex reference runtime vulnerability policy are hardened.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'This release adds no database migration and requires no configuration change. Deploy the v0.3.19 chart and all component images as one release unit.\n\n'
+            printf 'Apply additive migrations 0072 and 0073 before starting v0.3.20. Migration 0072 accepts the new api Task origin without rewriting historical rows. Migration 0073 adds nullable immutable caller-reference context without rewriting historical rows. Deploy the chart, API, web, and receiver images together.\n\n'
+            printf 'Configure the receiver signing Secret, pinned certificate authority, read-only Envelope reference, filters, run limits, cooldowns, and exact public /hooks/jira/<id> edge path before enabling a Jira Trigger. Set config.apiserver.jiraBaseUrl only to the validated HTTPS Jira site used for optional issue links.\n\n'
             printf 'Jira Connections retain the v0.3.18 prerequisite: MCP-GW v0.6.0 with its read-only Jira REST preset and the exact Jira wrapper under connectionsBridge.providerOrigins.\n\n'
-            printf 'Rolling back to v0.3.18 hides the two bounded workspace-preparation explanations from Run API responses and restores error logging during expected sandbox-deletion progress. The cleanup deadline and stalled-deletion error remain unchanged.\n\n'
+            printf 'Jenkins callers require a github-oidc-exchange release that supports generic OIDC exchange. Temporal and Jira callers use their documented short-lived token exchange.\n\n'
+            printf 'Before rolling back to v0.3.19, stop Task submission and prove that no stored Task has the api origin; v0.3.19 cannot read that new immutable value. If any such row exists, restore the pre-upgrade database or keep v0.3.20 API readers. The nullable caller-reference column may remain. A full chart rollback removes the receiver and its configuration.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
             printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
@@ -845,7 +849,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.19.json
+          subject-path: dist/steward-product-compatibility-0.3.20.json
 
       - name: Archive product compatibility verification material
         env:
@@ -855,7 +859,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.19.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.20.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

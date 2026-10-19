@@ -17,7 +17,6 @@ use steward_apiserver::browser_admin::CapabilityCatalog;
 use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, PgStore, StoreError};
 use steward_types::CanonicalUserId;
 use steward_types::direct_package::{EnvelopeDigest, Uuid};
-use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 use crate::{
@@ -159,13 +158,6 @@ pub struct KubernetesTokenRequester {
     service_account: String,
     audience: String,
     expiration_seconds: u64,
-    cache: Arc<Mutex<Option<CachedSourceToken>>>,
-}
-
-#[derive(Clone)]
-struct CachedSourceToken {
-    token: OpaqueToken,
-    refresh_at: SystemTime,
 }
 
 impl KubernetesTokenRequester {
@@ -193,11 +185,10 @@ impl KubernetesTokenRequester {
             service_account,
             audience,
             expiration_seconds,
-            cache: Arc::new(Mutex::new(None)),
         })
     }
 
-    async fn request(&self) -> Result<CachedSourceToken, TaskLifecycleError> {
+    async fn request(&self) -> Result<OpaqueToken, TaskLifecycleError> {
         let expiration_seconds =
             i64::try_from(self.expiration_seconds).map_err(|_| TaskLifecycleError::Final)?;
         let api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), &self.namespace);
@@ -222,12 +213,8 @@ impl KubernetesTokenRequester {
         let status = response.status.ok_or(TaskLifecycleError::Final)?;
         let token = OpaqueToken::new(status.token).map_err(|_| TaskLifecycleError::Final)?;
         let expires_at: SystemTime = status.expiration_timestamp.0.into();
-        let refresh_at = source_token_refresh_at(expires_at, SystemTime::now())?;
-        Ok(CachedSourceToken { token, refresh_at })
-    }
-
-    async fn invalidate(&self) {
-        *self.cache.lock().await = None;
+        source_token_refresh_at(expires_at, SystemTime::now())?;
+        Ok(token)
     }
 }
 
@@ -259,24 +246,14 @@ fn transient_status_code(code: u16) -> bool {
 impl WorkloadSourceTokenProvider for KubernetesTokenRequester {
     fn source_token(&self) -> WorkloadSourceTokenFuture<'_> {
         Box::pin(async move {
-            let mut cache = self.cache.lock().await;
-            if let Some(cached) = cache
-                .as_ref()
-                .filter(|cached| SystemTime::now() < cached.refresh_at)
-            {
-                return Ok(cached.token.clone());
-            }
-            let source = self.request().await.map_err(|error| match error {
+            self.request().await.map_err(|error| match error {
                 TaskLifecycleError::Final => steward_ports::PortError::Rejected {
                     reason: "workload source credential was refused".to_owned(),
                 },
                 TaskLifecycleError::Retriable => steward_ports::PortError::Failed {
                     reason: "workload source credential is unavailable".to_owned(),
                 },
-            })?;
-            let token = source.token.clone();
-            *cache = Some(source);
-            Ok(token)
+            })
         })
     }
 }
@@ -341,28 +318,21 @@ impl TaskTokenProvider for KubernetesWorkloadTokenProvider {
                 Arc::new(self.source.clone()),
             )
             .map_err(exchange_error)?;
-            Ok(Arc::new(KubernetesAccessTokenProvider {
-                exchange: provider,
-                source: self.source.clone(),
-            }) as Arc<dyn TaskAccessTokenProvider>)
+            Ok(
+                Arc::new(KubernetesAccessTokenProvider { exchange: provider })
+                    as Arc<dyn TaskAccessTokenProvider>,
+            )
         })
     }
 }
 
 struct KubernetesAccessTokenProvider {
     exchange: WorkloadExchangeTokenProvider,
-    source: KubernetesTokenRequester,
 }
 
 impl TaskAccessTokenProvider for KubernetesAccessTokenProvider {
     fn token(&self) -> ReceiverFuture<'_, Result<OpaqueToken, TaskLifecycleError>> {
-        Box::pin(async move {
-            let result = self.exchange.access_token().await;
-            if matches!(result, Err(steward_ports::PortError::Rejected { .. })) {
-                self.source.invalidate().await;
-            }
-            result.map_err(exchange_error)
-        })
+        Box::pin(async move { self.exchange.access_token().await.map_err(exchange_error) })
     }
 }
 
@@ -844,7 +814,6 @@ mod tests {
                 .request()
                 .await
                 .map_err(|_| "request failed")?
-                .token
                 .expose_secret(),
             "obviously-fake-source-token"
         );
@@ -902,7 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workload_provider_reuses_the_source_token_during_access_token_refresh()
+    async fn workload_provider_refreshes_the_source_token_with_the_access_token()
     -> Result<(), String> {
         let source_calls = Arc::new(Mutex::new(0_usize));
         let counted = source_calls.clone();
@@ -970,15 +939,15 @@ mod tests {
             "obviously-fake-second-access"
         );
         exchange.handle.await.map_err(|error| error.to_string())?;
-        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 1);
+        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
         let requests = exchange.requests.lock().map_err(|_| "poisoned")?;
         assert!(requests[0].contains("Bearer obviously-fake-source-token-1"));
-        assert!(requests[1].contains("Bearer obviously-fake-source-token-1"));
+        assert!(requests[1].contains("Bearer obviously-fake-source-token-2"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn source_token_refreshes_after_its_refresh_point() -> Result<(), String> {
+    async fn source_token_is_fresh_for_each_exchange() -> Result<(), String> {
         let source_calls = Arc::new(Mutex::new(0_usize));
         let counted = source_calls.clone();
         let kube = KubeClient::new(
@@ -1019,13 +988,6 @@ mod tests {
                 .expose_secret(),
             "obviously-fake-source-token-1"
         );
-        requester
-            .cache
-            .lock()
-            .await
-            .as_mut()
-            .ok_or("source token was not cached")?
-            .refresh_at = SystemTime::UNIX_EPOCH;
         assert_eq!(
             requester
                 .source_token()
@@ -1034,6 +996,48 @@ mod tests {
                 .expose_secret(),
             "obviously-fake-source-token-2"
         );
+        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_exchanges_cannot_share_a_source_token() -> Result<(), String> {
+        let source_calls = Arc::new(Mutex::new(0_usize));
+        let counted = source_calls.clone();
+        let kube = KubeClient::new(
+            service_fn(move |_request: Request<KubeBody>| {
+                let counted = counted.clone();
+                async move {
+                    let call = {
+                        let mut count = counted
+                            .lock()
+                            .map_err(|_| std::io::Error::other("poisoned"))?;
+                        *count += 1;
+                        *count
+                    };
+                    let mut response = HttpResponse::new(Body::from(format!(
+                        r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{{}},"spec":{{"audiences":["steward-task"],"expirationSeconds":600}},"status":{{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token-{call}"}}}}"#
+                    )));
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "default",
+        );
+        let requester = KubernetesTokenRequester::new(
+            kube,
+            "steward-test".to_owned(),
+            "receiver".to_owned(),
+            "steward-task".to_owned(),
+            600,
+        )?;
+        let (first, second) = tokio::join!(requester.source_token(), requester.source_token());
+        let first = first.map_err(|error| format!("{error:?}"))?;
+        let second = second.map_err(|error| format!("{error:?}"))?;
+        assert_ne!(first.expose_secret(), second.expose_secret());
         assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
         Ok(())
     }
@@ -1212,7 +1216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_source_token_is_evicted_before_the_next_delivery() -> Result<(), String> {
+    async fn refused_source_token_does_not_block_the_next_delivery() -> Result<(), String> {
         let source_calls = Arc::new(Mutex::new(0_usize));
         let counted = source_calls.clone();
         let kube = KubeClient::new(
