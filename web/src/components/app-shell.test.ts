@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import { breadcrumbsForPath, hasDualRole, isAccessPending, isActive, workspaceLandingPath } from "./app-shell";
+
+const source = readFileSync(new URL("./app-shell.tsx", import.meta.url), "utf8");
 
 describe("primary navigation", () => {
   test("selects Envelopes for list, new, detail, and nested run routes", () => {
@@ -23,6 +26,13 @@ describe("primary navigation", () => {
   test("keeps Task library and detail in the Tasks workspace", () => {
     expect(isActive("/tasks/steward%3Asha256%3Aexample", "/tasks")).toBe(true);
     expect(isActive("/tasks/steward%3Asha256%3Aexample", "/runs")).toBe(false);
+  });
+
+  test("offers Agents and selects it for list, creation, and thread routes", () => {
+    expect(source).toContain('{ href: "/agents", label: "Agents" }');
+    for (const pathname of ["/agents", "/agents/new", "/agents/agent-1"]) {
+      expect(isActive(pathname, "/agents")).toBe(true);
+    }
   });
 });
 
@@ -76,6 +86,23 @@ describe("breadcrumbs", () => {
     expect(breadcrumbsForPath("/admin/approvals")).toEqual([
       { label: "Admin" },
       { label: "Requests" },
+    ]);
+  });
+
+  test("names agent list, creation, and thread routes", () => {
+    expect(breadcrumbsForPath("/agents")).toEqual([
+      { label: "User" },
+      { label: "Agents" },
+    ]);
+    expect(breadcrumbsForPath("/agents/new")).toEqual([
+      { label: "User" },
+      { href: "/agents", label: "Agents" },
+      { label: "New agent" },
+    ]);
+    expect(breadcrumbsForPath("/agents/agent-3c9e1b27-long-value")).toEqual([
+      { label: "User" },
+      { href: "/agents", label: "Agents" },
+      { label: "agent-3c9e1b…", mono: true },
     ]);
   });
 });

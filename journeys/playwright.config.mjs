@@ -20,6 +20,7 @@ const testDir = defineBddConfig({
     "J10-operator-changes-configuration.feature",
     "J11-user-runs-a-task-with-jira.feature",
     "J12-service-callers-run-governed-work.feature",
+    "J13-user-chats-with-a-personal-agent.feature",
   ],
   steps: "steps/*.mjs",
   outputDir: `.generated/${execution}`,
