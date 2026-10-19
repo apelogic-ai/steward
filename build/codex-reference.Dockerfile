@@ -1,8 +1,6 @@
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
 
 USER root
-ARG LINUX_LIBC_DEV_VERSION=6.8.0-147.147
-ARG LINUX_LIBC_DEV_SHA256=fec8e4a308c03cd98dace67370a8d5a8031c36741796065c9f6e3f9548ab0cd2
 ARG RIPGREP_VERSION=14.1.0-1
 ARG RIPGREP_SHA256=c5ae63c7bee915b1cfc9f0bd07c55b4ce7f2bcd1133cba4da56719aac26101a4
 ARG JQ_VERSION=1.7.1-3ubuntu0.24.04.2
@@ -16,9 +14,6 @@ ARG FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e66
 ARG TREE_VERSION=2.1.1-2ubuntu3.24.04.2
 ARG TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e
 RUN curl --fail --silent --show-error --location \
-        "https://launchpad.net/ubuntu/+archive/primary/+files/linux-libc-dev_${LINUX_LIBC_DEV_VERSION}_amd64.deb" \
-        --output /tmp/linux-libc-dev.deb \
-    && curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
     && curl --fail --silent --show-error --location \
@@ -36,7 +31,6 @@ RUN curl --fail --silent --show-error --location \
     && curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
-    && printf '%s  %s\n' "${LINUX_LIBC_DEV_SHA256}" /tmp/linux-libc-dev.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${JQ_SHA256}" /tmp/jq.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBJQ_SHA256}" /tmp/libjq1.deb | sha256sum --check --strict \
@@ -44,14 +38,13 @@ RUN curl --fail --silent --show-error --location \
     && printf '%s  %s\n' "${FD_FIND_SHA256}" /tmp/fd-find.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${TREE_SHA256}" /tmp/tree.deb | sha256sum --check --strict \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install \
-        /tmp/linux-libc-dev.deb \
         /tmp/ripgrep.deb \
         /tmp/libonig5.deb \
         /tmp/libjq1.deb \
         /tmp/jq.deb \
         /tmp/fd-find.deb \
         /tmp/tree.deb \
-    && rm /tmp/linux-libc-dev.deb /tmp/ripgrep.deb /tmp/libonig5.deb \
+    && rm /tmp/ripgrep.deb /tmp/libonig5.deb \
         /tmp/libjq1.deb /tmp/jq.deb /tmp/fd-find.deb /tmp/tree.deb \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \
@@ -67,7 +60,8 @@ RUN curl --fail --silent --show-error --location \
     && test "$(/usr/bin/codex --version)" = "codex-cli 0.140.0" \
     && test "$(node --print 'require("/usr/lib/node_modules/tar/package.json").version')" = "7.5.22" \
     && test "$(node --print 'require("/usr/lib/node_modules/npm/node_modules/tar/package.json").version')" = "7.5.22" \
-    && test -x /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex
+    && test -x /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex \
+    && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin apt-get purge --yes --auto-remove linux-libc-dev
 
 USER sandbox
 RUN rg --version \
