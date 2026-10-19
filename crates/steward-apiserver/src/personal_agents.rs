@@ -1006,10 +1006,7 @@ mod tests {
         headers.insert("last-event-id", HeaderValue::from_static("42"));
         assert_eq!(personal_agent_last_event_id(&headers), Ok(Some(42)));
         for invalid in ["-1", "1.5", "not-a-sequence"] {
-            headers.insert(
-                "last-event-id",
-                HeaderValue::from_str(invalid).expect("valid header fixture"),
-            );
+            headers.insert("last-event-id", HeaderValue::from_static(invalid));
             assert_eq!(personal_agent_last_event_id(&headers), Err(()));
         }
     }
