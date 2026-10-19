@@ -5,10 +5,20 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
+  createPersonalAgent as createPersonalAgentRequest,
+  getPersonalAgent as getPersonalAgentRequest,
   getUserCapabilities,
+  listPersonalAgentMessages,
+  listPersonalAgents as listPersonalAgentsRequest,
   listRequests,
+  postPersonalAgentMessage as postPersonalAgentMessageRequest,
   type EnvelopeRequestStatus,
   type EnvelopeRequestsResponse,
+  type PersonalAgentMessageView,
+  type PersonalAgentReplyView,
+  type PersonalAgentsResponse,
+  type PersonalAgentTurnView,
+  type PersonalAgentView,
   type UserCapabilitiesResponse,
 } from "@/api-client";
 import { DataTable } from "@/components/hs/data-table";
@@ -18,63 +28,17 @@ import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary } from "@/compone
 import { classifyResource, useApiResource, type ResourceState } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
-export type PersonalAgent = {
-  agentRef: string;
-  createdAt: string;
-  envelopeRequestId: string;
-  id: string;
-  instructions: string;
-  name: string;
-  updatedAt: string;
-};
-
-export type PersonalAgentMessage = {
-  content: string;
-  createdAt: string;
-  id: string;
-};
-
-export type PersonalAgentReply = {
-  content: string;
-  createdAt: string;
-};
-
-export type PersonalAgentTurn = {
-  completedAt?: string | null;
-  createdAt: string;
-  failureReason?: string | null;
-  id: string;
-  messages: PersonalAgentMessage[];
-  reply?: PersonalAgentReply | null;
-  runId?: string | null;
-  startedAt?: string | null;
-  status: "done" | "failed" | "queued" | "running";
-};
+export type PersonalAgent = PersonalAgentView;
+export type PersonalAgentMessage = PersonalAgentMessageView;
+export type PersonalAgentReply = PersonalAgentReplyView;
+export type PersonalAgentTurn = PersonalAgentTurnView;
 
 export type PersonalAgentThread = {
   agent: PersonalAgent;
   turns: PersonalAgentTurn[];
 };
 
-export type PersonalAgents = {
-  apiVersion: string;
-  agents: PersonalAgent[];
-};
-
-type PersonalAgentResponse = {
-  agent: PersonalAgent;
-  apiVersion: string;
-};
-
-type PersonalAgentThreadResponse = {
-  apiVersion: string;
-  turns: PersonalAgentTurn[];
-};
-
-type PersonalAgentMutationResult = {
-  apiVersion: string;
-  turn: PersonalAgentTurn;
-};
+export type PersonalAgents = PersonalAgentsResponse;
 
 type PersonalAgentApiResult<T> = {
   data?: T;
@@ -152,72 +116,18 @@ export function PersonalAgentsListContent({ state }: Readonly<{
   );
 }
 
-async function readResponseBody(response: Response): Promise<unknown> {
-  try {
-    return await response.json();
-  } catch {
-    return undefined;
-  }
-}
-
-async function personalAgentRequest<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<PersonalAgentApiResult<T>> {
-  try {
-    const response = await fetch(path, {
-      cache: "no-store",
-      credentials: "same-origin",
-      ...init,
-    });
-    const body = await readResponseBody(response);
-    return response.ok
-      ? { data: body as T, response }
-      : { error: body, response };
-  } catch {
-    return {};
-  }
-}
-
-function listPersonalAgents(): Promise<PersonalAgentApiResult<PersonalAgents>> {
-  return personalAgentRequest("/app/api/v1/agents");
-}
-
-function createPersonalAgent(
-  body: { agentRef: string; envelopeRequestId: string; instructions: string; name: string },
-  csrf: string,
-): Promise<PersonalAgentApiResult<PersonalAgentResponse>> {
-  return personalAgentRequest("/app/api/v1/agents", {
-    body: JSON.stringify(body),
-    headers: { "Content-Type": "application/json", "X-Steward-CSRF": csrf },
-    method: "POST",
-  });
-}
-
-function getPersonalAgent(agentId: string): Promise<PersonalAgentApiResult<PersonalAgentResponse>> {
-  return personalAgentRequest(`/app/api/v1/agents/${encodeURIComponent(agentId)}`);
-}
-
-function getPersonalAgentMessages(agentId: string): Promise<PersonalAgentApiResult<PersonalAgentThreadResponse>> {
-  return personalAgentRequest(`/app/api/v1/agents/${encodeURIComponent(agentId)}/messages`);
-}
-
-function postPersonalAgentMessage(
-  agentId: string,
-  body: { content: string; idempotencyKey: string },
-  csrf: string,
-): Promise<PersonalAgentApiResult<PersonalAgentMutationResult>> {
-  return personalAgentRequest(`/app/api/v1/agents/${encodeURIComponent(agentId)}/messages`, {
-    body: JSON.stringify(body),
-    headers: { "Content-Type": "application/json", "X-Steward-CSRF": csrf },
-    method: "POST",
-  });
-}
-
 async function loadPersonalAgentThread(agentId: string): Promise<PersonalAgentApiResult<PersonalAgentThread>> {
   const [agent, messages] = await Promise.all([
-    getPersonalAgent(agentId),
-    getPersonalAgentMessages(agentId),
+    getPersonalAgentRequest({
+      cache: "no-store",
+      credentials: "same-origin",
+      path: { agent_id: agentId },
+    }),
+    listPersonalAgentMessages({
+      cache: "no-store",
+      credentials: "same-origin",
+      path: { agent_id: agentId },
+    }),
   ]);
   const response = !agent.response?.ok ? agent.response : messages.response;
   return agent.data && messages.data
@@ -226,7 +136,10 @@ async function loadPersonalAgentThread(agentId: string): Promise<PersonalAgentAp
 }
 
 export function PersonalAgentsView() {
-  const load = useCallback(() => listPersonalAgents(), []);
+  const load = useCallback(() => listPersonalAgentsRequest({
+    cache: "no-store",
+    credentials: "same-origin",
+  }), []);
   const state = useApiResource(load);
   return <PersonalAgentsListContent state={state} />;
 }
@@ -268,7 +181,12 @@ export function NewPersonalAgentView() {
     };
     setFailure(null);
     setSaving(true);
-    const result = await createPersonalAgent(body, session.value.csrf);
+    const result = await createPersonalAgentRequest({
+      body,
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+    });
     setSaving(false);
     if (result.data && result.response?.ok) {
       router.push(`/agents/${encodeURIComponent(result.data.agent.id)}`);
@@ -379,10 +297,16 @@ export function PersonalAgentDetailView({ agentId }: Readonly<{ agentId: string 
     idempotencyKey.current = nextPersonalAgentMessageKey(idempotencyKey.current, () => crypto.randomUUID());
     setFailure(null);
     setSending(true);
-    const result = await postPersonalAgentMessage(agentId, {
-      content,
-      idempotencyKey: idempotencyKey.current,
-    }, session.value.csrf);
+    const result = await postPersonalAgentMessageRequest({
+      body: {
+        content,
+        idempotencyKey: idempotencyKey.current,
+      },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { agent_id: agentId },
+    });
     setSending(false);
     if (result.data && result.response?.ok) {
       idempotencyKey.current = null;

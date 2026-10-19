@@ -92,10 +92,13 @@ describe("personal agent list", () => {
 });
 
 describe("personal agent thread", () => {
-  test("uses the owner-approved agent API routes", () => {
-    expect(source).toContain('personalAgentRequest("/app/api/v1/agents")');
-    expect(source).toContain("/app/api/v1/agents/${encodeURIComponent(agentId)}");
-    expect(source).not.toContain("/app/api/v1/personal-agents");
+  test("uses the generated agent API client", () => {
+    expect(source).toContain("listPersonalAgentsRequest({");
+    expect(source).toContain("createPersonalAgentRequest({");
+    expect(source).toContain("getPersonalAgentRequest({");
+    expect(source).toContain("listPersonalAgentMessages({");
+    expect(source).toContain("postPersonalAgentMessageRequest({");
+    expect(source).not.toContain("fetch(");
   });
 
   test("uses a browser event stream instead of polling for turn updates", () => {
