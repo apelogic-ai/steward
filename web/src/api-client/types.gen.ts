@@ -4184,6 +4184,36 @@ export type GetPersonalAgentResponses = {
 
 export type GetPersonalAgentResponse = GetPersonalAgentResponses[keyof GetPersonalAgentResponses];
 
+export type PersonalAgentEventsData = {
+    body?: never;
+    headers?: {
+        'Last-Event-ID'?: number | null;
+    };
+    path: {
+        agent_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/agents/{agent_id}/events';
+};
+
+export type PersonalAgentEventsErrors = {
+    400: PersonalAgentErrorResponse;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    404: PersonalAgentErrorResponse;
+    503: PersonalAgentErrorResponse;
+};
+
+export type PersonalAgentEventsError = PersonalAgentEventsErrors[keyof PersonalAgentEventsErrors];
+
+export type PersonalAgentEventsResponses = {
+    200: string;
+};
+
+export type PersonalAgentEventsResponse = PersonalAgentEventsResponses[keyof PersonalAgentEventsResponses];
+
 export type ListPersonalAgentMessagesData = {
     body?: never;
     path: {
