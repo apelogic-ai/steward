@@ -12,9 +12,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Signed-in users can create owner-scoped personal agents from a configured coding agent and an
   active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
   The dispatcher merges messages that arrive during a turn into one next turn, resumes the same
-  Run after restart, and always requests models without tools. Deployment settings bound retained
-  conversation turns, leases, and status checks. A resumable event stream sends durable status and
-  final-reply updates, with heartbeat and no-buffering headers for the browser edge path.
+  Run after restart, and always requests one selected Envelope model without tools. Envelopes with
+  multiple models require an explicit choice. Deployment settings bound concurrent turns,
+  transient attempts, retained conversation turns, leases, status checks, and every content size. A
+  resumable event stream sends durable status and final-reply updates, with heartbeat and
+  no-buffering headers for the browser edge path.
 
 ## [0.3.20] - 2026-10-18
 

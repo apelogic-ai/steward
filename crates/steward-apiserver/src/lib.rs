@@ -2994,7 +2994,10 @@ impl IntoResponse for ApiError {
                 | StoreError::ConnectionOAuthFlowPending
                 | StoreError::CumulativeEscalationConflict
                 | StoreError::PersonalAgentEnvelopeInactive
+                | StoreError::PersonalAgentModelRequired
+                | StoreError::PersonalAgentModelUnavailable
                 | StoreError::PersonalAgentMessageConflict
+                | StoreError::PersonalAgentConversationTooLarge
                 | StoreError::PersonalAgentLeaseLost,
             ) => StatusCode::CONFLICT,
             Self::Store(
@@ -3015,7 +3018,8 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidWorkflow
                 | StoreError::InvalidConnectionOperation
                 | StoreError::InvalidPersonalAgent
-                | StoreError::InvalidPersonalAgentMessage,
+                | StoreError::InvalidPersonalAgentMessage
+                | StoreError::PersonalAgentReplyTooLarge,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Store(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
                 StatusCode::BAD_REQUEST

@@ -3,9 +3,11 @@
 CREATE TABLE personal_agents (
     id uuid PRIMARY KEY,
     owner_user_id text NOT NULL REFERENCES canonical_users(user_id) ON DELETE RESTRICT,
-    name text NOT NULL CHECK (name <> '' AND char_length(name) <= 200),
+    name text NOT NULL CHECK (name <> ''),
     agent_ref text NOT NULL CHECK (agent_ref <> '' AND char_length(agent_ref) <= 255),
-    instructions text NOT NULL CHECK (octet_length(instructions) <= 16384),
+    instructions text NOT NULL,
+    model_provider text NOT NULL,
+    model_name text NOT NULL,
     envelope_request_id uuid NOT NULL REFERENCES envelope_requests(id) ON DELETE RESTRICT,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
@@ -16,10 +18,11 @@ CREATE INDEX personal_agents_by_owner
 
 CREATE TABLE personal_agent_turns (
     id uuid PRIMARY KEY,
-    agent_id uuid NOT NULL REFERENCES personal_agents(id) ON DELETE CASCADE,
+    -- Retention and deletion semantics are defined by #587; immutable history blocks cascades.
+    agent_id uuid NOT NULL REFERENCES personal_agents(id) ON DELETE RESTRICT,
     status text NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed')),
     task_uid uuid REFERENCES task_submissions(task_uid) ON DELETE RESTRICT,
-    reply text CHECK (reply IS NULL OR octet_length(reply) <= 1048576),
+    reply text,
     failure_reason text CHECK (
         failure_reason IS NULL
         OR (failure_reason <> '' AND char_length(failure_reason) <= 500)
@@ -29,6 +32,7 @@ CREATE TABLE personal_agent_turns (
     created_at timestamptz NOT NULL DEFAULT now(),
     started_at timestamptz,
     completed_at timestamptz,
+    dispatch_attempts integer NOT NULL DEFAULT 0 CHECK (dispatch_attempts >= 0),
     CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
     CHECK (
         (status = 'queued' AND started_at IS NULL AND completed_at IS NULL)
@@ -50,11 +54,11 @@ CREATE INDEX personal_agent_turns_dispatch
 
 CREATE TABLE personal_agent_messages (
     id uuid PRIMARY KEY,
-    agent_id uuid NOT NULL REFERENCES personal_agents(id) ON DELETE CASCADE,
-    turn_id uuid NOT NULL REFERENCES personal_agent_turns(id) ON DELETE CASCADE,
+    agent_id uuid NOT NULL REFERENCES personal_agents(id) ON DELETE RESTRICT,
+    turn_id uuid NOT NULL REFERENCES personal_agent_turns(id) ON DELETE RESTRICT,
     idempotency_key text NOT NULL
         CHECK (idempotency_key <> '' AND char_length(idempotency_key) <= 255),
-    content text NOT NULL CHECK (content <> '' AND octet_length(content) <= 16384),
+    content text NOT NULL CHECK (content <> ''),
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (agent_id, idempotency_key)
 );
@@ -69,8 +73,8 @@ FOR EACH ROW EXECUTE FUNCTION steward_reject_history_mutation();
 -- TODO(#587): define bounded retention and an expired-resume contract before pruning.
 CREATE TABLE personal_agent_turn_events (
     seq bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    agent_id uuid NOT NULL REFERENCES personal_agents(id) ON DELETE CASCADE,
-    turn_id uuid NOT NULL REFERENCES personal_agent_turns(id) ON DELETE CASCADE,
+    agent_id uuid NOT NULL REFERENCES personal_agents(id) ON DELETE RESTRICT,
+    turn_id uuid NOT NULL REFERENCES personal_agent_turns(id) ON DELETE RESTRICT,
     kind text NOT NULL CHECK (kind = 'turn.updated'),
     payload jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
