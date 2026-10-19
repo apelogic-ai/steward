@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "steward-conformance"
-version = "0.3.19"
+version = "0.3.20"

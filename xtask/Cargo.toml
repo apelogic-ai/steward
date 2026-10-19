@@ -12,16 +12,16 @@ serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-steward-adapter-fake = { path = "../adapters/fake", version = "=0.3.19" }
-steward-adapter-github-source = { path = "../adapters/github-source", version = "=0.3.19" }
-steward-adapter-jira = { path = "../adapters/jira", version = "=0.3.19" }
-steward-adapter-litellm = { path = "../adapters/litellm", version = "=0.3.19" }
-steward-adapter-mcp-gw = { path = "../adapters/mcp-gw", version = "=0.3.19" }
-steward-adapter-opa = { path = "../adapters/opa", version = "=0.3.19" }
-steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.3.19" }
-steward-adapter-spire = { path = "../adapters/spire", version = "=0.3.19" }
-steward-ports = { path = "../crates/steward-ports", version = "=0.3.19" }
-steward-types = { path = "../crates/steward-types", version = "=0.3.19" }
+steward-adapter-fake = { path = "../adapters/fake", version = "=0.3.20" }
+steward-adapter-github-source = { path = "../adapters/github-source", version = "=0.3.20" }
+steward-adapter-jira = { path = "../adapters/jira", version = "=0.3.20" }
+steward-adapter-litellm = { path = "../adapters/litellm", version = "=0.3.20" }
+steward-adapter-mcp-gw = { path = "../adapters/mcp-gw", version = "=0.3.20" }
+steward-adapter-opa = { path = "../adapters/opa", version = "=0.3.20" }
+steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.3.20" }
+steward-adapter-spire = { path = "../adapters/spire", version = "=0.3.20" }
+steward-ports = { path = "../crates/steward-ports", version = "=0.3.20" }
+steward-types = { path = "../crates/steward-types", version = "=0.3.20" }
 toml = "1.1.3"
 
 [lints]

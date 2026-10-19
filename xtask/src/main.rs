@@ -1184,7 +1184,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.19" => Ok(true),
+            "0.3.20" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -5145,7 +5145,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.19")
+            Some("0.3.20")
         );
         assert_eq!(
             manifest
