@@ -83,6 +83,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
+mod personal_agents;
+
 const RUNTIME_PATH_PREFIX: &str =
     "/apis/agents.apelogic.ai/v1alpha1/namespaces/steward-test/agentruntimes";
 const WORKFLOW_RUNTIME_PATH_PREFIX: &str =
