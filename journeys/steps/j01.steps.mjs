@@ -409,8 +409,12 @@ async function selectConfiguredRuntime(page, envelopeSpec, envelopeName) {
   }
   const modelPicker = fieldLocator(page, "Model");
   if (configuredModel) {
-    await expect(modelPicker, "the Run form should expose the configured Model picker").toHaveCount(1);
-    await selectConfiguredOption(modelPicker, configuredModel, "Model");
+    if (new URL(page.url()).pathname === "/agents/new") {
+      await expect(modelPicker, "the New agent form chooses its model from the selected Envelope").toHaveCount(0);
+    } else {
+      await expect(modelPicker, "the Run form should expose the configured Model picker").toHaveCount(1);
+      await selectConfiguredOption(modelPicker, configuredModel, "Model");
+    }
   } else if (await modelPicker.count()) {
     await chooseFirstOfferedModel(page);
   }
