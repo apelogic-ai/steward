@@ -1186,6 +1186,15 @@ async fn authenticate_browser_user_request(
         Ok(token) => token,
         Err(error) => return error.into_response(),
     };
+    if let Some(token) = &user_token {
+        let audit_record = browser_user_request_audit_record(
+            &token.principal,
+            &token.caller_reference,
+            request.method(),
+            request.uri().path(),
+        );
+        (service.request_audit_reporter)(&audit_record);
+    }
     if let (Some(cookie), Some(token)) = (&cookie_session, &user_token)
         && cookie.principal.canonical_user_id != token.principal.canonical_user_id
     {
@@ -1204,15 +1213,6 @@ async fn authenticate_browser_user_request(
     } else {
         return BrowserAuthFailure::InvalidSession.into_response();
     };
-    if let Some(reference) = &caller_reference {
-        let audit_record = browser_user_request_audit_record(
-            &principal,
-            reference,
-            request.method(),
-            request.uri().path(),
-        );
-        (service.request_audit_reporter)(&audit_record);
-    }
     let is_mutation = matches!(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
