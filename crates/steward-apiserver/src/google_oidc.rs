@@ -104,6 +104,7 @@ struct UserTokenIdentityConfig {
     discovery_endpoint: String,
     identity_policy: OrganizationIdentityPolicy,
     organization_claim: String,
+    user_id_claim: String,
     email_claim: String,
     trust_email: bool,
 }
@@ -112,6 +113,7 @@ pub struct UserTokenSettings {
     pub issuer: String,
     pub organization_claim: String,
     pub organization_id: OrganizationId,
+    pub user_id_claim: String,
     pub email_claim: String,
     pub trust_email: bool,
     pub api_audience: String,
@@ -137,6 +139,7 @@ impl UserTokenConfig {
             issuer,
             organization_claim,
             organization_id,
+            user_id_claim,
             email_claim,
             trust_email,
             api_audience,
@@ -163,15 +166,24 @@ impl UserTokenConfig {
         {
             return Err("user token configuration is invalid".to_owned());
         }
-        if email_claim.is_empty()
-            || email_claim.len() > 128
-            || !email_claim
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        let valid_claim_name = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        };
+        if !valid_claim_name(&user_id_claim)
+            || !valid_claim_name(&email_claim)
+            || matches!(
+                user_id_claim.as_str(),
+                "iss" | "aud" | "azp" | "client_id" | "exp" | "iat" | "nbf" | "name"
+            )
             || matches!(
                 email_claim.as_str(),
                 "iss" | "sub" | "aud" | "azp" | "client_id" | "exp" | "iat" | "nbf" | "name"
             )
+            || user_id_claim == email_claim
         {
             return Err("user token configuration is invalid".to_owned());
         }
@@ -238,6 +250,7 @@ impl UserTokenConfig {
             )?,
             issuer,
             organization_claim,
+            user_id_claim,
             email_claim,
             trust_email,
         };
@@ -550,6 +563,7 @@ pub(crate) fn fixture_user_token_verifier(
         issuer: "https://issuer.example.test".to_owned(),
         organization_claim: "example.com".to_owned(),
         organization_id: steward_types::OrganizationId::parse("org_example")?,
+        user_id_claim: "sub".to_owned(),
         email_claim: "email".to_owned(),
         trust_email,
         api_audience: "steward-api".to_owned(),
@@ -776,6 +790,7 @@ fn validate_user_token_claims(
         .nbf
         .is_none_or(|not_before| not_before <= now.saturating_add(CLOCK_SKEW_SECONDS));
     if claims.iss != config.identity.issuer
+        || config.identity.user_id_claim != "sub"
         || !audience_matches
         || !config.frontend_client_ids.contains(frontend_client_id)
         || !expiration_is_valid
@@ -1507,6 +1522,7 @@ mod tests {
             issuer: "https://issuer.example.test".to_owned(),
             organization_claim: "example.com".to_owned(),
             organization_id: OrganizationId::parse("org_example")?,
+            user_id_claim: "sub".to_owned(),
             email_claim: "email".to_owned(),
             trust_email: false,
             api_audience: "steward-api".to_owned(),
@@ -2279,6 +2295,7 @@ mod tests {
                     issuer: "https://issuer.example.test".to_owned(),
                     organization_claim: "example.com".to_owned(),
                     organization_id: OrganizationId::parse("org_example")?,
+                    user_id_claim: "sub".to_owned(),
                     email_claim: "email".to_owned(),
                     trust_email: false,
                     api_audience: api_audience.to_owned(),
@@ -2295,6 +2312,7 @@ mod tests {
                 issuer: "https://issuer.example.test/π".to_owned(),
                 organization_claim: "example.com".to_owned(),
                 organization_id: OrganizationId::parse("org_example")?,
+                user_id_claim: "sub".to_owned(),
                 email_claim: "email".to_owned(),
                 trust_email: false,
                 api_audience: "steward-api".to_owned(),
@@ -2388,6 +2406,7 @@ mod tests {
                 issuer: "https://issuer.example.test".to_owned(),
                 organization_claim: "example.com".to_owned(),
                 organization_id: OrganizationId::parse("org_example")?,
+                user_id_claim: "sub".to_owned(),
                 email_claim: email_claim.to_owned(),
                 trust_email,
                 api_audience: "steward-api".to_owned(),
@@ -2500,6 +2519,7 @@ mod tests {
                     issuer: google_issuer.to_owned(),
                     organization_claim: "example.com".to_owned(),
                     organization_id: OrganizationId::parse("org_example")?,
+                    user_id_claim: "sub".to_owned(),
                     email_claim: "email".to_owned(),
                     trust_email: false,
                     api_audience: "steward-api".to_owned(),

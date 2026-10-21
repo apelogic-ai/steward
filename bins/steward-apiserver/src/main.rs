@@ -852,6 +852,7 @@ fn parse_browser_user_token_config(
         issuer,
         organization_claim,
         organization_id,
+        user_id_claim: "sub".to_owned(),
         email_claim,
         trust_email,
         api_audience,
