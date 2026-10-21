@@ -178,11 +178,28 @@ impl UserTokenConfig {
             || !valid_claim_name(&email_claim)
             || matches!(
                 user_id_claim.as_str(),
-                "iss" | "aud" | "azp" | "client_id" | "exp" | "iat" | "nbf" | "name"
+                "iss"
+                    | "aud"
+                    | "azp"
+                    | "client_id"
+                    | "exp"
+                    | "iat"
+                    | "nbf"
+                    | "name"
+                    | "email_verified"
             )
             || matches!(
                 email_claim.as_str(),
-                "iss" | "sub" | "aud" | "azp" | "client_id" | "exp" | "iat" | "nbf" | "name"
+                "iss"
+                    | "sub"
+                    | "aud"
+                    | "azp"
+                    | "client_id"
+                    | "exp"
+                    | "iat"
+                    | "nbf"
+                    | "name"
+                    | "email_verified"
             )
             || user_id_claim == email_claim
         {
@@ -2398,8 +2415,7 @@ mod tests {
             })
             .is_err()
         );
-        for (user_id_claim, email_claim) in
-            [("email_verified", "email"), ("sub", "email_verified")]
+        for (user_id_claim, email_claim) in [("email_verified", "email"), ("sub", "email_verified")]
         {
             assert!(
                 UserTokenConfig::new(UserTokenSettings {
