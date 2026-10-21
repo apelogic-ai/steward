@@ -34,11 +34,12 @@ use steward_apiserver::{
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
     agent_runs_ui, browser_admin, browser_auth, browser_task_rerunner, browser_task_router,
     connections, github_automation, google_oidc, governed_connections, inference_connections,
-    operator_admin, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
+    operator_admin, personal_agents, router, stable_runtime_bridge, task_router, user_envelopes,
+    workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PgStore,
+    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PersonalAgentLimits, PgStore,
     RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE, TaskOrchestrationMode,
 };
 use steward_types::{CanonicalUserId, InferenceMode, OrganizationId};
@@ -957,6 +958,24 @@ async fn browser_application_router(
             google_oidc::OidcUserTokenVerifier::new(user_tokens).map_err(io::Error::other)?,
         ));
     }
+    let personal_agent_config = personal_agent_configuration()?;
+    let personal_agent_refs = workflow_agents
+        .iter()
+        .map(|agent| agent.agent_ref.clone())
+        .collect::<Vec<_>>();
+    let _personal_agent_dispatcher = personal_agents::spawn_dispatcher(
+        store.clone(),
+        task_api_config.clone(),
+        personal_agent_config,
+    );
+    let personal_agent_router = personal_agents::protected_router(
+        store.clone(),
+        personal_agent_refs,
+        auth.clone(),
+        personal_agent_config,
+    )
+    .await
+    .map_err(io::Error::other)?;
     let connections = governed_connections_configuration(
         &origin,
         store.clone(),
@@ -986,6 +1005,7 @@ async fn browser_application_router(
         application_config.task_identity_discovery_enabled,
     );
     let app = browser_auth::browser_auth_router(auth.clone())
+        .merge(personal_agent_router)
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
                 store.clone(),
@@ -1073,6 +1093,173 @@ async fn browser_application_router(
         None => app,
     };
     Ok(Some(app))
+}
+
+fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig, io::Error> {
+    let recent_turn_limit =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_RECENT_TURN_LIMIT.to_string());
+    let lease_seconds = optional_unicode_environment("STEWARD_PERSONAL_AGENT_LEASE_SECONDS")?
+        .unwrap_or_else(|| personal_agents::DEFAULT_LEASE_SECONDS.to_string());
+    let poll_interval_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_POLL_INTERVAL_SECONDS.to_string());
+    let max_concurrent_turns =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string());
+    let max_transient_attempts =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string());
+    let retry_backoff_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string());
+    let max_claims_per_turn =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_CLAIMS_PER_TURN.to_string());
+    let monitoring_grace_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MONITORING_GRACE_SECONDS.to_string());
+    let max_name_characters = personal_agent_limit(
+        "MAX_NAME_CHARACTERS",
+        personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
+    )?;
+    let max_instructions_bytes = personal_agent_limit(
+        "MAX_INSTRUCTIONS_BYTES",
+        personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
+    )?;
+    let max_message_bytes = personal_agent_limit(
+        "MAX_MESSAGE_BYTES",
+        personal_agents::DEFAULT_MAX_MESSAGE_BYTES,
+    )?;
+    let max_queued_bytes = personal_agent_limit(
+        "MAX_QUEUED_BYTES",
+        personal_agents::DEFAULT_MAX_QUEUED_BYTES,
+    )?;
+    let max_reply_bytes =
+        personal_agent_limit("MAX_REPLY_BYTES", personal_agents::DEFAULT_MAX_REPLY_BYTES)?;
+    let max_prompt_bytes = personal_agent_limit(
+        "MAX_PROMPT_BYTES",
+        personal_agents::DEFAULT_MAX_PROMPT_BYTES,
+    )?;
+    personal_agent_configuration_from_all_values(
+        PersonalAgentDispatchSettingValues {
+            recent_turn_limit: &recent_turn_limit,
+            lease_seconds: &lease_seconds,
+            poll_interval_seconds: &poll_interval_seconds,
+            max_concurrent_turns: &max_concurrent_turns,
+            max_transient_attempts: &max_transient_attempts,
+            retry_backoff_seconds: &retry_backoff_seconds,
+            max_claims_per_turn: &max_claims_per_turn,
+            monitoring_grace_seconds: &monitoring_grace_seconds,
+        },
+        PersonalAgentLimits {
+            max_name_characters,
+            max_instructions_bytes,
+            max_message_bytes,
+            max_queued_bytes,
+            max_reply_bytes,
+            max_prompt_bytes,
+        },
+    )
+}
+
+fn personal_agent_limit(name: &str, default: usize) -> Result<usize, io::Error> {
+    let variable = format!("STEWARD_PERSONAL_AGENT_{name}");
+    optional_unicode_environment(&variable)?
+        .unwrap_or_else(|| default.to_string())
+        .parse::<usize>()
+        .map_err(|_| io::Error::other(format!("{variable} must be an integer")))
+}
+
+#[cfg(test)]
+fn personal_agent_configuration_from_values(
+    recent_turn_limit: &str,
+    lease_seconds: &str,
+    poll_interval_seconds: &str,
+) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
+    personal_agent_configuration_from_all_values(
+        PersonalAgentDispatchSettingValues {
+            recent_turn_limit,
+            lease_seconds,
+            poll_interval_seconds,
+            max_concurrent_turns: &personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string(),
+            max_transient_attempts: &personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string(),
+            retry_backoff_seconds: &personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string(),
+            max_claims_per_turn: &personal_agents::DEFAULT_MAX_CLAIMS_PER_TURN.to_string(),
+            monitoring_grace_seconds: &personal_agents::DEFAULT_MONITORING_GRACE_SECONDS
+                .to_string(),
+        },
+        PersonalAgentLimits {
+            max_name_characters: personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
+            max_instructions_bytes: personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
+            max_message_bytes: personal_agents::DEFAULT_MAX_MESSAGE_BYTES,
+            max_queued_bytes: personal_agents::DEFAULT_MAX_QUEUED_BYTES,
+            max_reply_bytes: personal_agents::DEFAULT_MAX_REPLY_BYTES,
+            max_prompt_bytes: personal_agents::DEFAULT_MAX_PROMPT_BYTES,
+        },
+    )
+}
+
+struct PersonalAgentDispatchSettingValues<'a> {
+    recent_turn_limit: &'a str,
+    lease_seconds: &'a str,
+    poll_interval_seconds: &'a str,
+    max_concurrent_turns: &'a str,
+    max_transient_attempts: &'a str,
+    retry_backoff_seconds: &'a str,
+    max_claims_per_turn: &'a str,
+    monitoring_grace_seconds: &'a str,
+}
+
+fn personal_agent_configuration_from_all_values(
+    values: PersonalAgentDispatchSettingValues<'_>,
+    limits: PersonalAgentLimits,
+) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
+    let recent_turn_limit = values.recent_turn_limit.parse::<i64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT must be an integer")
+    })?;
+    let lease_seconds = values
+        .lease_seconds
+        .parse::<i64>()
+        .map_err(|_| io::Error::other("STEWARD_PERSONAL_AGENT_LEASE_SECONDS must be an integer"))?;
+    let poll_interval_seconds = values.poll_interval_seconds.parse::<u64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS must be an integer")
+    })?;
+    let max_concurrent_turns = values.max_concurrent_turns.parse::<usize>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS must be an integer")
+    })?;
+    let max_transient_attempts = values.max_transient_attempts.parse::<i32>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS must be an integer")
+    })?;
+    let retry_backoff_seconds = values.retry_backoff_seconds.parse::<i64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS must be an integer")
+    })?;
+    let max_claims_per_turn = values.max_claims_per_turn.parse::<i32>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN must be an integer")
+    })?;
+    let monitoring_grace_seconds =
+        values
+            .monitoring_grace_seconds
+            .parse::<i64>()
+            .map_err(|_| {
+                io::Error::other(
+                    "STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS must be an integer",
+                )
+            })?;
+    personal_agents::PersonalAgentConfig::new(
+        personal_agents::PersonalAgentDispatchSettings {
+            recent_turn_limit,
+            lease_seconds,
+            poll_interval_seconds,
+            max_concurrent_turns,
+            max_transient_attempts,
+            retry_backoff_seconds,
+            max_claims_per_turn,
+            monitoring_grace_seconds,
+        },
+        limits,
+    )
+    .map_err(io::Error::other)
 }
 
 type GovernedConnectionMutations =
@@ -2052,8 +2239,9 @@ mod tests {
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
         github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
         parse_browser_user_token_config, parse_execution_bindings_mode, parse_inference_mode,
-        parse_template_document, rustls_crypto_provider, stable_bridge_configuration_from_values,
-        templates_command, validate_execution_bindings, with_claude_code_execution_adapter,
+        parse_template_document, personal_agent_configuration_from_values, rustls_crypto_provider,
+        stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
+        with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -2085,6 +2273,25 @@ mod tests {
             steward_types::OrganizationId::parse("org_example".to_owned())
                 .map_err(std::io::Error::other)?,
         )
+    }
+
+    #[test]
+    fn personal_agent_dispatcher_configuration_is_bounded_and_coherent() {
+        assert!(personal_agent_configuration_from_values("8", "30", "2").is_ok());
+        for values in [
+            ("0", "30", "2"),
+            ("101", "30", "2"),
+            ("8", "4", "2"),
+            ("8", "3601", "2"),
+            ("8", "30", "0"),
+            ("8", "30", "16"),
+            ("eight", "30", "2"),
+        ] {
+            assert!(
+                personal_agent_configuration_from_values(values.0, values.1, values.2).is_err(),
+                "invalid personal-agent dispatcher configuration {values:?} must fail startup"
+            );
+        }
     }
 
     #[test]

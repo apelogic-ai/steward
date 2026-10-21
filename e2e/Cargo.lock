@@ -3715,6 +3715,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64",
+ "chrono",
  "futures",
  "jsonwebtoken",
  "k8s-openapi",
@@ -3793,6 +3794,7 @@ name = "steward-store"
 version = "0.3.20"
 dependencies = [
  "ring",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",

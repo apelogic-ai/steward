@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
 - Optional headless user access accepts RS256 or ES256 JWT access tokens from an exact configured
   OIDC issuer on `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum
   token age are configured. The portal audience and token `typ` are separate opt-ins. Tokens reuse
@@ -15,6 +17,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   configurable; operators may either require `email_verified` or explicitly trust the issuer's
   email, which also permits exact same-organization email linking to an existing canonical user.
   Google access tokens remain browser-session only because Google issues opaque user access tokens.
+- Signed-in users can create owner-scoped personal agents from a configured coding agent and an
+  active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
+  The dispatcher merges messages that arrive during a turn into one next turn, resumes the same
+  Run after restart, and always requests one selected Envelope model without tools. Envelopes with
+  multiple models require an explicit choice. Deployment settings bound concurrent turns,
+  Task-start attempts, unexpected restarts, retained conversation turns, leases, status checks,
+  total monitoring time, and every content size. A resumable event stream sends durable status and
+  final-reply updates, with heartbeat and no-buffering headers for the browser edge path.
 
 ## [0.3.20] - 2026-10-18
 
@@ -74,8 +84,9 @@ chart rendering, caller refusal coverage, and coding-agent execution evidence.
 - The Helm chart now renders every Jira receiver numeric environment setting as decimal digits,
   preventing the receiver from rejecting large default or ceiling values written in scientific
   notation.
-- The Codex reference runtime now pins the latest reviewed Ubuntu kernel headers and limits its
-  vulnerability exception to three named, unfixed kernel-code findings with a dated review.
+- The Codex reference runtime now removes inherited C build tools and kernel headers after
+  installing its prebuilt tools. Its release scan still fails on critical findings and verifies
+  that the header package is absent.
 - Jira webhook delivery now recovers its concurrency and cooldown state if Task startup stops
   unexpectedly, treats semantically identical JSON retries as one delivery, reuses bounded
   Kubernetes access credentials within one Task lifecycle, requests a fresh workload assertion for

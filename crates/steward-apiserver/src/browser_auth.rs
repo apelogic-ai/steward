@@ -226,6 +226,28 @@ pub struct VerifiedOrganizationClaims {
     pub(crate) nonce: String,
 }
 
+impl VerifiedOrganizationClaims {
+    pub fn new(
+        issuer: String,
+        subject: String,
+        hosted_domain: String,
+        email: String,
+        email_verified: bool,
+        display_name: Option<String>,
+        nonce: String,
+    ) -> Self {
+        Self {
+            issuer,
+            subject,
+            hosted_domain,
+            email,
+            email_verified,
+            display_name,
+            nonce,
+        }
+    }
+}
+
 pub trait BrowserOidcProvider: Send + Sync + 'static {
     fn authorization_url(
         &self,

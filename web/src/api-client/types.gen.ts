@@ -944,6 +944,14 @@ export type CreateEnvelopeRequestBody = {
     templateRevision?: number | null;
 };
 
+export type CreatePersonalAgentBody = {
+    agentRef: string;
+    envelopeRequestId: string;
+    instructions: string;
+    model?: null | ModelRef;
+    name: string;
+};
+
 export type CreateRuntimeRequest = {
     name: string;
     spec: AgentRuntimeSpec;
@@ -1470,6 +1478,73 @@ export type PackageClosure = {
     contractVersion: string;
     entries: Array<ClosureEntry>;
     entryPoint: RelativePath;
+};
+
+export type PersonalAgentErrorResponse = {
+    apiVersion: string;
+    error: string;
+    failureReason: string;
+};
+
+export type PersonalAgentMessageView = {
+    content: string;
+    createdAt: string;
+    id: string;
+};
+
+export type PersonalAgentReplyView = {
+    content: string;
+    createdAt: string;
+};
+
+export type PersonalAgentResponse = {
+    agent: PersonalAgentView;
+    apiVersion: string;
+};
+
+export type PersonalAgentTurnResponse = {
+    apiVersion: string;
+    turn: PersonalAgentTurnView;
+};
+
+export type PersonalAgentTurnStatusView = 'queued' | 'running' | 'done' | 'failed';
+
+export type PersonalAgentTurnView = {
+    completedAt?: string | null;
+    createdAt: string;
+    failureReason?: string | null;
+    id: string;
+    messages: Array<PersonalAgentMessageView>;
+    reply?: null | PersonalAgentReplyView;
+    runId?: string | null;
+    startedAt?: string | null;
+    status: PersonalAgentTurnStatusView;
+};
+
+export type PersonalAgentTurnsResponse = {
+    apiVersion: string;
+    turns: Array<PersonalAgentTurnView>;
+};
+
+export type PersonalAgentView = {
+    agentRef: string;
+    createdAt: string;
+    envelopeRequestId: string;
+    id: string;
+    instructions: string;
+    model: ModelRef;
+    name: string;
+    updatedAt: string;
+};
+
+export type PersonalAgentsResponse = {
+    agents: Array<PersonalAgentView>;
+    apiVersion: string;
+};
+
+export type PostPersonalAgentMessageBody = {
+    content: string;
+    idempotencyKey: string;
 };
 
 export type Principal = {
@@ -4032,6 +4107,172 @@ export type GetOperatorEffectiveAccessResponses = {
 };
 
 export type GetOperatorEffectiveAccessResponse = GetOperatorEffectiveAccessResponses[keyof GetOperatorEffectiveAccessResponses];
+
+export type ListPersonalAgentsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/agents';
+};
+
+export type ListPersonalAgentsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    503: PersonalAgentErrorResponse;
+};
+
+export type ListPersonalAgentsError = ListPersonalAgentsErrors[keyof ListPersonalAgentsErrors];
+
+export type ListPersonalAgentsResponses = {
+    200: PersonalAgentsResponse;
+};
+
+export type ListPersonalAgentsResponse = ListPersonalAgentsResponses[keyof ListPersonalAgentsResponses];
+
+export type CreatePersonalAgentData = {
+    body: CreatePersonalAgentBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/agents';
+};
+
+export type CreatePersonalAgentErrors = {
+    400: PersonalAgentErrorResponse;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    404: PersonalAgentErrorResponse;
+    409: PersonalAgentErrorResponse;
+    503: PersonalAgentErrorResponse;
+};
+
+export type CreatePersonalAgentError = CreatePersonalAgentErrors[keyof CreatePersonalAgentErrors];
+
+export type CreatePersonalAgentResponses = {
+    201: PersonalAgentResponse;
+};
+
+export type CreatePersonalAgentResponse = CreatePersonalAgentResponses[keyof CreatePersonalAgentResponses];
+
+export type GetPersonalAgentData = {
+    body?: never;
+    path: {
+        agent_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/agents/{agent_id}';
+};
+
+export type GetPersonalAgentErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    404: PersonalAgentErrorResponse;
+    503: PersonalAgentErrorResponse;
+};
+
+export type GetPersonalAgentError = GetPersonalAgentErrors[keyof GetPersonalAgentErrors];
+
+export type GetPersonalAgentResponses = {
+    200: PersonalAgentResponse;
+};
+
+export type GetPersonalAgentResponse = GetPersonalAgentResponses[keyof GetPersonalAgentResponses];
+
+export type PersonalAgentEventsData = {
+    body?: never;
+    headers?: {
+        'Last-Event-ID'?: number | null;
+    };
+    path: {
+        agent_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/agents/{agent_id}/events';
+};
+
+export type PersonalAgentEventsErrors = {
+    400: PersonalAgentErrorResponse;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    404: PersonalAgentErrorResponse;
+    503: PersonalAgentErrorResponse;
+};
+
+export type PersonalAgentEventsError = PersonalAgentEventsErrors[keyof PersonalAgentEventsErrors];
+
+export type PersonalAgentEventsResponses = {
+    200: string;
+};
+
+export type PersonalAgentEventsResponse = PersonalAgentEventsResponses[keyof PersonalAgentEventsResponses];
+
+export type ListPersonalAgentMessagesData = {
+    body?: never;
+    path: {
+        agent_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/agents/{agent_id}/messages';
+};
+
+export type ListPersonalAgentMessagesErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    404: PersonalAgentErrorResponse;
+    503: PersonalAgentErrorResponse;
+};
+
+export type ListPersonalAgentMessagesError = ListPersonalAgentMessagesErrors[keyof ListPersonalAgentMessagesErrors];
+
+export type ListPersonalAgentMessagesResponses = {
+    200: PersonalAgentTurnsResponse;
+};
+
+export type ListPersonalAgentMessagesResponse = ListPersonalAgentMessagesResponses[keyof ListPersonalAgentMessagesResponses];
+
+export type PostPersonalAgentMessageData = {
+    body: PostPersonalAgentMessageBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        agent_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/agents/{agent_id}/messages';
+};
+
+export type PostPersonalAgentMessageErrors = {
+    400: PersonalAgentErrorResponse;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    404: PersonalAgentErrorResponse;
+    409: PersonalAgentErrorResponse;
+    503: PersonalAgentErrorResponse;
+};
+
+export type PostPersonalAgentMessageError = PostPersonalAgentMessageErrors[keyof PostPersonalAgentMessageErrors];
+
+export type PostPersonalAgentMessageResponses = {
+    200: PersonalAgentTurnResponse;
+    202: PersonalAgentTurnResponse;
+};
+
+export type PostPersonalAgentMessageResponse = PostPersonalAgentMessageResponses[keyof PostPersonalAgentMessageResponses];
 
 export type GetUserCapabilitiesData = {
     body?: never;

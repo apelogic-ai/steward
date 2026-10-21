@@ -1,11 +1,12 @@
 # User journeys as feature files
 
-Twelve journeys cover the web UI (brand name in the UI: HyperShell) and service callers, one file
+Thirteen journeys cover the web UI (brand name in the UI: HyperShell) and service callers, one file
 each. A journey is one person or caller, one goal, from start to finish. The files are plain text
 that a person can read and a test runner can run.
 
 The feature set comes from the user-journey specification (J1 to J10), plus the Jira acceptance
-journey J11 and the service-caller acceptance journey J12. The runner loads all twelve
+journey J11, the service-caller acceptance journey J12, and the personal-agent acceptance journey
+J13. The runner loads all thirteen
 files. `@smoke` executes the release-critical paths in J1 through J4; `@extended` executes the
 currently passing one-account paths in J2 and J6 through J8. J5's documented paths still carry
 product findings, J9 needs a second signed-in person, and J10 needs operator control of the
@@ -26,6 +27,7 @@ are available.
 | `J10-…` | Operator changes configuration |
 | `J11-…` | User runs a Task with Jira |
 | `J12-…` | Jenkins, Temporal and Jira callers run governed work |
+| `J13-…` | User creates and chats with a personal agent |
 
 `STEPS.md` lists every sentence pattern the files use.
 
@@ -46,7 +48,7 @@ are available.
 
 ## To add a scenario or a journey
 
-1. A new feature first goes into the journey whose goal it serves, as a new scenario. Start a new file only for a new goal. Name it `J13-short-name.feature`.
+1. A new feature first goes into the journey whose goal it serves, as a new scenario. Start a new file only for a new goal. Name it `J14-short-name.feature`.
 2. Write each line with a pattern from `STEPS.md`.
 3. If no pattern fits, write the sentence the way a person would say it, and add it to `STEPS.md` in the same change. See "A sentence with no code behind it" below.
 4. Add the tags that apply.
@@ -95,6 +97,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
 | `@callers` | Exercises external caller exchange, Run API and receiver paths in J12. |
+| `@personal-agents` | Exercises the signed-in personal-agent path in J13. It creates its own standard-template Envelope fixture. |
 | `@covered-by-process-e2e` | Covered by the named real-process integration test instead of an installation journey. Unlike `@known-failing-*`, it is not waiting for a product fix. |
 | `@live-jira-webhook` | Causes a real Jira event to reach a public receiver. It also requires `@owner-only`. |
 | `@needs-public-ingress` | Requires the target receiver to be reachable from the external service. |
@@ -120,7 +123,7 @@ When a file holds a sentence that has no code:
 
 So a maintainer can write a new sentence at any time. The cost is one request to a test engineer, and the scenario stays unproven until it is answered. Reusing a pattern from `STEPS.md` costs nothing.
 
-The runner includes all twelve files, but tags select only the intended scenarios. Feature
+The runner includes all thirteen files, but tags select only the intended scenarios. Feature
 specifications without step code do not look tested: selecting one fails generation before a
 browser starts.
 
@@ -161,6 +164,14 @@ objects under that prefix:
 
 ```console
 cargo xtask journeys --tags @extended
+```
+
+Run the personal-agent path with its own unique prefix. It creates the standard template and its
+active Envelope, then creates a run-prefixed personal agent, sends one message, waits for the
+reply, and opens the linked Run:
+
+```console
+cargo xtask journeys --tags @personal-agents
 ```
 
 After the owner connects Jira, run its acceptance journey with the same prefix that created the

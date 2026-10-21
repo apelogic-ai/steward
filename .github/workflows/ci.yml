@@ -354,6 +354,14 @@ jobs:
       - name: Build Codex reference runtime
         run: docker build --platform linux/amd64 --file build/codex-reference.Dockerfile --tag steward-codex-runtime:release-validation .
 
+      - name: Confirm Codex reference runtime omits kernel headers
+        run: |
+          if docker run --rm --entrypoint /usr/bin/dpkg steward-codex-runtime:release-validation -l linux-libc-dev \
+            | grep -Eq '^ii[[:space:]]+linux-libc-dev[[:space:]]'; then
+            echo "Codex reference runtime must not install linux-libc-dev" >&2
+            exit 1
+          fi
+
       - name: Install governed sandbox tools
         uses: ./.github/actions/setup-tools
         with:
