@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, Request, State};
+use axum::extract::{MatchedPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -1186,18 +1186,24 @@ async fn authenticate_browser_user_request(
         Ok(token) => token,
         Err(error) => return error.into_response(),
     };
-    if let Some(token) = &user_token {
-        let audit_record = browser_user_request_audit_record(
-            &token.principal,
-            &token.caller_reference,
-            request.method(),
-            request.uri().path(),
-        );
-        (service.request_audit_reporter)(&audit_record);
-    }
+    let method = request.method().clone();
+    let route_template = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched")
+        .to_owned();
     if let (Some(cookie), Some(token)) = (&cookie_session, &user_token)
         && cookie.principal.canonical_user_id != token.principal.canonical_user_id
     {
+        report_browser_user_request(
+            &service,
+            token,
+            &method,
+            &route_template,
+            "refused",
+            "identity_conflict",
+        );
         return BrowserAuthFailure::InvalidSession.into_response();
     }
     let (principal, binding, caller_reference) = if let Some(cookie) = &cookie_session {
@@ -1208,8 +1214,12 @@ async fn authenticate_browser_user_request(
                 .as_ref()
                 .map(|token| token.caller_reference.clone()),
         )
-    } else if let Some(token) = user_token {
-        (token.principal, token.binding, Some(token.caller_reference))
+    } else if let Some(token) = &user_token {
+        (
+            token.principal.clone(),
+            token.binding.clone(),
+            Some(token.caller_reference.clone()),
+        )
     } else {
         return BrowserAuthFailure::InvalidSession.into_response();
     };
@@ -1226,6 +1236,16 @@ async fn authenticate_browser_user_request(
                 &cookie.csrf,
             )
         {
+            if let Some(token) = &user_token {
+                report_browser_user_request(
+                    &service,
+                    token,
+                    &method,
+                    &route_template,
+                    "refused",
+                    "invalid_mutation",
+                );
+            }
             return BrowserAuthFailure::InvalidMutation.into_response();
         }
         request.extensions_mut().insert(BrowserMutationProof(()));
@@ -1238,24 +1258,41 @@ async fn authenticate_browser_user_request(
         binding,
         caller_reference,
     });
-    next.run(request).await
+    let response = next.run(request).await;
+    if let Some(token) = &user_token {
+        report_browser_user_request(
+            &service,
+            token,
+            &method,
+            &route_template,
+            "allowed",
+            "authenticated",
+        );
+    }
+    response
 }
 
-fn browser_user_request_audit_record(
-    principal: &BrowserPrincipal,
-    reference: &CallerReference,
+fn report_browser_user_request(
+    service: &BrowserAuthService,
+    token: &VerifiedUserTokenSession,
     method: &Method,
-    path: &str,
-) -> String {
-    serde_json::json!({
-        "event": "bearer_user_request",
-        "canonicalUserId": principal.canonical_user_id,
-        "issuer": reference.url(),
-        "frontendClientId": reference.label(),
+    route_template: &str,
+    outcome: &str,
+    reason_code: &str,
+) {
+    let audit_record = serde_json::json!({
+        "event": "api_bearer_request",
+        "canonicalUserId": token.principal.canonical_user_id,
+        "issuer": token.caller_reference.url(),
+        "frontendClientId": token.caller_reference.label(),
         "method": method.as_str(),
-        "path": path,
+        "routeTemplate": route_template,
+        "outcome": outcome,
+        "reasonCode": reason_code,
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     })
-    .to_string()
+    .to_string();
+    (service.request_audit_reporter)(&audit_record);
 }
 
 fn user_token_credential(
@@ -1727,6 +1764,46 @@ mod tests {
         PendingAuthorization, VerifiedUserTokenClaims, browser_auth_router,
         local_fake_browser_auth_service, protect_browser_admin_routes, protect_browser_routes,
     };
+
+    fn parse_bearer_request_audit(
+        line: &str,
+        access_token: &str,
+    ) -> Result<serde_json::Value, String> {
+        assert!(!line.contains(access_token));
+        assert!(!line.contains("Authorization"));
+        assert!(!line.contains("authorization"));
+        assert!(!line.contains("Bearer "));
+        let audit: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("parse request audit record: {error}"))?;
+        let audit_fields = audit
+            .as_object()
+            .ok_or_else(|| "request audit record must be a JSON object".to_owned())?
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            audit_fields,
+            std::collections::BTreeSet::from([
+                "canonicalUserId",
+                "event",
+                "frontendClientId",
+                "issuer",
+                "method",
+                "outcome",
+                "reasonCode",
+                "routeTemplate",
+                "timestamp",
+            ]),
+            "the process-log contract must not gain token or claim fields"
+        );
+        chrono::DateTime::parse_from_rfc3339(
+            audit["timestamp"]
+                .as_str()
+                .ok_or_else(|| "audit timestamp must be a string".to_owned())?,
+        )
+        .map_err(|error| format!("audit timestamp must be RFC 3339: {error}"))?;
+        Ok(audit)
+    }
 
     #[derive(Clone, Copy)]
     struct FixtureTokenIdentityResolver;
@@ -3102,12 +3179,12 @@ mod tests {
                 audit_count_before_csrf_rejection + 1,
                 "an identified bearer request must be audited before CSRF refusal"
             );
-            let audit: serde_json::Value = serde_json::from_str(
+            let audit = parse_bearer_request_audit(
                 audit_lines
                     .last()
                     .ok_or_else(|| "missing CSRF-refusal audit line".to_owned())?,
-            )
-            .map_err(|error| format!("parse CSRF-refusal audit record: {error}"))?;
+                &access_token,
+            )?;
             assert_eq!(audit["outcome"], "refused");
             assert_eq!(audit["reasonCode"], "invalid_mutation");
         }
@@ -3148,15 +3225,23 @@ mod tests {
                 audit_count_before_identity_conflict + 1,
                 "a verified bearer must be audited before a cookie identity conflict is refused"
             );
-            let audit: serde_json::Value = serde_json::from_str(
+            let audit = parse_bearer_request_audit(
                 audit_lines
                     .last()
                     .ok_or_else(|| "missing identity-conflict audit line".to_owned())?,
-            )
-            .map_err(|error| format!("parse identity-conflict audit record: {error}"))?;
+                &access_token,
+            )?;
             assert_eq!(audit["outcome"], "refused");
             assert_eq!(audit["reasonCode"], "identity_conflict");
         }
+        assert_eq!(
+            audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?
+                .len(),
+            3,
+            "allowed, CSRF-refused, and identity-conflict requests must each emit one line"
+        );
         Ok(())
     }
 
@@ -3200,29 +3285,7 @@ mod tests {
             1,
             "one request must make one audit record"
         );
-        let audit: serde_json::Value = serde_json::from_str(&audit_lines[0])
-            .map_err(|error| format!("parse request audit record: {error}"))?;
-        let audit_fields = audit
-            .as_object()
-            .ok_or_else(|| "request audit record must be a JSON object".to_owned())?
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            audit_fields,
-            std::collections::BTreeSet::from([
-                "canonicalUserId",
-                "event",
-                "frontendClientId",
-                "issuer",
-                "method",
-                "outcome",
-                "reasonCode",
-                "routeTemplate",
-                "timestamp",
-            ]),
-            "the process-log contract must not gain token or claim fields"
-        );
+        let audit = parse_bearer_request_audit(&audit_lines[0], &access_token)?;
         assert_eq!(audit["event"], "api_bearer_request");
         assert_eq!(
             audit["canonicalUserId"],
@@ -3237,16 +3300,6 @@ mod tests {
         );
         assert_eq!(audit["outcome"], "allowed");
         assert_eq!(audit["reasonCode"], "authenticated");
-        chrono::DateTime::parse_from_rfc3339(
-            audit["timestamp"]
-                .as_str()
-                .ok_or_else(|| "audit timestamp must be a string".to_owned())?,
-        )
-        .map_err(|error| format!("audit timestamp must be RFC 3339: {error}"))?;
-        assert!(!audit_lines[0].contains(&access_token));
-        assert!(!audit_lines[0].contains("Authorization"));
-        assert!(!audit_lines[0].contains("authorization"));
-        assert!(!audit_lines[0].contains("Bearer "));
         Ok(())
     }
 

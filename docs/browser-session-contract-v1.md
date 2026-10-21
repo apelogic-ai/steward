@@ -153,11 +153,14 @@ organization and workspace email domain match and that user has no other subject
 issuer. The attachment records actor `user-token:<issuer>` and does not create a second user. An
 access-token issuer that still requires `email_verified` cannot use email linking. Access still
 comes only from Steward's local RBAC assignments; token claims do not grant administrator or
-member roles. Every accepted bearer identity writes one request audit record with the canonical
-user, verified issuer, allowlisted frontend client ID, HTTP method, and path, including requests
-later refused for missing browser CSRF proof. Browser Tasks persist the same issuer and frontend
-client ID through their existing caller reference. The raw token is never logged or stored. The
-request binding is a SHA-256-derived opaque value and never exposes the token.
+member roles. Every bearer-authenticated request writes exactly one `api_bearer_request` JSON line
+before its response is returned. It contains only the canonical user, verified issuer, allowlisted
+frontend client ID, HTTP method, route template, allowed or refused outcome with a reason code, and
+an RFC 3339 timestamp. Refused cookie-identity conflicts and missing browser CSRF proof are included.
+The deployment's log pipeline provides retention. Browser Tasks persist the same issuer and
+frontend client ID through their existing caller reference. The authorization value, raw token,
+token hash, and other claims are never logged or stored. The request binding is a SHA-256-derived
+opaque value and never exposes the token.
 
 `browserAuth.autoCreateUsers` defaults to `true`, preserving existing first-sign-in registration.
 When disabled, neither authentication path creates a new canonical user. Both paths may activate
