@@ -3093,14 +3093,24 @@ mod tests {
             .await
             .map_err(|error| format!("execute cookie and bearer mutation: {error}"))?;
         assert_eq!(same_person_without_csrf.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            audit_lines
+        {
+            let audit_lines = audit_lines
                 .lock()
-                .map_err(|_| "request audit capture lock poisoned".to_owned())?
-                .len(),
-            audit_count_before_csrf_rejection + 1,
-            "an identified bearer request must be audited before CSRF refusal"
-        );
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                audit_count_before_csrf_rejection + 1,
+                "an identified bearer request must be audited before CSRF refusal"
+            );
+            let audit: serde_json::Value = serde_json::from_str(
+                audit_lines
+                    .last()
+                    .ok_or_else(|| "missing CSRF-refusal audit line".to_owned())?,
+            )
+            .map_err(|error| format!("parse CSRF-refusal audit record: {error}"))?;
+            assert_eq!(audit["outcome"], "refused");
+            assert_eq!(audit["reasonCode"], "invalid_mutation");
+        }
 
         let mut other_principal = principal()?;
         other_principal.canonical_user_id =
@@ -3129,14 +3139,24 @@ mod tests {
             .await
             .map_err(|error| format!("execute conflicting identities request: {error}"))?;
         assert_eq!(conflict.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            audit_lines
+        {
+            let audit_lines = audit_lines
                 .lock()
-                .map_err(|_| "request audit capture lock poisoned".to_owned())?
-                .len(),
-            audit_count_before_identity_conflict + 1,
-            "a verified bearer must be audited before a cookie identity conflict is refused"
-        );
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                audit_count_before_identity_conflict + 1,
+                "a verified bearer must be audited before a cookie identity conflict is refused"
+            );
+            let audit: serde_json::Value = serde_json::from_str(
+                audit_lines
+                    .last()
+                    .ok_or_else(|| "missing identity-conflict audit line".to_owned())?,
+            )
+            .map_err(|error| format!("parse identity-conflict audit record: {error}"))?;
+            assert_eq!(audit["outcome"], "refused");
+            assert_eq!(audit["reasonCode"], "identity_conflict");
+        }
         Ok(())
     }
 
@@ -3157,7 +3177,7 @@ mod tests {
             }
         });
         let response = protect_browser_routes(
-            Router::new().route("/app/api/v1/agents/fixture/messages", post(probe)),
+            Router::new().route("/app/api/v1/agents/{agent_id}/messages", post(probe)),
             service,
         )
         .oneshot(
@@ -3182,6 +3202,28 @@ mod tests {
         );
         let audit: serde_json::Value = serde_json::from_str(&audit_lines[0])
             .map_err(|error| format!("parse request audit record: {error}"))?;
+        let audit_fields = audit
+            .as_object()
+            .ok_or_else(|| "request audit record must be a JSON object".to_owned())?
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            audit_fields,
+            std::collections::BTreeSet::from([
+                "canonicalUserId",
+                "event",
+                "frontendClientId",
+                "issuer",
+                "method",
+                "outcome",
+                "reasonCode",
+                "routeTemplate",
+                "timestamp",
+            ]),
+            "the process-log contract must not gain token or claim fields"
+        );
+        assert_eq!(audit["event"], "api_bearer_request");
         assert_eq!(
             audit["canonicalUserId"],
             "usr_0123456789abcdef0123456789abcdef"
@@ -3189,9 +3231,22 @@ mod tests {
         assert_eq!(audit["issuer"], "https://issuer.example.test");
         assert_eq!(audit["frontendClientId"], "portal-client");
         assert_eq!(audit["method"], "POST");
-        assert_eq!(audit["path"], "/app/api/v1/agents/fixture/messages");
-        assert!(audit.get("token").is_none());
+        assert_eq!(
+            audit["routeTemplate"],
+            "/app/api/v1/agents/{agent_id}/messages"
+        );
+        assert_eq!(audit["outcome"], "allowed");
+        assert_eq!(audit["reasonCode"], "authenticated");
+        chrono::DateTime::parse_from_rfc3339(
+            audit["timestamp"]
+                .as_str()
+                .ok_or_else(|| "audit timestamp must be a string".to_owned())?,
+        )
+        .map_err(|error| format!("audit timestamp must be RFC 3339: {error}"))?;
         assert!(!audit_lines[0].contains(&access_token));
+        assert!(!audit_lines[0].contains("Authorization"));
+        assert!(!audit_lines[0].contains("authorization"));
+        assert!(!audit_lines[0].contains("Bearer "));
         Ok(())
     }
 
