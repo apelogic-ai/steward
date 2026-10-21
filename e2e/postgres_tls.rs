@@ -1164,26 +1164,26 @@ async fn verify_user_token_identity_resolution_policy(
     store: &PgStore,
 ) -> Result<(), Box<dyn Error>> {
     let resolver = PgBrowserIdentityResolver::new(store.clone());
-    let organization_id = OrganizationId::parse("org_auth-policy")?;
+    let organization_id = OrganizationId::parse("org_acme")?;
     let google_policy = OrganizationIdentityPolicy::new(
         GOOGLE_ORGANIZATION_ISSUER,
         "example.com",
         organization_id.clone(),
     )?;
-    let browser_email = Email::parse("browser-owner@example.com")?;
+    let browser_email = Email::parse("alice@example.com")?;
     let browser_owner = google_policy.validate(
         GOOGLE_ORGANIZATION_ISSUER,
-        "browser-owner-subject",
+        "alice",
         "example.com",
         browser_email.as_str(),
         true,
     )?;
-    store
+    let browser_owner = store
         .register_canonical_identity(&browser_owner, "browser-oidc")
         .await?;
     let browser_takeover = google_policy.validate(
         GOOGLE_ORGANIZATION_ISSUER,
-        "browser-takeover-subject",
+        "bob",
         "example.com",
         browser_email.as_str(),
         true,
@@ -1202,22 +1202,11 @@ async fn verify_user_token_identity_resolution_policy(
         "example.com",
         organization_id.clone(),
     )?;
-    let untrusted_email = Email::parse("untrusted-link@example.com")?;
-    let untrusted_owner = google_policy.validate(
-        GOOGLE_ORGANIZATION_ISSUER,
-        "untrusted-link-owner",
-        "example.com",
-        untrusted_email.as_str(),
-        true,
-    )?;
-    store
-        .register_canonical_identity(&untrusted_owner, "browser-oidc")
-        .await?;
     let untrusted_candidate = token_policy.validate(
         token_issuer,
-        "untrusted-link-candidate",
+        "carol",
         "example.com",
-        untrusted_email.as_str(),
+        browser_email.as_str(),
         true,
     )?;
     assert!(
@@ -1234,22 +1223,11 @@ async fn verify_user_token_identity_resolution_policy(
         "trustEmail=false must not link an existing email owner"
     );
 
-    let trusted_email = Email::parse("trusted-link@example.com")?;
-    let trusted_owner = google_policy.validate(
-        GOOGLE_ORGANIZATION_ISSUER,
-        "trusted-link-owner",
-        "example.com",
-        trusted_email.as_str(),
-        true,
-    )?;
-    let trusted_owner = store
-        .register_canonical_identity(&trusted_owner, "browser-oidc")
-        .await?;
     let trusted_candidate = token_policy.validate(
         token_issuer,
-        "trusted-link-candidate",
+        "dave",
         "example.com",
-        trusted_email.as_str(),
+        browser_email.as_str(),
         true,
     )?;
     let linked = resolver
@@ -1261,26 +1239,15 @@ async fn verify_user_token_identity_resolution_policy(
         .await
         .map_err(|error| io::Error::other(format!("link trusted identity: {error:?}")))?;
     assert_eq!(
-        linked.canonical_user_id, trusted_owner.user_id,
+        linked.canonical_user_id, browser_owner.user_id,
         "auto-create off must still allow configured trusted linking to an existing user"
     );
 
-    let same_issuer_email = Email::parse("same-issuer-owner@example.com")?;
-    let original_subject = token_policy.validate(
-        token_issuer,
-        "same-issuer-original",
-        "example.com",
-        same_issuer_email.as_str(),
-        true,
-    )?;
-    store
-        .register_canonical_identity(&original_subject, "user-token:https://issuer.example.test")
-        .await?;
     let second_subject = token_policy.validate(
         token_issuer,
-        "same-issuer-second",
+        "carol",
         "example.com",
-        same_issuer_email.as_str(),
+        browser_email.as_str(),
         true,
     )?;
     assert!(
@@ -1297,17 +1264,23 @@ async fn verify_user_token_identity_resolution_policy(
         "email linking must refuse a user who already has another subject from that issuer"
     );
 
-    let pending_email = Email::parse("pending-auth@example.com")?;
+    let pending_organization_id = OrganizationId::parse("org_team-a")?;
+    let pending_email = Email::parse("alice@example.com")?;
     let pending = store
         .preprovision_canonical_user(
-            &organization_id,
+            &pending_organization_id,
             &pending_email,
             "usr_0123456789abcdef0123456789abcdef",
         )
         .await?;
-    let pending_identity = token_policy.validate(
+    let pending_policy = OrganizationIdentityPolicy::new_configured_oidc(
         token_issuer,
-        "pending-auth-subject",
+        "example.com",
+        pending_organization_id,
+    )?;
+    let pending_identity = pending_policy.validate(
+        token_issuer,
+        "alice",
         "example.com",
         pending_email.as_str(),
         true,
@@ -1318,11 +1291,16 @@ async fn verify_user_token_identity_resolution_policy(
         .map_err(|error| io::Error::other(format!("activate pending identity: {error:?}")))?;
     assert_eq!(activated.canonical_user_id, pending.user_id);
 
-    let unknown = token_policy.validate(
+    let unknown_policy = OrganizationIdentityPolicy::new_configured_oidc(
         token_issuer,
-        "unknown-auth-subject",
         "example.com",
-        "unknown-auth@example.com",
+        OrganizationId::parse("org_example-org")?,
+    )?;
+    let unknown = unknown_policy.validate(
+        token_issuer,
+        "bob",
+        "example.com",
+        "alice@example.com",
         true,
     )?;
     assert!(

@@ -21,10 +21,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   and persist the issuer and frontend client ID without recording the token. The stable user-ID
   and email claims are configurable; operators may either require `email_verified` or explicitly
   trust the issuer's email, which also permits exact same-organization email linking to an existing
-  canonical user. Google access tokens remain browser-session only because Google issues opaque
-  user access tokens. One shared, default-on setting controls first-sign-in creation for both
-  browser and access-token users; disabling it leaves known people working and refuses unknown
-  identities on both paths.
+  canonical user that has no other subject from that issuer. `email_verified` is reserved from
+  identity-claim mapping, and an explicit false value is always refused. Google browser sign-in
+  never email-links an active user, and Google access tokens remain browser-session only because
+  Google issues opaque user access tokens. One shared, default-on setting controls first-sign-in
+  creation for both browser and access-token users; disabling it still permits pending-invitation
+  activation and configured trusted-email linking but never creates a new canonical user. Every
+  accepted bearer identity emits one sanitized request audit record, and Tasks retain the same
+  verified issuer and frontend client ID without recording the token.
 - Signed-in users can create owner-scoped personal agents from a configured coding agent and an
   active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
   The dispatcher merges messages that arrive during a turn into one next turn, resumes the same

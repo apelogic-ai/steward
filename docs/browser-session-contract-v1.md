@@ -131,8 +131,10 @@ accepts only RS256 or ES256 signatures. It requires the configured HyperShell au
 allowlisted `azp` or `client_id`, an email in the browser workspace domain, a valid key ID, current
 `exp` and `nbf` with bounded clock skew, and an `iat` within `maximumTokenAgeSeconds`.
 `userIdClaim` selects the stable person identifier and defaults to `sub`; `emailClaim` selects the
-email claim. A token missing either configured claim is refused. By default `email_verified` must
-be true; `trustEmail=true` is an explicit operator decision to trust the configured issuer's email.
+email claim. `email_verified` is reserved and cannot be selected for either identity claim. A token
+missing either configured claim is refused. By default `email_verified` must be true;
+`trustEmail=true` is an explicit operator decision to trust the configured issuer's email. An
+explicit `email_verified=false` is always refused, including for a trusted issuer.
 If `requiredTyp` is nonempty, the JOSE `typ` must exactly match it. Opaque tokens fail closed.
 
 The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
@@ -144,20 +146,25 @@ Google user access tokens are opaque, so Google sign-in remains browser-session 
 tokens are not API bearer credentials: their client-ID audience does not satisfy the configured
 HyperShell audience. Opaque-token introspection or exchange is outside this contract.
 
-The verified subject is resolved or registered through the same canonical identity resolver as
-browser login. Google and a trusted-email access-token issuer may link their exact subject to an
-existing canonical user only when the organization and workspace email domain match; an access
-token attachment records actor `user-token:<issuer>` and does not create a second user. An
+The verified subject is resolved or registered through the canonical identity resolver. Google
+browser sign-in never attaches a new subject to an active user's email. A trusted-email
+access-token issuer may attach its exact subject to an existing canonical user only when the
+organization and workspace email domain match and that user has no other subject from the same
+issuer. The attachment records actor `user-token:<issuer>` and does not create a second user. An
 access-token issuer that still requires `email_verified` cannot use email linking. Access still
-comes only from Steward's local RBAC
-assignments; token claims do not grant administrator or member roles. Browser Tasks persist the
-verified issuer and frontend client ID through their existing caller reference. The raw token is
-never logged or stored. The request binding is a SHA-256-derived opaque value and never exposes
-the token.
+comes only from Steward's local RBAC assignments; token claims do not grant administrator or
+member roles. Every accepted bearer identity writes one request audit record with the canonical
+user, verified issuer, allowlisted frontend client ID, HTTP method, and path, including requests
+later refused for missing browser CSRF proof. Browser Tasks persist the same issuer and frontend
+client ID through their existing caller reference. The raw token is never logged or stored. The
+request binding is a SHA-256-derived opaque value and never exposes the token.
 
 `browserAuth.autoCreateUsers` defaults to `true`, preserving existing first-sign-in registration.
-When disabled, both browser sign-in and access-token authentication require an already registered
-exact issuer/subject; neither path creates or links an unknown identity.
+When disabled, neither authentication path creates a new canonical user. Both paths may activate
+an exact pending invitation. Browser sign-in otherwise requires an already registered exact
+issuer/subject and never email-links an active user. A bearer from an issuer configured with
+`trustEmail=true` may still attach to an existing active user under the constraints above; all
+other previously unseen bearer identities are refused.
 
 A bearer-only mutation does not need browser CSRF proof. If a request also contains a browser
 cookie, the cookie remains subject to the existing origin, fetch-site, content-type, and CSRF

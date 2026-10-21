@@ -364,15 +364,20 @@ to administrator routes. Google sign-in continues to use browser sessions becaus
 access tokens are opaque and are not accepted by this JWT verifier.
 
 `browserAuth.autoCreateUsers` is one shared browser and bearer policy. Its default is `true`,
-preserving first-sign-in registration. When it is `false`, both paths accept only an already known
-issuer/subject and refuse unknown people; it does not disable sign-in for known people.
+preserving first-sign-in registration. When it is `false`, neither path creates a new canonical
+user, but both may activate an exact pending invitation. Browser sign-in never links a new subject
+to an active user's email. A bearer issuer configured with `trustEmail=true` may still attach a
+subject to an existing active user with the same organization email, provided that user has no
+other subject from that issuer. Other unknown people are refused.
 
 `userIdClaim` names the issuer claim containing the stable person identifier and defaults to `sub`.
 Tokens without that configured claim are refused. `emailClaim` names the issuer claim containing
-the organization email and defaults to `email`.
+the organization email and defaults to `email`. `email_verified` is reserved and cannot be used as
+either configured identity claim.
 By default, the token must also carry `email_verified: true`. Set `trustEmail=true` only when the
-configured issuer contract makes that claim unnecessary. That opt-in also allows Steward to link
-the exact organization email to an existing canonical user; issuer groups never grant roles.
+configured issuer contract makes that claim unnecessary. An explicit `email_verified=false` is
+always refused. The trust opt-in also allows Steward to link the exact organization email to an
+existing canonical user under the constraints above; issuer groups never grant roles.
 
 ## Direct package source resolution
 
