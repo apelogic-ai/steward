@@ -2452,6 +2452,30 @@ mod tests {
     }
 
     #[test]
+    fn user_token_uses_the_configured_stable_user_id_claim() -> Result<(), String> {
+        let mut config = fixture_user_token_config(None, None)?;
+        config.identity.user_id_claim = "oid".to_owned();
+        let mut claims = fixture_user_token_claims();
+        claims.sub = "untrusted-default-subject".to_owned();
+        claims.provider_claims.insert(
+            "oid".to_owned(),
+            serde_json::Value::String("fixture-user-subject".to_owned()),
+        );
+
+        let verified = validate_user_token_claims(claims, &config, 1_100)
+            .map_err(|error| format!("verify configured stable user ID claim: {error:?}"))?;
+        assert_eq!(verified.identity.subject(), "fixture-user-subject");
+
+        let mut missing = fixture_user_token_claims();
+        missing.sub = "untrusted-default-subject".to_owned();
+        assert!(matches!(
+            validate_user_token_claims(missing, &config, 1_100),
+            Err(IdTokenError::InvalidClaims)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn mixed_jwks_ignores_non_signing_and_unsupported_keys() -> Result<(), String> {
         let jwks: JwkSet = serde_json::from_value(serde_json::json!({
             "keys": [
