@@ -1530,11 +1530,12 @@ mod tests {
     use super::{
         Audience, Cached, DiscoveryDocument, GoogleClientSecret, GoogleOidcProvider, HttpFailure,
         HttpFuture, HttpResponse, IdTokenClaims, IdTokenError,
-        JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, OidcHttpTransport, OidcUserTokenVerifier,
-        TokenExchangeRequest, USER_ID_TOKEN_FIXTURE_HEADER, USER_ID_TOKEN_FIXTURE_PAYLOAD,
-        USER_ID_TOKEN_FIXTURE_SIGNATURE, USER_TOKEN_FIXTURE_HEADER, USER_TOKEN_FIXTURE_MODULUS,
-        USER_TOKEN_FIXTURE_PAYLOAD, USER_TOKEN_FIXTURE_SIGNATURE, UserTokenClaims, UserTokenConfig,
-        UserTokenSettings, cache_ttl, validate_claims, validate_oidc_jwks,
+        JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, MAX_ID_TOKEN_BYTES, OidcHttpTransport,
+        OidcUserTokenVerifier, TokenExchangeRequest, USER_ID_TOKEN_FIXTURE_HEADER,
+        USER_ID_TOKEN_FIXTURE_PAYLOAD, USER_ID_TOKEN_FIXTURE_SIGNATURE, USER_TOKEN_FIXTURE_HEADER,
+        USER_TOKEN_FIXTURE_MODULUS, USER_TOKEN_FIXTURE_PAYLOAD, USER_TOKEN_FIXTURE_SIGNATURE,
+        UserTokenClaims, UserTokenConfig, UserTokenSettings, cache_ttl, validate_claims,
+        validate_oidc_jwks,
         validate_user_token_claims, verify_id_token, verify_user_token,
     };
 
@@ -2826,6 +2827,30 @@ mod tests {
             verifier.verify("opaque-token").await,
             Err(BrowserAuthFailure::InvalidIdentity)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_user_token_is_refused_before_provider_io() -> Result<(), String> {
+        let transport = Arc::new(CountingFailureTransport::new());
+        let verifier = OidcUserTokenVerifier::with_transport(
+            fixture_user_token_config(None, None)?,
+            transport.clone(),
+            fixture_now,
+        );
+        let oversized = format!(
+            "{USER_TOKEN_FIXTURE_HEADER}.{}.fixture-signature",
+            "a".repeat(MAX_ID_TOKEN_BYTES)
+        );
+        assert!(matches!(
+            verifier.verify(&oversized).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ));
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            0,
+            "a token over the local size limit must not trigger discovery or JWKS I/O"
+        );
         Ok(())
     }
 
