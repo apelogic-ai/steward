@@ -1222,6 +1222,13 @@ async fn authenticate_browser_user_request(
         request.extensions_mut().insert(BrowserMutationProof(()));
     }
     if let Some(reference) = &caller_reference {
+        let audit_record = browser_user_request_audit_record(
+            &principal,
+            reference,
+            request.method(),
+            request.uri().path(),
+        );
+        (service.request_audit_reporter)(&audit_record);
         request.extensions_mut().insert(reference.clone());
     }
     request.extensions_mut().insert(BrowserSessionContext {
@@ -1230,6 +1237,23 @@ async fn authenticate_browser_user_request(
         caller_reference,
     });
     next.run(request).await
+}
+
+fn browser_user_request_audit_record(
+    principal: &BrowserPrincipal,
+    reference: &CallerReference,
+    method: &Method,
+    path: &str,
+) -> String {
+    serde_json::json!({
+        "event": "bearer_user_request",
+        "canonicalUserId": principal.canonical_user_id,
+        "issuer": reference.url(),
+        "frontendClientId": reference.label(),
+        "method": method.as_str(),
+        "path": path,
+    })
+    .to_string()
 }
 
 fn user_token_credential(
@@ -3021,10 +3045,10 @@ mod tests {
         let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = audit_lines.clone();
         let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
-            captured
-                .lock()
-                .expect("request audit capture lock")
-                .push(line.to_owned());
+            match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            }
         });
         let response = protect_browser_routes(
             Router::new().route("/app/api/v1/agents/fixture/messages", post(probe)),
