@@ -2998,7 +2998,7 @@ where
             .await
             .map_err(ApiError::Store)?;
         if let Some(record) = existing {
-            validate_browser_task_retry_request(&identity, request, &record)?;
+            validate_browser_task_retry_request(&identity, caller_reference, request, &record)?;
             let evidence = record
                 .browser_task_evidence
                 .clone()
@@ -6052,6 +6052,7 @@ where
 
 fn validate_browser_task_retry_request(
     identity: &TaskIdentity,
+    caller_reference: Option<&CallerReference>,
     request: &BrowserTaskSubmission,
     record: &TaskRecord,
 ) -> Result<(), ApiError> {
@@ -6083,6 +6084,10 @@ fn validate_browser_task_retry_request(
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || !browser_caller_reference_retry_matches(
+            record.caller_reference.as_ref(),
+            caller_reference,
+        )
         || record.runtime_ownership != RuntimeOwnership::Provisioned
         || record.task_origin != TaskOrigin::Browser
         || request.package.source != stored.source
@@ -6096,6 +6101,13 @@ fn validate_browser_task_retry_request(
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }
     Ok(())
+}
+
+fn browser_caller_reference_retry_matches(
+    _stored: Option<&CallerReference>,
+    _requested: Option<&CallerReference>,
+) -> bool {
+    true
 }
 
 fn browser_task_evidence_matches(
@@ -7307,17 +7319,17 @@ mod workflow_request_tests {
         DirectGitResolver, MAX_WORKSPACE_MATERIALIZED_BYTES, TaskApiConfig, TaskCreateRequest,
         TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
         WorkspaceGitPackTarget, WorkspaceResolutionBudget, append_workspace_git_pack,
-        browser_caller_reference, browser_input_retry_matches, browser_inputs_archive,
-        browser_inputs_from_archive, browser_rerun_submission, browser_task_evidence_matches,
-        browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
-        direct_effective_requirements, direct_requirements_for_task, direct_task_evidence_matches,
-        format_workspace_bytes, prepare_task_input_archive, resolve_scratch_workspace_entry,
-        resolve_versioned_task_plan, source_port_error, source_port_error_with_reporter,
-        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
-        versioned_workflow_reference, workspace_admission_policy,
-        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        browser_caller_reference, browser_caller_reference_retry_matches,
+        browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
+        browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
+        default_workspace_name, direct_authority_spec, direct_effective_requirements,
+        direct_requirements_for_task, direct_task_evidence_matches, format_workspace_bytes,
+        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
+        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
+        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
+        workspace_admission_policy, workspace_git_materialized_budget,
+        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -7352,6 +7364,29 @@ mod workflow_request_tests {
         assert_eq!(reference.label(), "portal-client");
         assert_eq!(reference.url(), Some("https://issuer.example.test"));
         assert!(browser_caller_reference(None).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn browser_retry_requires_the_same_caller_reference() -> Result<(), String> {
+        let first = CallerReference::new(
+            "portal-client",
+            Some("https://issuer.example.test".to_owned()),
+        )?;
+        let second = CallerReference::new(
+            "other-client",
+            Some("https://issuer.example.test".to_owned()),
+        )?;
+        assert!(browser_caller_reference_retry_matches(
+            Some(&first),
+            Some(&first)
+        ));
+        assert!(!browser_caller_reference_retry_matches(
+            Some(&first),
+            Some(&second)
+        ));
+        assert!(!browser_caller_reference_retry_matches(Some(&first), None));
+        assert!(!browser_caller_reference_retry_matches(None, Some(&first)));
         Ok(())
     }
 
