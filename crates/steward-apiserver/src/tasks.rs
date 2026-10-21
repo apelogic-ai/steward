@@ -6104,10 +6104,10 @@ fn validate_browser_task_retry_request(
 }
 
 fn browser_caller_reference_retry_matches(
-    _stored: Option<&CallerReference>,
-    _requested: Option<&CallerReference>,
+    stored: Option<&CallerReference>,
+    requested: Option<&CallerReference>,
 ) -> bool {
-    true
+    stored == requested
 }
 
 fn browser_task_evidence_matches(
