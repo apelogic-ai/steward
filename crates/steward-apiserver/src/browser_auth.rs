@@ -3110,6 +3110,10 @@ mod tests {
             .registry
             .issue(other_principal, super::epoch_seconds())
             .map_err(|error| format!("issue conflicting cookie: {error:?}"))?;
+        let audit_count_before_identity_conflict = audit_lines
+            .lock()
+            .map_err(|_| "request audit capture lock poisoned".to_owned())?
+            .len();
         let conflict = routes()
             .oneshot(
                 Request::builder()
@@ -3125,6 +3129,14 @@ mod tests {
             .await
             .map_err(|error| format!("execute conflicting identities request: {error}"))?;
         assert_eq!(conflict.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?
+                .len(),
+            audit_count_before_identity_conflict + 1,
+            "a verified bearer must be audited before a cookie identity conflict is refused"
+        );
         Ok(())
     }
 
