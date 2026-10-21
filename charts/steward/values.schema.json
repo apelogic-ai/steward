@@ -388,7 +388,39 @@
             "userIdClaim": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$"},
             "emailClaim": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$"},
             "trustEmail": {"type": "boolean"}
-          }
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "issuer": {"const": ""},
+                "hyperShellAudience": {"const": ""},
+                "portalAudience": {"const": ""},
+                "acceptPortalAudience": {"const": false},
+                "frontendClientIds": {"maxItems": 0}
+              }
+            },
+            {
+              "properties": {
+                "issuer": {"minLength": 1},
+                "hyperShellAudience": {"minLength": 1},
+                "frontendClientIds": {"minItems": 1}
+              },
+              "oneOf": [
+                {
+                  "properties": {
+                    "portalAudience": {"const": ""},
+                    "acceptPortalAudience": {"const": false}
+                  }
+                },
+                {
+                  "properties": {
+                    "portalAudience": {"minLength": 1},
+                    "acceptPortalAudience": {"const": true}
+                  }
+                }
+              ]
+            }
+          ]
         }
       },
       "oneOf": [
