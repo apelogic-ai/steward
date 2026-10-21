@@ -32,14 +32,14 @@ allow = ["Zlib"]
 
 [[licenses.exceptions]]
 name = "webpki-roots"
-version = "=1.0.9"
+version = "=1.0.10"
 allow = ["CDLA-Permissive-2.0"]
 
 # rustls-platform-verifier 0.7.0 packages the same Mozilla CA data under
 # CDLA-Permissive-2.0, which imposes no attribution requirement.
 [[licenses.exceptions]]
 name = "webpki-root-certs"
-version = "=1.0.9"
+version = "=1.0.10"
 allow = ["CDLA-Permissive-2.0"]
 
 [advisories]
