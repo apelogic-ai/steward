@@ -1204,6 +1204,15 @@ async fn authenticate_browser_user_request(
     } else {
         return BrowserAuthFailure::InvalidSession.into_response();
     };
+    if let Some(reference) = &caller_reference {
+        let audit_record = browser_user_request_audit_record(
+            &principal,
+            reference,
+            request.method(),
+            request.uri().path(),
+        );
+        (service.request_audit_reporter)(&audit_record);
+    }
     let is_mutation = matches!(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
@@ -1222,13 +1231,6 @@ async fn authenticate_browser_user_request(
         request.extensions_mut().insert(BrowserMutationProof(()));
     }
     if let Some(reference) = &caller_reference {
-        let audit_record = browser_user_request_audit_record(
-            &principal,
-            reference,
-            request.method(),
-            request.uri().path(),
-        );
-        (service.request_audit_reporter)(&audit_record);
         request.extensions_mut().insert(reference.clone());
     }
     request.extensions_mut().insert(BrowserSessionContext {
