@@ -545,6 +545,7 @@ pub struct BrowserAuthService {
     provider: Arc<dyn BrowserOidcProvider>,
     user_tokens: Option<Arc<dyn BrowserUserTokenVerifier>>,
     identities: Arc<dyn BrowserIdentityResolver>,
+    request_audit_reporter: Arc<dyn Fn(&str) + Send + Sync>,
     registry: BrowserSessionRegistry,
     config: BrowserAuthConfig,
     auto_create_users: bool,
@@ -560,6 +561,7 @@ impl BrowserAuthService {
             provider,
             user_tokens: None,
             identities,
+            request_audit_reporter: Arc::new(|line| eprintln!("{line}")),
             registry: BrowserSessionRegistry::default(),
             auto_create_users: true,
             config: BrowserAuthConfig {
@@ -580,6 +582,15 @@ impl BrowserAuthService {
 
     pub fn with_auto_create_users(mut self, enabled: bool) -> Self {
         self.auto_create_users = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_request_audit_reporter(
+        mut self,
+        reporter: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        self.request_audit_reporter = Arc::new(reporter);
         self
     }
 
@@ -611,6 +622,7 @@ impl BrowserAuthService {
             provider,
             user_tokens: None,
             identities,
+            request_audit_reporter: Arc::new(|line| eprintln!("{line}")),
             registry: BrowserSessionRegistry::default(),
             auto_create_users: true,
             config: BrowserAuthConfig {
@@ -3001,24 +3013,27 @@ mod tests {
     #[tokio::test]
     async fn bearer_auth_records_request_audit_context_for_personal_agent_routes()
     -> Result<(), String> {
-        async fn probe(
-            Extension(reference): Extension<CallerReference>,
-        ) -> Json<serde_json::Value> {
-            Json(serde_json::json!({
-                "issuer": reference.url(),
-                "frontendClientId": reference.label(),
-            }))
+        async fn probe() -> StatusCode {
+            StatusCode::OK
         }
 
         let access_token = crate::google_oidc::fixture_user_access_token();
+        let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_lines.clone();
+        let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
+            captured
+                .lock()
+                .expect("request audit capture lock")
+                .push(line.to_owned());
+        });
         let response = protect_browser_routes(
-            Router::new().route("/app/api/v1/personal-agents/fixture/turns", post(probe)),
-            user_token_test_service()?,
+            Router::new().route("/app/api/v1/agents/fixture/messages", post(probe)),
+            service,
         )
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/app/api/v1/personal-agents/fixture/turns")
+                .uri("/app/api/v1/agents/fixture/messages")
                 .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::empty())
@@ -3027,14 +3042,26 @@ mod tests {
         .await
         .map_err(|error| format!("execute personal-agent bearer request: {error}"))?;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read request audit response: {error}"))?;
-        let audit: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse request audit response: {error}"))?;
+        let audit_lines = audit_lines
+            .lock()
+            .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+        assert_eq!(
+            audit_lines.len(),
+            1,
+            "one request must make one audit record"
+        );
+        let audit: serde_json::Value = serde_json::from_str(&audit_lines[0])
+            .map_err(|error| format!("parse request audit record: {error}"))?;
+        assert_eq!(
+            audit["canonicalUserId"],
+            "usr_0123456789abcdef0123456789abcdef"
+        );
         assert_eq!(audit["issuer"], "https://issuer.example.test");
         assert_eq!(audit["frontendClientId"], "portal-client");
+        assert_eq!(audit["method"], "POST");
+        assert_eq!(audit["path"], "/app/api/v1/agents/fixture/messages");
         assert!(audit.get("token").is_none());
+        assert!(!audit_lines[0].contains(&access_token));
         Ok(())
     }
 
