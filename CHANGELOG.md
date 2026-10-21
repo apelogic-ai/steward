@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Security
+
+- Updated certificate verification and the bundled web trust roots to reject certificates chained
+  through distrusted emSign intermediates.
+
 ### Added
 
 - Optional headless user access accepts RS256 or ES256 JWT access tokens from an exact configured
