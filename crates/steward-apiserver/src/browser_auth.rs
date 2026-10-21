@@ -335,6 +335,7 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
         &'a self,
         identity: &'a OrganizationIdentity,
         _actor: &'a str,
+        _email_linking_allowed: bool,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
         self.resolve_existing(identity)
     }
@@ -444,6 +445,7 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
         &'a self,
         identity: &'a OrganizationIdentity,
         actor: &'a str,
+        _email_linking_allowed: bool,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
         Box::pin(async move { self.resolve(identity, actor, false, false).await })
     }
@@ -1315,7 +1317,7 @@ async fn resolve_user_token_identity(
     } else {
         service
             .identities
-            .resolve_existing_user_token(identity, actor)
+            .resolve_existing_user_token(identity, actor, email_linking_allowed)
             .await
     }
 }

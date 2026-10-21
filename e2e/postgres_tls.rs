@@ -1234,6 +1234,37 @@ async fn verify_user_token_identity_resolution_policy(
         "trustEmail=false must not link an existing email owner"
     );
 
+    let trusted_email = Email::parse("trusted-link@example.com")?;
+    let trusted_owner = google_policy.validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "trusted-link-owner",
+        "example.com",
+        trusted_email.as_str(),
+        true,
+    )?;
+    let trusted_owner = store
+        .register_canonical_identity(&trusted_owner, "browser-oidc")
+        .await?;
+    let trusted_candidate = token_policy.validate(
+        token_issuer,
+        "trusted-link-candidate",
+        "example.com",
+        trusted_email.as_str(),
+        true,
+    )?;
+    let linked = resolver
+        .resolve_existing_user_token(
+            &trusted_candidate,
+            "user-token:https://issuer.example.test",
+            true,
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("link trusted identity: {error:?}")))?;
+    assert_eq!(
+        linked.canonical_user_id, trusted_owner.user_id,
+        "auto-create off must still allow configured trusted linking to an existing user"
+    );
+
     let same_issuer_email = Email::parse("same-issuer-owner@example.com")?;
     let original_subject = token_policy.validate(
         token_issuer,
