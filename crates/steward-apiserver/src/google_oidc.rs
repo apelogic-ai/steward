@@ -2415,6 +2415,23 @@ mod tests {
             })
             .is_err()
         );
+        assert!(
+            UserTokenConfig::new(UserTokenSettings {
+                issuer: "https://idp_internal.example.test".to_owned(),
+                organization_claim: "example.com".to_owned(),
+                organization_id: OrganizationId::parse("org_example")?,
+                user_id_claim: "sub".to_owned(),
+                email_claim: "email".to_owned(),
+                trust_email: false,
+                api_audience: "steward-api".to_owned(),
+                portal_audience: None,
+                frontend_client_ids: vec!["portal-client".to_owned()],
+                maximum_token_age_seconds: 300,
+                required_typ: None,
+            })
+            .is_err(),
+            "issuer metadata that cannot be audited must fail at startup"
+        );
         for (user_id_claim, email_claim) in [("email_verified", "email"), ("sub", "email_verified")]
         {
             assert!(
