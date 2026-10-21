@@ -1746,14 +1746,35 @@ mod tests {
     }
 
     fn user_token_test_service() -> Result<super::BrowserAuthService, String> {
+        user_token_test_service_with_verifier(crate::google_oidc::fixture_user_token_verifier(
+            false,
+        )?)
+    }
+
+    fn user_token_test_service_with_verifier(
+        verifier: crate::google_oidc::OidcUserTokenVerifier,
+    ) -> Result<super::BrowserAuthService, String> {
         let service = super::BrowserAuthService::local_fake(
             "http://127.0.0.1:33001",
             Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
             Arc::new(FixtureTokenIdentityResolver),
         )?;
-        Ok(service.with_user_token_verifier(Arc::new(
-            crate::google_oidc::fixture_user_token_verifier(false)?,
-        )))
+        Ok(service.with_user_token_verifier(Arc::new(verifier)))
+    }
+
+    fn valid_user_token_claims() -> serde_json::Value {
+        serde_json::json!({
+            "iss": "https://issuer.example.test",
+            "sub": "fixture-user-subject",
+            "azp": "portal-client",
+            "aud": "steward-api",
+            "exp": 2_000,
+            "iat": 1_000,
+            "nbf": 1_000,
+            "email": "alice@example.com",
+            "email_verified": true,
+            "name": "Alice Example"
+        })
     }
 
     #[test]
@@ -2844,6 +2865,7 @@ mod tests {
             .map_err(|error| format!("read bearer user response: {error}"))?;
         let audit: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse bearer user response: {error}"))?;
+        assert_eq!(audit["userId"], "usr_0123456789abcdef0123456789abcdef");
         assert_eq!(audit["issuer"], "https://issuer.example.test");
         assert_eq!(audit["frontendClientId"], "portal-client");
         assert!(audit.get("token").is_none());
@@ -2960,6 +2982,98 @@ mod tests {
             .await
             .map_err(|error| format!("execute conflicting identities request: {error}"))?;
         assert_eq!(conflict.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_bearer_refusals_reach_the_real_verifier_and_middleware() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let mut cases = Vec::new();
+        let mut wrong_issuer = valid_user_token_claims();
+        wrong_issuer["iss"] = serde_json::json!("https://other.example.test");
+        cases.push(("wrong issuer", wrong_issuer, "sub"));
+
+        let mut wrong_audience = valid_user_token_claims();
+        wrong_audience["aud"] = serde_json::json!("other-api");
+        cases.push(("wrong audience", wrong_audience, "sub"));
+
+        let mut unlisted_client = valid_user_token_claims();
+        unlisted_client["azp"] = serde_json::json!("other-client");
+        cases.push(("client not allowlisted", unlisted_client, "sub"));
+
+        let mut expired = valid_user_token_claims();
+        expired["exp"] = serde_json::json!(1_039);
+        cases.push(("expired", expired, "sub"));
+
+        let mut over_age = valid_user_token_claims();
+        over_age["iat"] = serde_json::json!(799);
+        cases.push(("over age", over_age, "sub"));
+
+        cases.push((
+            "missing configured user ID",
+            valid_user_token_claims(),
+            "oid",
+        ));
+
+        for (case, claims, user_id_claim) in cases {
+            let (verifier, token) =
+                crate::google_oidc::signed_user_token_fixture(claims, user_id_claim)?;
+            let response = protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe)),
+                user_token_test_service_with_verifier(verifier)?,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build {case} bearer request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute {case} bearer request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_groups_cannot_raise_local_user_authority() -> Result<(), String> {
+        async fn probe(
+            Extension(session): Extension<BrowserSessionContext>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "role": session.principal.role,
+                "memberRoles": session.principal.member_roles,
+            }))
+        }
+
+        let mut claims = valid_user_token_claims();
+        claims["groups"] = serde_json::json!(["admin", "owners"]);
+        let (verifier, token) = crate::google_oidc::signed_user_token_fixture(claims, "sub")?;
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            user_token_test_service_with_verifier(verifier)?,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .map_err(|error| format!("build grouped bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute grouped bearer request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read grouped bearer response: {error}"))?;
+        let authority: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse grouped bearer response: {error}"))?;
+        assert_eq!(authority["role"], "user");
+        assert_eq!(authority["memberRoles"], serde_json::json!([]));
         Ok(())
     }
 

@@ -601,6 +601,74 @@ pub(crate) fn fixture_user_token_verifier(
     Ok(verifier)
 }
 
+#[cfg(test)]
+pub(crate) fn signed_user_token_fixture(
+    claims: serde_json::Value,
+    user_id_claim: &str,
+) -> Result<(OidcUserTokenVerifier, String), String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use p256::SecretKey;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::EncodePrivateKey;
+    use rand_core::OsRng;
+
+    let private = SecretKey::random(&mut OsRng);
+    let der = private
+        .to_pkcs8_der()
+        .map_err(|error| format!("encode P-256 user-token test key: {error}"))?;
+    let point = private.public_key().to_encoded_point(false);
+    let x = point.x().ok_or("P-256 user-token test key missing x")?;
+    let y = point.y().ok_or("P-256 user-token test key missing y")?;
+    let jwks: JwkSet = serde_json::from_value(serde_json::json!({
+        "keys": [{
+            "kty": "EC",
+            "use": "sig",
+            "alg": "ES256",
+            "kid": "user-token-dynamic-key",
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(x),
+            "y": URL_SAFE_NO_PAD.encode(y)
+        }]
+    }))
+    .map_err(|error| format!("parse dynamic user-token JWKS: {error}"))?;
+    let config = UserTokenConfig::new(UserTokenSettings {
+        issuer: "https://issuer.example.test".to_owned(),
+        organization_claim: "example.com".to_owned(),
+        organization_id: steward_types::OrganizationId::parse("org_example")?,
+        user_id_claim: user_id_claim.to_owned(),
+        email_claim: "email".to_owned(),
+        trust_email: false,
+        api_audience: "steward-api".to_owned(),
+        portal_audience: Some("portal-audience".to_owned()),
+        frontend_client_ids: vec!["portal-client".to_owned()],
+        maximum_token_age_seconds: 300,
+        required_typ: None,
+    })?;
+    let verifier = OidcUserTokenVerifier::from_parts(
+        config,
+        Arc::new(ReqwestOidcTransport::new()?),
+        Arc::new(|| 1_100),
+    );
+    verifier
+        .keys
+        .cache
+        .lock()
+        .map_err(|_| "cache dynamic user-token JWKS".to_owned())?
+        .jwks = Some(Cached {
+        value: jwks,
+        expires_at: 2_000,
+    });
+
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some("user-token-dynamic-key".to_owned());
+    header.typ = Some("at+jwt".to_owned());
+    let token = encode(&header, &claims, &EncodingKey::from_ec_der(der.as_bytes()))
+        .map_err(|error| format!("sign dynamic user access token: {error}"))?;
+    Ok((verifier, token))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdTokenError {
     Malformed,

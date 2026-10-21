@@ -9369,9 +9369,10 @@ mod identity_task_authentication_tests {
         BoxFuture, IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, IdentityTaskIdentityResolver,
         IdentityTaskStore, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
         TaskIdentityResolver, compatibility_task_identity_from_claims,
-        map_canonical_identity_error, task_identity_from_identity_claims, valid_identity_issuer,
-        validate_identity_task_jwks, verify_identity_task_token,
+        map_canonical_identity_error, resolve_task_identity, task_identity_from_identity_claims,
+        valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
     };
+    use axum::http::{HeaderMap, HeaderValue, header};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use jsonwebtoken::jwk::JwkSet;
@@ -9692,6 +9693,44 @@ mod identity_task_authentication_tests {
             resolver.resolve(&assertion).await,
             Err(TaskAuthenticationError::UnknownUser)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_route_authentication_refuses_a_user_access_token() -> Result<(), String> {
+        let (_task_key, task_jwks) = key_material()?;
+        let resolver = IdentityTaskIdentityResolver {
+            jwks: task_jwks,
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            canonical_identities: Arc::new(UnknownCanonicalUserStore),
+            federated_subjects_enabled: false,
+        };
+        let (_user_verifier, user_token) = crate::google_oidc::signed_user_token_fixture(
+            serde_json::json!({
+                "iss": "https://issuer.example.test",
+                "sub": "fixture-user-subject",
+                "azp": "portal-client",
+                "aud": "steward-api",
+                "exp": 2_000,
+                "iat": 1_000,
+                "nbf": 1_000,
+                "email": "alice@example.com",
+                "email_verified": true
+            }),
+            "sub",
+        )?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {user_token}"))
+                .map_err(|error| format!("build user-token authorization header: {error}"))?,
+        );
+
+        assert!(matches!(
+            resolve_task_identity(&resolver, &headers).await,
+            Err(super::ApiError::TaskAuthentication)
+        ));
         Ok(())
     }
 
