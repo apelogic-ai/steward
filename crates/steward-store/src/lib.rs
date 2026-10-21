@@ -1812,8 +1812,8 @@ impl PgStore {
 
     /// Reserve one verified organization email for browser-member onboarding.
     ///
-    /// A pending record has no external identity and cannot act as a principal. The browser OIDC
-    /// registration path is the only operation that can activate it, after it verifies the exact
+    /// A pending record has no external identity and cannot act as a principal. A verified browser
+    /// or user-token identity registration may activate it only after verifying the exact
     /// organization email.
     pub async fn preprovision_canonical_user(
         &self,

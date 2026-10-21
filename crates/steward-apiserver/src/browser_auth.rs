@@ -1313,6 +1313,11 @@ async fn resolve_user_token(
         BrowserAuthFailure::ProviderUnavailable | BrowserAuthFailure::IdentityUnavailable => error,
         _ => BrowserAuthFailure::InvalidSession,
     })?;
+    let caller_reference = CallerReference::new(
+        claims.frontend_client_id,
+        Some(claims.identity.issuer().to_owned()),
+    )
+    .map_err(|_| BrowserAuthFailure::InvalidSession)?;
     let actor = format!("user-token:{}", claims.identity.issuer());
     let mut principal = resolve_user_token_identity(
         service,
@@ -1332,11 +1337,6 @@ async fn resolve_user_token(
         "user-token:{}",
         base64_url(&Sha256::digest(token.as_bytes()))
     ));
-    let caller_reference = CallerReference::new(
-        claims.frontend_client_id,
-        Some(claims.identity.issuer().to_owned()),
-    )
-    .map_err(|_| BrowserAuthFailure::InvalidSession)?;
     Ok(Some(VerifiedUserTokenSession {
         principal,
         binding,
