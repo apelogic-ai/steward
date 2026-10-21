@@ -3304,6 +3304,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bearer_auth_accepts_case_insensitive_authorization_scheme() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            user_token_test_service()?,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, format!("bearer {access_token}"))
+                .body(Body::empty())
+                .map_err(|error| format!("build lowercase bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute lowercase bearer request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bearer_auth_validates_audit_metadata_before_identity_resolution() -> Result<(), String>
     {
         async fn probe() -> StatusCode {
