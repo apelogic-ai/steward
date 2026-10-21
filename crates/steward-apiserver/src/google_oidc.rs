@@ -2398,6 +2398,27 @@ mod tests {
             })
             .is_err()
         );
+        for (user_id_claim, email_claim) in
+            [("email_verified", "email"), ("sub", "email_verified")]
+        {
+            assert!(
+                UserTokenConfig::new(UserTokenSettings {
+                    issuer: "https://issuer.example.test".to_owned(),
+                    organization_claim: "example.com".to_owned(),
+                    organization_id: OrganizationId::parse("org_example")?,
+                    user_id_claim: user_id_claim.to_owned(),
+                    email_claim: email_claim.to_owned(),
+                    trust_email: true,
+                    api_audience: "steward-api".to_owned(),
+                    portal_audience: None,
+                    frontend_client_ids: vec!["portal-client".to_owned()],
+                    maximum_token_age_seconds: 300,
+                    required_typ: None,
+                })
+                .is_err(),
+                "email_verified is reserved for verification policy"
+            );
+        }
         Ok(())
     }
 
