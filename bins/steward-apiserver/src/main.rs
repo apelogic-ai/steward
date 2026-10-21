@@ -740,6 +740,7 @@ struct BrowserUserTokenEnvironment {
     frontend_client_ids_json: Option<String>,
     maximum_token_age_seconds: Option<String>,
     required_typ: Option<String>,
+    user_id_claim: Option<String>,
     email_claim: Option<String>,
     trust_email: Option<String>,
 }
@@ -763,6 +764,7 @@ fn configured_browser_user_tokens(
                 "STEWARD_USER_TOKEN_MAX_AGE_SECONDS",
             )?,
             required_typ: optional_unicode_environment("STEWARD_USER_TOKEN_REQUIRED_TYP")?,
+            user_id_claim: optional_unicode_environment("STEWARD_USER_TOKEN_USER_ID_CLAIM")?,
             email_claim: optional_unicode_environment("STEWARD_USER_TOKEN_EMAIL_CLAIM")?,
             trust_email: optional_unicode_environment("STEWARD_USER_TOKEN_TRUST_EMAIL")?,
         },
@@ -807,6 +809,9 @@ fn parse_browser_user_token_config(
             io::Error::other("STEWARD_USER_TOKEN_MAX_AGE_SECONDS must be a positive integer")
         })?;
     let required_typ = environment.required_typ.unwrap_or_default();
+    let user_id_claim = environment
+        .user_id_claim
+        .unwrap_or_else(|| "sub".to_owned());
     let email_claim = environment
         .email_claim
         .unwrap_or_else(|| "email".to_owned());
@@ -825,6 +830,7 @@ fn parse_browser_user_token_config(
             || !frontend_client_ids.is_empty()
             || (maximum_was_configured && maximum_token_age_seconds != 300)
             || !required_typ.is_empty()
+            || user_id_claim != "sub"
             || email_claim != "email"
             || trust_email
         {
@@ -852,7 +858,7 @@ fn parse_browser_user_token_config(
         issuer,
         organization_claim,
         organization_id,
-        user_id_claim: "sub".to_owned(),
+        user_id_claim,
         email_claim,
         trust_email,
         api_audience,
@@ -2267,6 +2273,7 @@ mod tests {
                 frontend_client_ids_json,
                 maximum_token_age_seconds,
                 required_typ: None,
+                user_id_claim: None,
                 email_claim: None,
                 trust_email: None,
             },
@@ -2399,6 +2406,7 @@ mod tests {
                     frontend_client_ids_json: Some("[\"portal-client\"]".to_owned()),
                     maximum_token_age_seconds: Some("600".to_owned()),
                     required_typ: None,
+                    user_id_claim: None,
                     email_claim: None,
                     trust_email: None,
                 },
@@ -2418,6 +2426,7 @@ mod tests {
                     frontend_client_ids_json: Some("[\"portal-client\"]".to_owned()),
                     maximum_token_age_seconds: Some("600".to_owned()),
                     required_typ: Some("at+jwt".to_owned()),
+                    user_id_claim: Some("oid".to_owned()),
                     email_claim: Some("preferred_email".to_owned()),
                     trust_email: Some("true".to_owned()),
                 },

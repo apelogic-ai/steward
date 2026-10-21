@@ -370,7 +370,7 @@
         "userTokens": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["issuer", "hyperShellAudience", "portalAudience", "acceptPortalAudience", "frontendClientIds", "maximumTokenAgeSeconds", "requiredTyp", "emailClaim", "trustEmail"],
+          "required": ["issuer", "hyperShellAudience", "portalAudience", "acceptPortalAudience", "frontendClientIds", "maximumTokenAgeSeconds", "requiredTyp", "userIdClaim", "emailClaim", "trustEmail"],
           "properties": {
             "issuer": {"type": "string", "maxLength": 2048},
             "hyperShellAudience": {"type": "string", "maxLength": 512, "pattern": "^[!-~]*$"},
@@ -384,6 +384,7 @@
             },
             "maximumTokenAgeSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
             "requiredTyp": {"type": "string", "maxLength": 64, "pattern": "^[!-~]*$"},
+            "userIdClaim": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$"},
             "emailClaim": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$"},
             "trustEmail": {"type": "boolean"}
           }
@@ -416,6 +417,7 @@
                 "frontendClientIds": {"maxItems": 0},
                 "maximumTokenAgeSeconds": {"const": 300},
                 "requiredTyp": {"const": ""},
+                "userIdClaim": {"const": "sub"},
                 "emailClaim": {"const": "email"},
                 "trustEmail": {"const": false}
               }

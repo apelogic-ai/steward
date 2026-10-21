@@ -129,10 +129,11 @@ frontend may call only `/app/api/v1/*` with `Authorization: Bearer <access-token
 bounded discovery and JWKS documents from that exact HTTPS issuer, follows no redirects, and
 accepts only RS256 or ES256 signatures. It requires the configured HyperShell audience, one
 allowlisted `azp` or `client_id`, an email in the browser workspace domain, a valid key ID, current
-`exp` and `nbf` with bounded clock skew, and an `iat` within `maximumTokenAgeSeconds`. `emailClaim`
-selects the email claim. By default `email_verified` must be true; `trustEmail=true` is an explicit
-operator decision to trust the configured issuer's email. If `requiredTyp` is nonempty, the JOSE
-`typ` must exactly match it. Opaque tokens fail closed.
+`exp` and `nbf` with bounded clock skew, and an `iat` within `maximumTokenAgeSeconds`.
+`userIdClaim` selects the stable person identifier and defaults to `sub`; `emailClaim` selects the
+email claim. A token missing either configured claim is refused. By default `email_verified` must
+be true; `trustEmail=true` is an explicit operator decision to trust the configured issuer's email.
+If `requiredTyp` is nonempty, the JOSE `typ` must exactly match it. Opaque tokens fail closed.
 
 The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
 `portalAudience` is configured, and the frontend client ID is allowlisted. It does not replace the

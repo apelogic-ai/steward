@@ -82,7 +82,8 @@ struct IdTokenClaims {
 #[derive(Clone, Deserialize)]
 struct UserTokenClaims {
     iss: String,
-    sub: String,
+    #[serde(default)]
+    sub: Option<String>,
     aud: Audience,
     #[serde(default)]
     azp: Option<String>,
@@ -765,7 +766,16 @@ fn validate_user_token_claims(
         (None, Some(client_id)) => client_id,
         _ => return Err(IdTokenError::InvalidClaims),
     };
-    let subject_is_bounded = valid_value(&claims.sub, 255);
+    let subject = if config.identity.user_id_claim == "sub" {
+        claims.sub.as_deref()
+    } else {
+        claims
+            .provider_claims
+            .get(&config.identity.user_id_claim)
+            .and_then(serde_json::Value::as_str)
+    }
+    .ok_or(IdTokenError::InvalidClaims)?;
+    let subject_is_bounded = valid_value(subject, 255);
     let email = claims
         .provider_claims
         .get(&config.identity.email_claim)
@@ -790,7 +800,6 @@ fn validate_user_token_claims(
         .nbf
         .is_none_or(|not_before| not_before <= now.saturating_add(CLOCK_SKEW_SECONDS));
     if claims.iss != config.identity.issuer
-        || config.identity.user_id_claim != "sub"
         || !audience_matches
         || !config.frontend_client_ids.contains(frontend_client_id)
         || !expiration_is_valid
@@ -808,7 +817,7 @@ fn validate_user_token_claims(
         .identity_policy
         .validate(
             &claims.iss,
-            &claims.sub,
+            subject,
             &config.identity.organization_claim,
             email,
             true,
@@ -2263,7 +2272,7 @@ mod tests {
     fn fixture_user_token_claims() -> UserTokenClaims {
         UserTokenClaims {
             iss: "https://issuer.example.test".to_owned(),
-            sub: "fixture-subject".to_owned(),
+            sub: Some("fixture-subject".to_owned()),
             aud: Audience::Single("steward-api".to_owned()),
             azp: Some("portal-client".to_owned()),
             client_id: None,
@@ -2357,7 +2366,7 @@ mod tests {
         claims.nbf = Some(1_161);
         cases.push(claims);
         let mut claims = fixture_user_token_claims();
-        claims.sub.clear();
+        claims.sub = None;
         cases.push(claims);
         for claims in cases {
             assert!(matches!(
@@ -2456,7 +2465,7 @@ mod tests {
         let mut config = fixture_user_token_config(None, None)?;
         config.identity.user_id_claim = "oid".to_owned();
         let mut claims = fixture_user_token_claims();
-        claims.sub = "untrusted-default-subject".to_owned();
+        claims.sub = Some("untrusted-default-subject".to_owned());
         claims.provider_claims.insert(
             "oid".to_owned(),
             serde_json::Value::String("fixture-user-subject".to_owned()),
@@ -2467,7 +2476,7 @@ mod tests {
         assert_eq!(verified.identity.subject(), "fixture-user-subject");
 
         let mut missing = fixture_user_token_claims();
-        missing.sub = "untrusted-default-subject".to_owned();
+        missing.sub = Some("untrusted-default-subject".to_owned());
         assert!(matches!(
             validate_user_token_claims(missing, &config, 1_100),
             Err(IdTokenError::InvalidClaims)

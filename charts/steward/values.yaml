@@ -169,6 +169,7 @@ browserAuth:
     frontendClientIds: []
     maximumTokenAgeSeconds: 300
     requiredTyp: ""
+    userIdClaim: sub
     emailClaim: email
     trustEmail: false
 workloadExchangeTrust:

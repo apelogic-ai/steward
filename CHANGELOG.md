@@ -13,10 +13,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   OIDC issuer on `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum
   token age are configured. The portal audience and token `typ` are separate opt-ins. Tokens reuse
   canonical users and local RBAC, ignore provider groups, never grant administrator-route access,
-  and persist the issuer and frontend client ID without recording the token. The email claim is
-  configurable; operators may either require `email_verified` or explicitly trust the issuer's
-  email, which also permits exact same-organization email linking to an existing canonical user.
-  Google access tokens remain browser-session only because Google issues opaque user access tokens.
+  and persist the issuer and frontend client ID without recording the token. The stable user-ID
+  and email claims are configurable; operators may either require `email_verified` or explicitly
+  trust the issuer's email, which also permits exact same-organization email linking to an existing
+  canonical user. Google access tokens remain browser-session only because Google issues opaque
+  user access tokens.
 - Signed-in users can create owner-scoped personal agents from a configured coding agent and an
   active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
   The dispatcher merges messages that arrive during a turn into one next turn, resumes the same

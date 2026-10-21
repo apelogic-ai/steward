@@ -888,6 +888,7 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.userTokens.hyperShellAudience=steward-api \
   --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client' \
   --set-string browserAuth.userTokens.requiredTyp=at+jwt \
+  --set-string browserAuth.userTokens.userIdClaim=oid \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${browser_auth_rendered}"
 
 awk '
@@ -904,6 +905,7 @@ for required in \
   '            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: "steward-api" }' \
   '            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: "[\"portal-client\"]" }' \
   '            - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: "at+jwt" }' \
+  '            - { name: STEWARD_USER_TOKEN_USER_ID_CLAIM, value: "oid" }' \
   '            - { name: STEWARD_USER_TOKEN_EMAIL_CLAIM, value: "email" }' \
   '            - { name: STEWARD_USER_TOKEN_TRUST_EMAIL, value: "false" }'
 do
