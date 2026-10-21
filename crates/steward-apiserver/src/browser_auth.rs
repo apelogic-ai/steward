@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_store::{BrowserRbacAssignments, PgStore, StoreError};
 use steward_types::{
-    CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentity,
-    OrganizationIdentityPolicy,
+    CallerReference, CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId,
+    OrganizationIdentity, OrganizationIdentityPolicy,
 };
 use uuid::Uuid;
 
@@ -184,13 +184,7 @@ pub struct BrowserSessionBinding(String);
 pub struct BrowserSessionContext {
     pub principal: BrowserPrincipal,
     pub binding: BrowserSessionBinding,
-    pub user_token: Option<BrowserUserTokenAudit>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BrowserUserTokenAudit {
-    pub issuer: String,
-    pub frontend_client_id: String,
+    pub caller_reference: Option<CallerReference>,
 }
 
 #[derive(Clone)]
@@ -336,6 +330,14 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
         self.resolve_or_register(identity)
     }
+
+    fn resolve_existing_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        _actor: &'a str,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        self.resolve_existing(identity)
+    }
 }
 
 #[derive(Clone)]
@@ -347,6 +349,55 @@ impl PgBrowserIdentityResolver {
     pub fn new(store: PgStore) -> Self {
         Self { store }
     }
+
+    async fn resolve(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+        create_unknown: bool,
+        email_linking_allowed: bool,
+    ) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+        let principal = match self.store.resolve_canonical_identity(identity).await {
+            Ok(principal) => principal,
+            Err(StoreError::CanonicalIdentityNotFound) if email_linking_allowed => {
+                match self
+                    .store
+                    .link_verified_canonical_identity_by_email(identity, actor)
+                    .await
+                {
+                    Ok(principal) => principal,
+                    Err(StoreError::CanonicalIdentityNotFound) if create_unknown => self
+                        .store
+                        .register_canonical_identity(identity, actor)
+                        .await
+                        .map_err(map_store_error)?,
+                    Err(StoreError::CanonicalIdentityNotFound) => self
+                        .store
+                        .activate_preprovisioned_canonical_identity(identity, actor)
+                        .await
+                        .map_err(map_store_error)?,
+                    Err(error) => return Err(map_store_error(error)),
+                }
+            }
+            Err(StoreError::CanonicalIdentityNotFound) if create_unknown => self
+                .store
+                .register_canonical_identity(identity, actor)
+                .await
+                .map_err(map_store_error)?,
+            Err(StoreError::CanonicalIdentityNotFound) => self
+                .store
+                .activate_preprovisioned_canonical_identity(identity, actor)
+                .await
+                .map_err(map_store_error)?,
+            Err(error) => return Err(map_store_error(error)),
+        };
+        let assignments = self
+            .store
+            .browser_rbac_assignments(&principal.user_id)
+            .await
+            .map_err(map_store_error)?;
+        Ok(browser_principal_from_assignments(principal, assignments))
+    }
 }
 
 impl BrowserIdentityResolver for PgBrowserIdentityResolver {
@@ -354,50 +405,14 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
         &'a self,
         identity: &'a OrganizationIdentity,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
-        Box::pin(async move {
-            let principal = self
-                .store
-                .resolve_canonical_identity(identity)
-                .await
-                .map_err(map_store_error)?;
-            let assignments = self
-                .store
-                .browser_rbac_assignments(&principal.user_id)
-                .await
-                .map_err(map_store_error)?;
-            Ok(browser_principal_from_assignments(principal, assignments))
-        })
+        Box::pin(async move { self.resolve(identity, "browser-oidc", false, false).await })
     }
 
     fn resolve_or_register<'a>(
         &'a self,
         identity: &'a OrganizationIdentity,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
-        Box::pin(async move {
-            let principal = match self.store.resolve_canonical_identity(identity).await {
-                Ok(principal) => principal,
-                Err(StoreError::CanonicalIdentityNotFound) => match self
-                    .store
-                    .link_verified_canonical_identity_by_email(identity, "browser-oidc")
-                    .await
-                {
-                    Ok(principal) => principal,
-                    Err(StoreError::CanonicalIdentityNotFound) => self
-                        .store
-                        .register_canonical_identity(identity, "browser-oidc")
-                        .await
-                        .map_err(map_store_error)?,
-                    Err(error) => return Err(map_store_error(error)),
-                },
-                Err(error) => return Err(map_store_error(error)),
-            };
-            let assignments = self
-                .store
-                .browser_rbac_assignments(&principal.user_id)
-                .await
-                .map_err(map_store_error)?;
-            Ok(browser_principal_from_assignments(principal, assignments))
-        })
+        Box::pin(async move { self.resolve(identity, "browser-oidc", true, false).await })
     }
 
     fn record_successful_sign_in<'a>(
@@ -420,37 +435,17 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
         email_linking_allowed: bool,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
         Box::pin(async move {
-            let principal = match self.store.resolve_canonical_identity(identity).await {
-                Ok(principal) => principal,
-                Err(StoreError::CanonicalIdentityNotFound) if email_linking_allowed => {
-                    match self
-                        .store
-                        .link_verified_canonical_identity_by_email(identity, actor)
-                        .await
-                    {
-                        Ok(principal) => principal,
-                        Err(StoreError::CanonicalIdentityNotFound) => self
-                            .store
-                            .register_canonical_identity(identity, actor)
-                            .await
-                            .map_err(map_store_error)?,
-                        Err(error) => return Err(map_store_error(error)),
-                    }
-                }
-                Err(StoreError::CanonicalIdentityNotFound) => self
-                    .store
-                    .register_canonical_identity(identity, actor)
-                    .await
-                    .map_err(map_store_error)?,
-                Err(error) => return Err(map_store_error(error)),
-            };
-            let assignments = self
-                .store
-                .browser_rbac_assignments(&principal.user_id)
+            self.resolve(identity, actor, true, email_linking_allowed)
                 .await
-                .map_err(map_store_error)?;
-            Ok(browser_principal_from_assignments(principal, assignments))
         })
+    }
+
+    fn resolve_existing_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        actor: &'a str,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async move { self.resolve(identity, actor, false, false).await })
     }
 }
 
@@ -1134,7 +1129,7 @@ async fn authenticate_browser_cookie_request(
     let context = BrowserSessionContext {
         principal: session.principal,
         binding: BrowserSessionBinding(session.token),
-        user_token: None,
+        caller_reference: None,
     };
     if require_admin {
         request.extensions_mut().insert(BrowserAdminAuthority {
@@ -1149,7 +1144,7 @@ async fn authenticate_browser_cookie_request(
 struct VerifiedUserTokenSession {
     principal: BrowserPrincipal,
     binding: BrowserSessionBinding,
-    audit: BrowserUserTokenAudit,
+    caller_reference: CallerReference,
 }
 
 async fn authenticate_browser_user_request(
@@ -1179,14 +1174,16 @@ async fn authenticate_browser_user_request(
     {
         return BrowserAuthFailure::InvalidSession.into_response();
     }
-    let (principal, binding, audit) = if let Some(cookie) = &cookie_session {
+    let (principal, binding, caller_reference) = if let Some(cookie) = &cookie_session {
         (
             cookie.principal.clone(),
             BrowserSessionBinding(cookie.token.clone()),
-            user_token.as_ref().map(|token| token.audit.clone()),
+            user_token
+                .as_ref()
+                .map(|token| token.caller_reference.clone()),
         )
     } else if let Some(token) = user_token {
-        (token.principal, token.binding, Some(token.audit))
+        (token.principal, token.binding, Some(token.caller_reference))
     } else {
         return BrowserAuthFailure::InvalidSession.into_response();
     };
@@ -1207,10 +1204,13 @@ async fn authenticate_browser_user_request(
         }
         request.extensions_mut().insert(BrowserMutationProof(()));
     }
+    if let Some(reference) = &caller_reference {
+        request.extensions_mut().insert(reference.clone());
+    }
     request.extensions_mut().insert(BrowserSessionContext {
         principal,
         binding,
-        user_token: audit,
+        caller_reference,
     });
     next.run(request).await
 }
@@ -1289,13 +1289,15 @@ async fn resolve_user_token(
         "user-token:{}",
         base64_url(&Sha256::digest(token.as_bytes()))
     ));
+    let caller_reference = CallerReference::new(
+        claims.frontend_client_id,
+        Some(claims.identity.issuer().to_owned()),
+    )
+    .map_err(|_| BrowserAuthFailure::InvalidSession)?;
     Ok(Some(VerifiedUserTokenSession {
         principal,
         binding,
-        audit: BrowserUserTokenAudit {
-            issuer: claims.identity.issuer().to_owned(),
-            frontend_client_id: claims.frontend_client_id,
-        },
+        caller_reference,
     }))
 }
 
@@ -1311,7 +1313,10 @@ async fn resolve_user_token_identity(
             .resolve_or_register_user_token(identity, actor, email_linking_allowed)
             .await
     } else {
-        service.identities.resolve_existing(identity).await
+        service
+            .identities
+            .resolve_existing_user_token(identity, actor)
+            .await
     }
 }
 
@@ -2801,11 +2806,14 @@ mod tests {
         ) -> Json<serde_json::Value> {
             Json(serde_json::json!({
                 "userId": session.principal.canonical_user_id,
-                "issuer": session.user_token.as_ref().map(|audit| &audit.issuer),
-                "frontendClientId": session
-                    .user_token
+                "issuer": session
+                    .caller_reference
                     .as_ref()
-                    .map(|audit| &audit.frontend_client_id),
+                    .and_then(CallerReference::url),
+                "frontendClientId": session
+                    .caller_reference
+                    .as_ref()
+                    .map(CallerReference::label),
             }))
         }
 

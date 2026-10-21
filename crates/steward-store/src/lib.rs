@@ -2326,6 +2326,26 @@ impl PgStore {
         identity: &OrganizationIdentity,
         actor: &str,
     ) -> Result<CanonicalPrincipal, StoreError> {
+        self.resolve_or_register_canonical_identity(identity, actor, true)
+            .await
+    }
+
+    /// Activate an exact pending invitation without creating an unknown person.
+    pub async fn activate_preprovisioned_canonical_identity(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        self.resolve_or_register_canonical_identity(identity, actor, false)
+            .await
+    }
+
+    async fn resolve_or_register_canonical_identity(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+        create_unknown: bool,
+    ) -> Result<CanonicalPrincipal, StoreError> {
         if actor.trim().is_empty() {
             return Err(StoreError::CanonicalIdentityInvalidActor);
         }
@@ -2447,6 +2467,10 @@ impl PgStore {
                 identity.verified_email().clone(),
             )
             .map_err(|_| StoreError::CanonicalIdentityInvalidRecord);
+        }
+
+        if !create_unknown {
+            return Err(StoreError::CanonicalIdentityNotFound);
         }
 
         let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))

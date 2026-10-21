@@ -2361,10 +2361,7 @@ where
         canonical_user_id: session.principal.canonical_user_id,
         source_provenance: None,
     };
-    let caller_reference = match browser_caller_reference(session.user_token.as_ref()) {
-        Ok(reference) => reference,
-        Err(error) => return error.into_response(),
-    };
+    let caller_reference = browser_caller_reference(session.caller_reference.as_ref());
     match state
         .application
         .submit_browser(
@@ -2380,15 +2377,8 @@ where
     }
 }
 
-fn browser_caller_reference(
-    audit: Option<&crate::browser_auth::BrowserUserTokenAudit>,
-) -> Result<Option<CallerReference>, ApiError> {
-    audit
-        .map(|audit| {
-            CallerReference::new(audit.frontend_client_id.clone(), Some(audit.issuer.clone()))
-                .map_err(ApiError::Admission)
-        })
-        .transpose()
+fn browser_caller_reference(reference: Option<&CallerReference>) -> Option<CallerReference> {
+    reference.cloned()
 }
 
 pub fn task_router<L, I>(ledger: L, identities: I, config: TaskApiConfig) -> Router
@@ -3474,8 +3464,7 @@ where
                 canonical_user_id: session.principal.canonical_user_id.clone(),
                 source_provenance: None,
             };
-            let caller_reference = browser_caller_reference(session.user_token.as_ref())
-                .map_err(|_| BrowserTaskRerunError::Rejected)?;
+            let caller_reference = browser_caller_reference(session.caller_reference.as_ref());
             self.application
                 .submit_browser(
                     idempotency_key,
@@ -7347,26 +7336,22 @@ mod workflow_request_tests {
         WorkspaceEvidence, WorkspaceGitNamedRef, WorkspacePath,
     };
     use steward_types::{
-        Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
+        Budget, CallerReference, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements,
+        ToolGrant,
     };
     use uuid::Uuid;
 
     #[test]
     fn bearer_task_caller_reference_records_issuer_and_frontend_client() -> Result<(), String> {
-        let audit = crate::browser_auth::BrowserUserTokenAudit {
-            issuer: "https://issuer.example.test".to_owned(),
-            frontend_client_id: "portal-client".to_owned(),
-        };
-        let reference = browser_caller_reference(Some(&audit))
-            .map_err(|error| format!("build bearer caller reference: {error:?}"))?
+        let request_audit = CallerReference::new(
+            "portal-client",
+            Some("https://issuer.example.test".to_owned()),
+        )?;
+        let reference = browser_caller_reference(Some(&request_audit))
             .ok_or_else(|| "bearer caller reference missing".to_owned())?;
         assert_eq!(reference.label(), "portal-client");
         assert_eq!(reference.url(), Some("https://issuer.example.test"));
-        assert!(
-            browser_caller_reference(None)
-                .map_err(|error| format!("cookie caller: {error:?}"))?
-                .is_none()
-        );
+        assert!(browser_caller_reference(None).is_none());
         Ok(())
     }
 

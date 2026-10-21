@@ -850,12 +850,10 @@ fn validate_user_token_claims(
         .and_then(serde_json::Value::as_str)
         .ok_or(IdTokenError::InvalidClaims)?;
     let email_is_bounded = !email.is_empty() && email.len() <= 320;
-    let email_is_trusted = config.identity.trust_email
-        || claims
-            .provider_claims
-            .get("email_verified")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
+    let email_is_trusted = match claims.provider_claims.get("email_verified") {
+        Some(value) => value.as_bool() == Some(true),
+        None => config.identity.trust_email,
+    };
     let display_name_is_bounded = claims.name.as_ref().is_none_or(|name| {
         let trimmed = name.trim();
         !trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control)

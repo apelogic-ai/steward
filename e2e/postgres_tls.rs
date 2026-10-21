@@ -1188,13 +1188,16 @@ async fn verify_user_token_identity_resolution_policy(
         browser_email.as_str(),
         true,
     )?;
-    assert!(matches!(
-        resolver.resolve_or_register(&browser_takeover).await,
-        Err(BrowserAuthFailure::InvalidIdentity)
-    ), "Google sign-in must not adopt an active email owner");
+    assert!(
+        matches!(
+            resolver.resolve_or_register(&browser_takeover).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "Google sign-in must not adopt an active email owner"
+    );
 
     let token_issuer = "https://issuer.example.test";
-    let token_policy = OrganizationIdentityPolicy::new(
+    let token_policy = OrganizationIdentityPolicy::new_configured_oidc(
         token_issuer,
         "example.com",
         organization_id.clone(),
@@ -1217,16 +1220,19 @@ async fn verify_user_token_identity_resolution_policy(
         untrusted_email.as_str(),
         true,
     )?;
-    assert!(matches!(
-        resolver
-            .resolve_or_register_user_token(
-                &untrusted_candidate,
-                "user-token:https://issuer.example.test",
-                false,
-            )
-            .await,
-        Err(BrowserAuthFailure::InvalidIdentity)
-    ), "trustEmail=false must not link an existing email owner");
+    assert!(
+        matches!(
+            resolver
+                .resolve_or_register_user_token(
+                    &untrusted_candidate,
+                    "user-token:https://issuer.example.test",
+                    false,
+                )
+                .await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "trustEmail=false must not link an existing email owner"
+    );
 
     let same_issuer_email = Email::parse("same-issuer-owner@example.com")?;
     let original_subject = token_policy.validate(
@@ -1237,10 +1243,7 @@ async fn verify_user_token_identity_resolution_policy(
         true,
     )?;
     store
-        .register_canonical_identity(
-            &original_subject,
-            "user-token:https://issuer.example.test",
-        )
+        .register_canonical_identity(&original_subject, "user-token:https://issuer.example.test")
         .await?;
     let second_subject = token_policy.validate(
         token_issuer,
@@ -1249,16 +1252,19 @@ async fn verify_user_token_identity_resolution_policy(
         same_issuer_email.as_str(),
         true,
     )?;
-    assert!(matches!(
-        resolver
-            .resolve_or_register_user_token(
-                &second_subject,
-                "user-token:https://issuer.example.test",
-                true,
-            )
-            .await,
-        Err(BrowserAuthFailure::InvalidIdentity)
-    ), "email linking must refuse a user who already has another subject from that issuer");
+    assert!(
+        matches!(
+            resolver
+                .resolve_or_register_user_token(
+                    &second_subject,
+                    "user-token:https://issuer.example.test",
+                    true,
+                )
+                .await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "email linking must refuse a user who already has another subject from that issuer"
+    );
 
     let pending_email = Email::parse("pending-auth@example.com")?;
     let pending = store
@@ -1288,10 +1294,13 @@ async fn verify_user_token_identity_resolution_policy(
         "unknown-auth@example.com",
         true,
     )?;
-    assert!(matches!(
-        resolver.resolve_existing(&unknown).await,
-        Err(BrowserAuthFailure::InvalidIdentity)
-    ), "auto-create off must refuse a truly unknown user");
+    assert!(
+        matches!(
+            resolver.resolve_existing(&unknown).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "auto-create off must refuse a truly unknown user"
+    );
     Ok(())
 }
 
