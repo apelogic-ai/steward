@@ -1324,6 +1324,9 @@ impl BrowserUserTokenVerifier for OidcUserTokenVerifier {
         token: &'a str,
     ) -> BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>> {
         Box::pin(async move {
+            if token.is_empty() || token.len() > MAX_ID_TOKEN_BYTES {
+                return Err(BrowserAuthFailure::InvalidIdentity);
+            }
             let jwks = self.keys.jwks_for_token(token).await?;
             verify_user_token(token, &jwks, &self.config, (self.keys.now)())
                 .map_err(map_id_token_error)
@@ -1535,8 +1538,7 @@ mod tests {
         USER_ID_TOKEN_FIXTURE_PAYLOAD, USER_ID_TOKEN_FIXTURE_SIGNATURE, USER_TOKEN_FIXTURE_HEADER,
         USER_TOKEN_FIXTURE_MODULUS, USER_TOKEN_FIXTURE_PAYLOAD, USER_TOKEN_FIXTURE_SIGNATURE,
         UserTokenClaims, UserTokenConfig, UserTokenSettings, cache_ttl, validate_claims,
-        validate_oidc_jwks,
-        validate_user_token_claims, verify_id_token, verify_user_token,
+        validate_oidc_jwks, validate_user_token_claims, verify_id_token, verify_user_token,
     };
 
     const FIXTURE_HEADER: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImZpeHR1cmUta2V5In0";
