@@ -1707,22 +1707,25 @@ fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use axum::routing::{get, post};
     use axum::{Extension, Json, Router};
     use steward_store::BrowserRbacAssignments;
-    use steward_types::{CallerReference, CanonicalUserId, Email, OrganizationId};
+    use steward_types::{
+        CallerReference, CanonicalUserId, Email, OrganizationId, OrganizationIdentityPolicy,
+    };
     use tower::ServiceExt;
 
     use super::{
         BrowserAdminAuthority, BrowserAuthError, BrowserAuthFailure, BrowserIdentityResolver,
         BrowserMutationProof, BrowserOidcProvider, BrowserPrincipal, BrowserRole,
-        BrowserSessionContext, BrowserSessionRegistry, GoogleOidcConfig, LocalFakeIdentity,
-        LocalFakeOidcProvider, MAX_BROWSER_SESSIONS, MAX_PENDING_AUTHORIZATIONS,
-        PendingAuthorization, browser_auth_router, local_fake_browser_auth_service,
-        protect_browser_admin_routes, protect_browser_routes,
+        BrowserSessionContext, BrowserSessionRegistry, BrowserUserTokenVerifier, GoogleOidcConfig,
+        LocalFakeIdentity, LocalFakeOidcProvider, MAX_BROWSER_SESSIONS, MAX_PENDING_AUTHORIZATIONS,
+        PendingAuthorization, VerifiedUserTokenClaims, browser_auth_router,
+        local_fake_browser_auth_service, protect_browser_admin_routes, protect_browser_routes,
     };
 
     #[derive(Clone, Copy)]
@@ -1747,6 +1750,76 @@ mod tests {
                         .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
                     role: BrowserRole::User,
                     member_roles: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingUserTokenIdentityResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BrowserIdentityResolver for RecordingUserTokenIdentityResolver {
+        fn resolve_or_register<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            self.resolve_or_register_user_token(identity, "test", false)
+        }
+
+        fn resolve_or_register_user_token<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+            _actor: &'a str,
+            _email_linking_allowed: bool,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(BrowserPrincipal {
+                    canonical_user_id: CanonicalUserId::parse(
+                        "usr_0123456789abcdef0123456789abcdef",
+                    )
+                    .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                    display_name: "Alice Example".to_owned(),
+                    display_email: identity.verified_email().clone(),
+                    role: BrowserRole::User,
+                    member_roles: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct InvalidAuditMetadataVerifier;
+
+    impl BrowserUserTokenVerifier for InvalidAuditMetadataVerifier {
+        fn verify<'a>(
+            &'a self,
+            _token: &'a str,
+        ) -> super::BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>> {
+            Box::pin(async move {
+                let policy = OrganizationIdentityPolicy::new_configured_oidc(
+                    "https://idp_internal.example.test",
+                    "example.com",
+                    OrganizationId::parse("org_example")
+                        .map_err(|_| BrowserAuthFailure::InvalidIdentity)?,
+                )
+                .map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
+                let identity = policy
+                    .validate(
+                        "https://idp_internal.example.test",
+                        "alice",
+                        "example.com",
+                        "alice@example.com",
+                        true,
+                    )
+                    .map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
+                Ok(VerifiedUserTokenClaims {
+                    identity,
+                    display_name: Some("Alice Example".to_owned()),
+                    frontend_client_id: "portal-client".to_owned(),
+                    email_linking_allowed: false,
                 })
             })
         }
@@ -3107,6 +3180,44 @@ mod tests {
         assert_eq!(audit["path"], "/app/api/v1/agents/fixture/messages");
         assert!(audit.get("token").is_none());
         assert!(!audit_lines[0].contains(&access_token));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_validates_audit_metadata_before_identity_resolution() -> Result<(), String>
+    {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = super::BrowserAuthService::local_fake(
+            "http://127.0.0.1:33001",
+            Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+            Arc::new(RecordingUserTokenIdentityResolver {
+                calls: calls.clone(),
+            }),
+        )?
+        .with_user_token_verifier(Arc::new(InvalidAuditMetadataVerifier));
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            service,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, "Bearer fixture-token")
+                .body(Body::empty())
+                .map_err(|error| format!("build invalid-audit-metadata request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute invalid-audit-metadata request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "invalid audit metadata must fail before identity state can change"
+        );
         Ok(())
     }
 
