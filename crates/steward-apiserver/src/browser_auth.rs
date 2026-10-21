@@ -1679,6 +1679,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct PolicyIdentityResolver {
+        known: bool,
+    }
+
+    impl PolicyIdentityResolver {
+        fn principal(
+            identity: &steward_types::OrganizationIdentity,
+        ) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+            Ok(BrowserPrincipal {
+                canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                    .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                display_name: "Alice Example".to_owned(),
+                display_email: identity.verified_email().clone(),
+                role: BrowserRole::User,
+                member_roles: Vec::new(),
+            })
+        }
+    }
+
+    impl BrowserIdentityResolver for PolicyIdentityResolver {
+        fn resolve_existing<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move {
+                if !self.known {
+                    return Err(BrowserAuthFailure::InvalidIdentity);
+                }
+                Self::principal(identity)
+            })
+        }
+
+        fn resolve_or_register<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move { Self::principal(identity) })
+        }
+    }
+
     fn user_token_test_service() -> Result<super::BrowserAuthService, String> {
         let service = super::BrowserAuthService::local_fake(
             "http://127.0.0.1:33001",
@@ -2227,6 +2268,12 @@ mod tests {
         identity: LocalFakeIdentity,
     ) -> Result<(super::BrowserAuthService, String, String), String> {
         let service = local_fake_browser_auth_service("http://127.0.0.1:33001", identity)?;
+        start_local_flow_with_service(service).await
+    }
+
+    async fn start_local_flow_with_service(
+        service: super::BrowserAuthService,
+    ) -> Result<(super::BrowserAuthService, String, String), String> {
         let login = browser_auth_router(service.clone())
             .oneshot(
                 Request::builder()
@@ -2261,6 +2308,92 @@ mod tests {
             .ok_or_else(|| "fake authorization omitted callback redirect".to_owned())?
             .to_owned();
         Ok((service, flow_cookie, callback))
+    }
+
+    async fn complete_local_flow(
+        service: super::BrowserAuthService,
+        flow_cookie: &str,
+        callback_uri: &str,
+    ) -> Result<axum::response::Response, String> {
+        browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri(callback_uri)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute callback request: {error}"))
+    }
+
+    #[tokio::test]
+    async fn shared_auto_create_policy_governs_browser_sign_in() -> Result<(), String> {
+        for (known, auto_create, expected_session) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let service = super::BrowserAuthService::local_fake(
+                "http://127.0.0.1:33001",
+                Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+                Arc::new(PolicyIdentityResolver { known }),
+            )?
+            .with_auto_create_users(auto_create);
+            let (service, flow_cookie, callback_uri) =
+                start_local_flow_with_service(service).await?;
+            let callback = complete_local_flow(service, &flow_cookie, &callback_uri).await?;
+            assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                cookie_pair(&callback, "steward-local-session").is_ok(),
+                expected_session,
+                "known={known} auto_create={auto_create}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_auto_create_policy_governs_user_bearers() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        for (known, auto_create, expected) in [
+            (false, false, StatusCode::UNAUTHORIZED),
+            (true, false, StatusCode::OK),
+            (false, true, StatusCode::OK),
+        ] {
+            let service = super::BrowserAuthService::local_fake(
+                "http://127.0.0.1:33001",
+                Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+                Arc::new(PolicyIdentityResolver { known }),
+            )?
+            .with_user_token_verifier(Arc::new(crate::google_oidc::fixture_user_token_verifier(
+                false,
+            )?))
+            .with_auto_create_users(auto_create);
+            let response = protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe)),
+                service,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build bearer policy request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute bearer policy request: {error}"))?;
+            assert_eq!(
+                response.status(),
+                expected,
+                "known={known} auto_create={auto_create}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
