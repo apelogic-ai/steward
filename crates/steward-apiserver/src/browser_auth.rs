@@ -445,9 +445,12 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
         &'a self,
         identity: &'a OrganizationIdentity,
         actor: &'a str,
-        _email_linking_allowed: bool,
+        email_linking_allowed: bool,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
-        Box::pin(async move { self.resolve(identity, actor, false, false).await })
+        Box::pin(async move {
+            self.resolve(identity, actor, false, email_linking_allowed)
+                .await
+        })
     }
 }
 
