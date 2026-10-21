@@ -11,7 +11,7 @@ use jsonwebtoken::jwk::{
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
-use steward_types::{OrganizationId, OrganizationIdentityPolicy};
+use steward_types::{CallerReference, OrganizationId, OrganizationIdentityPolicy};
 
 use crate::browser_auth::{
     BrowserAuthFailure, BrowserAuthorizationRequest, BrowserFuture, BrowserOidcProvider,
@@ -256,6 +256,11 @@ impl UserTokenConfig {
         {
             return Err("user token configuration is invalid".to_owned());
         }
+        let audit_client = frontend_client_ids
+            .first()
+            .ok_or_else(|| "user token configuration is invalid".to_owned())?;
+        CallerReference::new(audit_client.clone(), Some(issuer.clone()))
+            .map_err(|_| "user token configuration is invalid".to_owned())?;
         let identity = UserTokenIdentityConfig {
             discovery_endpoint: format!(
                 "{}/.well-known/openid-configuration",
