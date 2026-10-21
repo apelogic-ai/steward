@@ -1315,7 +1315,13 @@ fn user_token_credential(
     }
     let bearer_count = authorization
         .iter()
-        .filter(|value| value.as_bytes().starts_with(b"Bearer "))
+        .filter(|value| {
+            value
+                .as_bytes()
+                .split(|byte| *byte == b' ')
+                .next()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"Bearer"))
+        })
         .count();
     if bearer_count == 0 {
         return Ok(None);
@@ -1326,9 +1332,12 @@ fn user_token_credential(
     let value = authorization[0]
         .to_str()
         .map_err(|_| BrowserAuthFailure::InvalidSession)?;
-    let Some(token) = value.strip_prefix("Bearer ") else {
+    let Some((scheme, token)) = value.split_once(' ') else {
         return Ok(None);
     };
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Ok(None);
+    }
     if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(BrowserAuthFailure::InvalidSession);
     }
