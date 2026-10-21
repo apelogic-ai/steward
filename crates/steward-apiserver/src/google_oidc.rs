@@ -2506,6 +2506,17 @@ mod tests {
             validate_user_token_claims(claims.clone(), &config("email", true)?, 1_100).is_ok(),
             "an operator-trusted issuer may omit email_verified"
         );
+        claims
+            .provider_claims
+            .insert("email_verified".to_owned(), serde_json::Value::Bool(false));
+        assert!(
+            matches!(
+                validate_user_token_claims(claims.clone(), &config("email", true)?, 1_100),
+                Err(IdTokenError::InvalidClaims)
+            ),
+            "an explicit false email_verified claim must override issuer trust"
+        );
+        claims.provider_claims.remove("email_verified");
         let email = claims
             .provider_claims
             .remove("email")

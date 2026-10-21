@@ -1665,7 +1665,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Extension, Json, Router};
     use steward_store::BrowserRbacAssignments;
-    use steward_types::{CanonicalUserId, Email, OrganizationId};
+    use steward_types::{CallerReference, CanonicalUserId, Email, OrganizationId};
     use tower::ServiceExt;
 
     use super::{
@@ -2982,6 +2982,46 @@ mod tests {
             .await
             .map_err(|error| format!("execute conflicting identities request: {error}"))?;
         assert_eq!(conflict.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_records_request_audit_context_for_personal_agent_routes()
+    -> Result<(), String> {
+        async fn probe(
+            Extension(reference): Extension<CallerReference>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "issuer": reference.url(),
+                "frontendClientId": reference.label(),
+            }))
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/personal-agents/fixture/turns", post(probe)),
+            user_token_test_service()?,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/personal-agents/fixture/turns")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .map_err(|error| format!("build personal-agent bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute personal-agent bearer request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read request audit response: {error}"))?;
+        let audit: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse request audit response: {error}"))?;
+        assert_eq!(audit["issuer"], "https://issuer.example.test");
+        assert_eq!(audit["frontendClientId"], "portal-client");
+        assert!(audit.get("token").is_none());
         Ok(())
     }
 
