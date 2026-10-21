@@ -885,6 +885,7 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.organizationId=org_example \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set browserAuth.autoCreateUsers=false \
   --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
   --set-string browserAuth.userTokens.hyperShellAudience=steward-api \
   --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client' \
