@@ -363,6 +363,10 @@ reuse the browser workspace domain, canonical-user, and local-RBAC rules. They d
 to administrator routes. Google sign-in continues to use browser sessions because Google user
 access tokens are opaque and are not accepted by this JWT verifier.
 
+`browserAuth.autoCreateUsers` is one shared browser and bearer policy. Its default is `true`,
+preserving first-sign-in registration. When it is `false`, both paths accept only an already known
+issuer/subject and refuse unknown people; it does not disable sign-in for known people.
+
 `userIdClaim` names the issuer claim containing the stable person identifier and defaults to `sub`.
 Tokens without that configured claim are refused. `emailClaim` names the issuer claim containing
 the organization email and defaults to `email`.

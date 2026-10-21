@@ -17,7 +17,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   and email claims are configurable; operators may either require `email_verified` or explicitly
   trust the issuer's email, which also permits exact same-organization email linking to an existing
   canonical user. Google access tokens remain browser-session only because Google issues opaque
-  user access tokens.
+  user access tokens. One shared, default-on setting controls first-sign-in creation for both
+  browser and access-token users; disabling it leaves known people working and refuses unknown
+  identities on both paths.
 - Signed-in users can create owner-scoped personal agents from a configured coding agent and an
   active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
   The dispatcher merges messages that arrive during a turn into one next turn, resumes the same

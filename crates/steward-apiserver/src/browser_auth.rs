@@ -350,6 +350,25 @@ impl PgBrowserIdentityResolver {
 }
 
 impl BrowserIdentityResolver for PgBrowserIdentityResolver {
+    fn resolve_existing<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async move {
+            let principal = self
+                .store
+                .resolve_canonical_identity(identity)
+                .await
+                .map_err(map_store_error)?;
+            let assignments = self
+                .store
+                .browser_rbac_assignments(&principal.user_id)
+                .await
+                .map_err(map_store_error)?;
+            Ok(browser_principal_from_assignments(principal, assignments))
+        })
+    }
+
     fn resolve_or_register<'a>(
         &'a self,
         identity: &'a OrganizationIdentity,
@@ -947,8 +966,11 @@ async fn resolve_browser_identity(
     service: &BrowserAuthService,
     identity: &OrganizationIdentity,
 ) -> Result<BrowserPrincipal, BrowserAuthFailure> {
-    let _shared_auto_create_policy = service.auto_create_users;
-    service.identities.resolve_or_register(identity).await
+    if service.auto_create_users {
+        service.identities.resolve_or_register(identity).await
+    } else {
+        service.identities.resolve_existing(identity).await
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -1283,11 +1305,14 @@ async fn resolve_user_token_identity(
     actor: &str,
     email_linking_allowed: bool,
 ) -> Result<BrowserPrincipal, BrowserAuthFailure> {
-    let _shared_auto_create_policy = service.auto_create_users;
-    service
-        .identities
-        .resolve_or_register_user_token(identity, actor, email_linking_allowed)
-        .await
+    if service.auto_create_users {
+        service
+            .identities
+            .resolve_or_register_user_token(identity, actor, email_linking_allowed)
+            .await
+    } else {
+        service.identities.resolve_existing(identity).await
+    }
 }
 
 fn valid_mutation(

@@ -773,6 +773,21 @@ fn configured_browser_user_tokens(
     )
 }
 
+fn configured_browser_auto_create_users() -> Result<bool, io::Error> {
+    let value = optional_unicode_environment("STEWARD_BROWSER_AUTO_CREATE_USERS")?;
+    parse_browser_auto_create_users(value.as_deref())
+}
+
+fn parse_browser_auto_create_users(value: Option<&str>) -> Result<bool, io::Error> {
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(io::Error::other(
+            "STEWARD_BROWSER_AUTO_CREATE_USERS must be true or false",
+        )),
+    }
+}
+
 fn parse_browser_user_token_config(
     environment: BrowserUserTokenEnvironment,
     organization_claim: String,
@@ -954,12 +969,14 @@ async fn browser_application_router(
     )
     .map_err(io::Error::other)?;
     let user_tokens = configured_browser_user_tokens(workspace_domain, organization_id)?;
+    let auto_create_users = configured_browser_auto_create_users()?;
     let mut auth = browser_auth::BrowserAuthService::google(
         config,
         Arc::new(provider.clone()),
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
-    .map_err(io::Error::other)?;
+    .map_err(io::Error::other)?
+    .with_auto_create_users(auto_create_users);
     if let Some(user_tokens) = user_tokens {
         auth = auth.with_user_token_verifier(Arc::new(
             google_oidc::OidcUserTokenVerifier::new(user_tokens).map_err(io::Error::other)?,
@@ -2245,8 +2262,9 @@ mod tests {
         custom_envelope_safety_ceiling_startup_warning, decode_tls_material,
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
         github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
-        parse_browser_user_token_config, parse_execution_bindings_mode, parse_inference_mode,
-        parse_template_document, personal_agent_configuration_from_values, rustls_crypto_provider,
+        parse_browser_auto_create_users, parse_browser_user_token_config,
+        parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
+        personal_agent_configuration_from_values, rustls_crypto_provider,
         stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
         with_claude_code_execution_adapter,
     };
@@ -2437,6 +2455,17 @@ mod tests {
             .is_some(),
             "an optional exact token type must be accepted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_auto_create_users_defaults_on_and_accepts_only_booleans() -> Result<(), String> {
+        assert!(parse_browser_auto_create_users(None).map_err(|error| error.to_string())?);
+        assert!(parse_browser_auto_create_users(Some("true")).map_err(|error| error.to_string())?);
+        assert!(
+            !parse_browser_auto_create_users(Some("false")).map_err(|error| error.to_string())?
+        );
+        assert!(parse_browser_auto_create_users(Some("sometimes")).is_err());
         Ok(())
     }
 

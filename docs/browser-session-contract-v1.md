@@ -155,6 +155,10 @@ verified issuer and frontend client ID through their existing caller reference. 
 never logged or stored. The request binding is a SHA-256-derived opaque value and never exposes
 the token.
 
+`browserAuth.autoCreateUsers` defaults to `true`, preserving existing first-sign-in registration.
+When disabled, both browser sign-in and access-token authentication require an already registered
+exact issuer/subject; neither path creates or links an unknown identity.
+
 A bearer-only mutation does not need browser CSRF proof. If a request also contains a browser
 cookie, the cookie remains subject to the existing origin, fetch-site, content-type, and CSRF
 checks. If cookie and bearer resolve to different people, Steward returns 401. User bearer tokens

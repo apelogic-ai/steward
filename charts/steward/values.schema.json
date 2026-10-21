@@ -344,9 +344,10 @@
     "browserAuth": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "google", "userTokens"],
+      "required": ["enabled", "autoCreateUsers", "google", "userTokens"],
       "properties": {
         "enabled": {"type": "boolean"},
+        "autoCreateUsers": {"type": "boolean"},
         "google": {
           "type": "object",
           "additionalProperties": false,
@@ -394,6 +395,7 @@
         {
           "properties": {
             "enabled": {"const": false},
+            "autoCreateUsers": {"const": true},
             "google": {
               "properties": {
                 "clientId": {"const": ""},

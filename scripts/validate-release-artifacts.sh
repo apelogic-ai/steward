@@ -651,6 +651,7 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.organizationId=org_example \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set browserAuth.autoCreateUsers=false \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${web_rendered}"
 
 awk '
@@ -901,6 +902,7 @@ for required in \
   '            - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: "example.test" }' \
   '            - { name: STEWARD_ORGANIZATION_ID, value: "org_example" }' \
   '            - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: steward-google-oidc, key: client-secret } } }' \
+  '            - { name: STEWARD_BROWSER_AUTO_CREATE_USERS, value: "false" }' \
   '            - { name: STEWARD_USER_TOKEN_ISSUER, value: "https://issuer.example.test" }' \
   '            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: "steward-api" }' \
   '            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: "[\"portal-client\"]" }' \

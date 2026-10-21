@@ -536,6 +536,7 @@ spec:
             - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: {{ .Values.browserAuth.google.workspaceDomain | quote }} }
             - { name: STEWARD_ORGANIZATION_ID, value: {{ .Values.browserAuth.google.organizationId | quote }} }
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
+            - { name: STEWARD_BROWSER_AUTO_CREATE_USERS, value: {{ .Values.browserAuth.autoCreateUsers | quote }} }
             - { name: STEWARD_USER_TOKEN_ISSUER, value: {{ .Values.browserAuth.userTokens.issuer | quote }} }
             - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: {{ .Values.browserAuth.userTokens.hyperShellAudience | quote }} }
             - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE, value: {{ .Values.browserAuth.userTokens.portalAudience | quote }} }
