@@ -308,6 +308,13 @@ impl BrowserOidcProvider for GoogleAuthorizationOnlyProvider {
 }
 
 pub trait BrowserIdentityResolver: Send + Sync + 'static {
+    fn resolve_existing<'a>(
+        &'a self,
+        _identity: &'a OrganizationIdentity,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async { Err(BrowserAuthFailure::InvalidIdentity) })
+    }
+
     fn resolve_or_register<'a>(
         &'a self,
         identity: &'a OrganizationIdentity,
@@ -521,6 +528,7 @@ pub struct BrowserAuthService {
     identities: Arc<dyn BrowserIdentityResolver>,
     registry: BrowserSessionRegistry,
     config: BrowserAuthConfig,
+    auto_create_users: bool,
 }
 
 impl BrowserAuthService {
@@ -534,6 +542,7 @@ impl BrowserAuthService {
             user_tokens: None,
             identities,
             registry: BrowserSessionRegistry::default(),
+            auto_create_users: true,
             config: BrowserAuthConfig {
                 browser_origin: config.browser_origin.clone(),
                 callback_uri: config.callback_uri.clone(),
@@ -547,6 +556,11 @@ impl BrowserAuthService {
 
     pub fn with_user_token_verifier(mut self, verifier: Arc<dyn BrowserUserTokenVerifier>) -> Self {
         self.user_tokens = Some(verifier);
+        self
+    }
+
+    pub fn with_auto_create_users(mut self, enabled: bool) -> Self {
+        self.auto_create_users = enabled;
         self
     }
 
@@ -579,6 +593,7 @@ impl BrowserAuthService {
             user_tokens: None,
             identities,
             registry: BrowserSessionRegistry::default(),
+            auto_create_users: true,
             config: BrowserAuthConfig {
                 browser_origin: origin.to_owned(),
                 callback_uri: format!("{origin}{CALLBACK_PATH}"),
@@ -883,7 +898,7 @@ async fn callback(
         Ok(identity) => identity,
         Err(_) => return rejected_callback(&service.config),
     };
-    let mut principal = match service.identities.resolve_or_register(&identity).await {
+    let mut principal = match resolve_browser_identity(&service, &identity).await {
         Ok(principal) => principal,
         Err(_) => return rejected_callback(&service.config),
     };
@@ -926,6 +941,14 @@ async fn callback(
         response.headers_mut().append(header::SET_COOKIE, expired);
     }
     response
+}
+
+async fn resolve_browser_identity(
+    service: &BrowserAuthService,
+    identity: &OrganizationIdentity,
+) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+    let _shared_auto_create_policy = service.auto_create_users;
+    service.identities.resolve_or_register(identity).await
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -1226,14 +1249,17 @@ async fn resolve_user_token(
         _ => BrowserAuthFailure::InvalidSession,
     })?;
     let actor = format!("user-token:{}", claims.identity.issuer());
-    let mut principal = service
-        .identities
-        .resolve_or_register_user_token(&claims.identity, &actor, claims.email_linking_allowed)
-        .await
-        .map_err(|error| match error {
-            BrowserAuthFailure::IdentityUnavailable => error,
-            _ => BrowserAuthFailure::InvalidSession,
-        })?;
+    let mut principal = resolve_user_token_identity(
+        service,
+        &claims.identity,
+        &actor,
+        claims.email_linking_allowed,
+    )
+    .await
+    .map_err(|error| match error {
+        BrowserAuthFailure::IdentityUnavailable => error,
+        _ => BrowserAuthFailure::InvalidSession,
+    })?;
     if let Some(display_name) = claims.display_name {
         principal.display_name = display_name;
     }
@@ -1249,6 +1275,19 @@ async fn resolve_user_token(
             frontend_client_id: claims.frontend_client_id,
         },
     }))
+}
+
+async fn resolve_user_token_identity(
+    service: &BrowserAuthService,
+    identity: &OrganizationIdentity,
+    actor: &str,
+    email_linking_allowed: bool,
+) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+    let _shared_auto_create_policy = service.auto_create_users;
+    service
+        .identities
+        .resolve_or_register_user_token(identity, actor, email_linking_allowed)
+        .await
 }
 
 fn valid_mutation(
