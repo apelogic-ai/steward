@@ -2875,7 +2875,14 @@ mod tests {
         .map_err(|error| format!("execute disabled bearer request: {error}"))?;
         assert_eq!(disabled.status(), StatusCode::UNAUTHORIZED);
 
-        let service = user_token_test_service()?;
+        let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_lines.clone();
+        let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
+            match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            }
+        });
         let access_token = crate::google_oidc::fixture_user_access_token();
         let routes = || {
             protect_browser_routes(
@@ -2988,6 +2995,10 @@ mod tests {
             .map_err(|error| format!("execute scoped cookie request with Basic auth: {error}"))?;
         assert_eq!(scoped_cookie_with_non_bearer.status(), StatusCode::OK);
 
+        let audit_count_before_csrf_rejection = audit_lines
+            .lock()
+            .map_err(|_| "request audit capture lock poisoned".to_owned())?
+            .len();
         let same_person_without_csrf = routes()
             .oneshot(
                 Request::builder()
@@ -3007,6 +3018,14 @@ mod tests {
             .await
             .map_err(|error| format!("execute cookie and bearer mutation: {error}"))?;
         assert_eq!(same_person_without_csrf.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?
+                .len(),
+            audit_count_before_csrf_rejection + 1,
+            "an identified bearer request must be audited before CSRF refusal"
+        );
 
         let mut other_principal = principal()?;
         other_principal.canonical_user_id =
