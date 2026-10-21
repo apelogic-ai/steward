@@ -911,7 +911,10 @@ for required in \
   '            - { name: STEWARD_USER_TOKEN_EMAIL_CLAIM, value: "email" }' \
   '            - { name: STEWARD_USER_TOKEN_TRUST_EMAIL, value: "false" }'
 do
-  grep -Fxq "${required}" "${browser_auth_deployment}"
+  if ! grep -Fxq "${required}" "${browser_auth_deployment}"; then
+    echo "browser auth deployment omitted required configuration: ${required}" >&2
+    exit 1
+  fi
 done
 grep -Fxq '        - ipBlock: { cidr: 203.0.113.0/24 }' "${browser_auth_rendered}"
 if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
