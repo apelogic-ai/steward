@@ -3,6 +3,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
+component_rendered="$(mktemp)"
+compatibility_directory="$(mktemp -d)"
 missing_namespace_error="$(mktemp)"
 receiver_startup_config="$(mktemp)"
 receiver_startup_output="$(mktemp)"
@@ -21,8 +23,9 @@ cleanup() {
     kill "${receiver_stub_pid}" 2>/dev/null || true
     wait "${receiver_stub_pid}" 2>/dev/null || true
   fi
-  rm -f "${rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
+  rm -f "${rendered}" "${component_rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
     "${receiver_startup_output}" "${receiver_stub_port}" "${receiver_stub_kubeconfig}"
+  find "${compatibility_directory}" -depth -delete
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -37,6 +40,91 @@ customer_images=(
 helm_template() {
   helm template steward "${root}/charts/steward" --namespace steward "${customer_images[@]}" "$@"
 }
+
+tag_only_images=(
+  --set images.requireDigest=false
+  --set-string images.apiserver.repository=registry.example.test/platform/steward-apiserver
+  --set-string images.apiserver.tag=release-apiserver
+  --set-string images.apiserver.digest=
+  --set-string images.controller.repository=registry.example.test/platform/steward-controller
+  --set-string images.controller.tag=release-controller
+  --set-string images.controller.digest=
+)
+
+helm_template \
+  "${tag_only_images[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca > "${component_rendered}"
+grep -Fq 'image: registry.example.test/platform/steward-apiserver:release-apiserver' \
+  "${component_rendered}"
+grep -Fq 'image: registry.example.test/platform/steward-controller:release-controller' \
+  "${component_rendered}"
+if grep -Eq 'image: registry\.example\.test/platform/steward-(apiserver|controller):[^[:space:]]+@' \
+  "${component_rendered}"
+then
+  echo 'tag-only component images must not render a digest separator' >&2
+  exit 1
+fi
+
+if helm_template \
+  --set-string images.apiserver.repository=registry.example.test/platform/steward-apiserver \
+  --set-string images.apiserver.digest= \
+  --set-string tls.webhook.caBundlePem=public-test-ca >/dev/null 2>&1
+then
+  echo 'digest-required images must reject a tag-only component image' >&2
+  exit 1
+fi
+
+if helm_template \
+  "${tag_only_images[@]}" \
+  --set-string images.apiserver.repository=Registry.example.test/platform/steward-apiserver \
+  --set-string tls.webhook.caBundlePem=public-test-ca >/dev/null 2>&1
+then
+  echo 'component images must reject an invalid repository' >&2
+  exit 1
+fi
+
+if helm_template \
+  "${tag_only_images[@]}" \
+  --set-string images.apiserver.tag=release/apiserver \
+  --set-string tls.webhook.caBundlePem=public-test-ca >/dev/null 2>&1
+then
+  echo 'component images must reject an invalid tag' >&2
+  exit 1
+fi
+
+app_version="$(awk '$1 == "appVersion:" { gsub(/"/, "", $2); print $2; exit }' "${root}/charts/steward/Chart.yaml")"
+helm_template \
+  --set images.requireDigest=false \
+  --set-string images.apiserver.repository=registry.example.test/platform/steward-apiserver \
+  --set-string images.apiserver.tag= \
+  --set-string images.apiserver.digest= \
+  --set-string images.controller.repository=registry.example.test/platform/steward-controller \
+  --set-string images.controller.tag= \
+  --set-string images.controller.digest= \
+  --set-string tls.webhook.caBundlePem=public-test-ca > "${component_rendered}"
+grep -Fq "image: registry.example.test/platform/steward-apiserver:${app_version}" \
+  "${component_rendered}"
+grep -Fq "image: registry.example.test/platform/steward-controller:${app_version}" \
+  "${component_rendered}"
+
+compatibility_base="${STEWARD_CHART_COMPAT_BASE:-origin/main}"
+if git -C "${root}" cat-file -e "${compatibility_base}:charts/steward/Chart.yaml" 2>/dev/null; then
+  git -C "${root}" archive "${compatibility_base}" charts/steward | \
+    tar -x -C "${compatibility_directory}"
+  helm template steward "${compatibility_directory}/charts/steward" --namespace steward \
+    "${customer_images[@]}" \
+    --set-string tls.webhook.caBundlePem=public-test-ca > "${compatibility_directory}/base-core.yaml"
+  helm_template \
+    --set-string tls.webhook.caBundlePem=public-test-ca > "${compatibility_directory}/head-core.yaml"
+  if ! cmp -s "${compatibility_directory}/base-core.yaml" "${compatibility_directory}/head-core.yaml"; then
+    diff -u "${compatibility_directory}/base-core.yaml" "${compatibility_directory}/head-core.yaml" >&2 || true
+    echo 'existing core profile render changed' >&2
+    exit 1
+  fi
+else
+  echo "chart compatibility base is unavailable: ${compatibility_base}" >&2
+  exit 1
+fi
 
 if helm_template \
   --set-string images.controller.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
