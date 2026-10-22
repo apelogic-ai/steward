@@ -613,7 +613,7 @@ class PlatformPreflightTests(unittest.TestCase):
             summary = (output / "summary.txt").read_text(encoding="utf-8")
             for line in (
                 "Capability models: 1",
-                "Capability tools: 1",
+                "Capability tools: 5",
                 "Execution bindings: 1",
                 "Runtime namespaces: 2",
                 "API caller namespaces: 1",
