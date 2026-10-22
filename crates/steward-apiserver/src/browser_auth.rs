@@ -3313,6 +3313,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bearer_auth_records_allowed_decision_before_cancelled_handler_finishes()
+    -> Result<(), String> {
+        async fn probe(
+            Extension(started): Extension<Arc<tokio::sync::Notify>>,
+        ) -> StatusCode {
+            started.notify_one();
+            std::future::pending().await
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_lines.clone();
+        let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
+            match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            }
+        });
+        let handler_started = Arc::new(tokio::sync::Notify::new());
+        let routes = protect_browser_routes(
+            Router::new()
+                .route("/app/api/v1/probe", get(probe))
+                .layer(Extension(handler_started.clone())),
+            service,
+        );
+        let request = Request::builder()
+            .uri("/app/api/v1/probe")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .body(Body::empty())
+            .map_err(|error| format!("build cancellable bearer request: {error}"))?;
+        let request_task = tokio::spawn(routes.oneshot(request));
+
+        handler_started.notified().await;
+        {
+            let audit_lines = audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                1,
+                "the authorization decision must be audited before the handler can be cancelled"
+            );
+            let audit = parse_bearer_request_audit(&audit_lines[0], &access_token)?;
+            assert_eq!(audit["outcome"], "allowed");
+            assert_eq!(audit["reasonCode"], "authenticated");
+        }
+
+        request_task.abort();
+        let _ = request_task.await;
+        assert_eq!(
+            audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?
+                .len(),
+            1,
+            "cancelling the handler must not add or remove audit records"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bearer_auth_accepts_case_insensitive_authorization_scheme() -> Result<(), String> {
         async fn probe() -> StatusCode {
             StatusCode::OK
