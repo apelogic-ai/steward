@@ -1,6 +1,7 @@
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
 
 USER root
+ARG TARGETARCH
 ARG RIPGREP_VERSION=14.1.0-1
 ARG RIPGREP_SHA256=c5ae63c7bee915b1cfc9f0bd07c55b4ce7f2bcd1133cba4da56719aac26101a4
 ARG JQ_VERSION=1.7.1-3ubuntu0.24.04.2
@@ -13,7 +14,18 @@ ARG FD_FIND_VERSION=9.0.0-1
 ARG FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e6672d
 ARG TREE_VERSION=2.1.1-2ubuntu3.24.04.2
 ARG TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e
-RUN curl --fail --silent --show-error --location \
+RUN case "${TARGETARCH}" in \
+      amd64) \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
+        helper_sha256="cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e" \
+        ;; \
+      arm64) \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
+        helper_sha256="ca2493fbca2b442b342c06815ea15cc34c68ebd7df65ff1440a19a122bb53b07" \
+        ;; \
+      *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
     && curl --fail --silent --show-error --location \
@@ -31,8 +43,7 @@ RUN curl --fail --silent --show-error --location \
     && curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
-    && curl --fail --silent --show-error --location \
-        "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz" \
+    && curl --fail --silent --show-error --location "${helper_url}" \
         --output /tmp/mcp-gw-sandbox-helper.tar.gz \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${JQ_SHA256}" /tmp/jq.deb | sha256sum --check --strict \
@@ -40,8 +51,7 @@ RUN curl --fail --silent --show-error --location \
     && printf '%s  %s\n' "${LIBONIG_SHA256}" /tmp/libonig5.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${FD_FIND_SHA256}" /tmp/fd-find.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${TREE_SHA256}" /tmp/tree.deb | sha256sum --check --strict \
-    && printf '%s  %s\n' \
-        cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e \
+    && printf '%s  %s\n' "${helper_sha256}" \
         /tmp/mcp-gw-sandbox-helper.tar.gz | sha256sum --check --strict \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install \
         /tmp/ripgrep.deb \

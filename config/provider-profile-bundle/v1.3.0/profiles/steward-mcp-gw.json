@@ -12,6 +12,8 @@
     "allowedCidrsInput": "service-cidrs",
     "protocol": "https",
     "allowedRoutes": [
+      {"method": "POST", "path": "/mcp"},
+      {"method": "DELETE", "path": "/mcp"},
       {"method": "POST", "path": "/cli/run"},
       {"method": "POST", "path": "/cli/jobs"},
       {"method": "POST", "path": "/shell/run"},

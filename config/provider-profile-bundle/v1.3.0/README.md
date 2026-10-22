@@ -3,7 +3,8 @@
 This immutable bundle supersedes `steward-runtime-providers@1.2.2`. It keeps
 the existing profile identities, endpoint hosts, token grants, Mint audience,
 CIDRs, and inference policy. The MCP-GW profile replaces its broad HTTP method
-policy with four exact `POST` routes: `/cli/run`, `/cli/jobs`, `/shell/run`, and
+policy with exact `POST` and `DELETE` rules for the existing `/mcp` transport
+and four exact `POST` routes: `/cli/run`, `/cli/jobs`, `/shell/run`, and
 `/shell/jobs`. It also requires the sandbox helper executable at
 `/usr/local/bin/mcp-gw-sandbox-helper`.
 

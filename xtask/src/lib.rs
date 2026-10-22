@@ -734,6 +734,8 @@ fn validate_provider_profile_upgrade_delta(
             let mut expected = current_profile.clone();
             if profile_id == "steward-mcp-gw" {
                 expected["endpoints"][0]["rules"] = serde_json::json!([
+                    {"allow": {"method": "POST", "path": "/mcp"}},
+                    {"allow": {"method": "DELETE", "path": "/mcp"}},
                     {"allow": {"method": "POST", "path": "/cli/run"}},
                     {"allow": {"method": "POST", "path": "/cli/jobs"}},
                     {"allow": {"method": "POST", "path": "/shell/run"}},
@@ -3343,6 +3345,8 @@ mod tests {
             "allowedCidrsInput": "service-cidrs",
             "protocol": "https",
             "allowedRoutes": [
+              {"method": "POST", "path": "/mcp"},
+              {"method": "DELETE", "path": "/mcp"},
               {"method": "POST", "path": "/cli/run"},
               {"method": "POST", "path": "/cli/jobs"},
               {"method": "POST", "path": "/shell/run"},
@@ -3391,6 +3395,8 @@ mod tests {
         assert_eq!(
             endpoint.get("rules"),
             Some(&serde_json::json!([
+                {"allow": {"method": "POST", "path": "/mcp"}},
+                {"allow": {"method": "DELETE", "path": "/mcp"}},
                 {"allow": {"method": "POST", "path": "/cli/run"}},
                 {"allow": {"method": "POST", "path": "/cli/jobs"}},
                 {"allow": {"method": "POST", "path": "/shell/run"}},

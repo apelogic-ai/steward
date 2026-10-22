@@ -65,7 +65,8 @@ failures return exit code `125` with a generic message and do not print the
 placeholder or substituted token.
 
 Use `steward-runtime-providers@1.3.0` with an image containing the helper. Its
-MCP-GW profile permits exactly `POST /cli/run`, `POST /cli/jobs`,
+MCP-GW profile preserves exact `POST /mcp` and `DELETE /mcp` access for the
+existing tool transport and adds exactly `POST /cli/run`, `POST /cli/jobs`,
 `POST /shell/run`, and `POST /shell/jobs` on the configured gateway host.
 Wildcard paths, query variants, other hosts, and all other methods remain
 blocked. The same Task and Envelope API grants drive native UI submissions;

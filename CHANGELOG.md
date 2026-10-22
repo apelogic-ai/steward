@@ -27,9 +27,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The Codex reference sandbox now includes checksum-pinned `kubectl` and
   `remote-shell` helpers from MCP-GW 0.7.0. Approved Task grants expose only a
   network-edge token placeholder and same-origin command URLs; the agent never
-  receives a usable credential. Provider-profile bundle 1.3.0 permits only the
-  four command and job routes, and both supported agent adapters refuse to
-  configure helpers for unrelated or unrecognized grant classes.
+  receives a usable credential. Provider-profile bundle 1.3.0 narrows gateway
+  access to the existing MCP transport and the four command and job routes,
+  and both supported agent adapters refuse to configure helpers for unrelated
+  or unrecognized grant classes.
 - The Helm chart can now create the public task-token JWKS and gateway backend
   CA ConfigMaps from values. It rejects malformed public material and private
   keys, while unchanged values continue to reference separately managed
