@@ -344,7 +344,6 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata: { name: {{ $.Values.taskIdentity.publicJwksConfigMap.name }} }
-immutable: true
 data:
   {{ $.Values.taskIdentity.publicJwksConfigMap.key | quote }}: |-
 {{ . | trimSuffix "\n" | nindent 4 }}
@@ -354,7 +353,6 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata: { name: {{ $.Values.web.httpRoute.backendTls.caConfigMap.name }} }
-immutable: true
 data:
   ca.crt: |-
 {{ . | trimSuffix "\n" | nindent 4 }}
@@ -504,6 +502,9 @@ spec:
       annotations:
         checksum/execution-bindings: {{ $executionBindingsHash | quote }}
         checksum/capability-catalog: {{ $capabilityCatalogHash | quote }}
+{{- with .Values.taskIdentity.publicJwksConfigMap.data }}
+        checksum/task-jwks: {{ . | sha256sum | quote }}
+{{- end }}
 {{- if .Values.githubSource.enabled }}
         checksum/source-repository-bindings: {{ $sourceRepositoryBindingsHash | quote }}
 {{- end }}

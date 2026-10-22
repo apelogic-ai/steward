@@ -161,7 +161,8 @@ key, or a TLS Secret in it.
 When `web.httpRoute.backendTls.caConfigMap.data` is nonempty, the chart creates
 that ConfigMap from the supplied public PEM certificate bundle. Leave `data`
 empty to use a separately managed ConfigMap. Malformed PEM and private key
-material are rejected before any object is rendered.
+material are rejected before any object is rendered. Updating the inline
+certificate bundle updates the existing ConfigMap in place.
 
 Set `networkPolicy.ingressNamespace` to the explicit Envoy Gateway data-plane
 namespace from which the route reaches the apiserver. It defaults to empty, so
@@ -659,7 +660,8 @@ Steward release namespace also creates `steward-workflows`.
 
   Set `publicJwksConfigMap.data` to have the chart create the ConfigMap, or
   leave it empty to reference one managed separately. The inline value must be
-  valid JSON with 1–16 public keys; private JWK fields are refused.
+  valid JSON with 1–16 public keys; private JWK fields are refused. Updating
+  the inline JWKS updates the ConfigMap and rolls the apiserver pods.
 
   `GET /.well-known/oauth-protected-resource` then advertises that resource,
   the exact issuer, bearer authentication, and accepted `steward-task-v2` and
