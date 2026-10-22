@@ -22,6 +22,52 @@
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}
 {{- $sourceRepositoryBindingsHash := $sourceRepositoryBindingsJson | sha256sum }}
 {{- $sourceRepositoryBindingsConfigMapName := printf "steward-source-repository-bindings-%s" ($sourceRepositoryBindingsHash | trunc 12) }}
+{{- with .Values.taskIdentity.publicJwksConfigMap.data }}
+{{- if contains "PRIVATE KEY" . }}
+{{- fail "taskIdentity.publicJwksConfigMap.data must never contain a private key" }}
+{{- end }}
+{{- $jwks := fromJson . }}
+{{- if hasKey $jwks "Error" }}
+{{- fail "taskIdentity.publicJwksConfigMap.data must be valid JSON" }}
+{{- end }}
+{{- $keys := get $jwks "keys" }}
+{{- if or (not (kindIs "slice" $keys)) (eq (len $keys) 0) (gt (len $keys) 16) }}
+{{- fail "taskIdentity.publicJwksConfigMap.data must contain between 1 and 16 public keys" }}
+{{- end }}
+{{- $identityKeyCount := 0 }}
+{{- range $key := $keys }}
+{{- if not (kindIs "map" $key) }}
+{{- fail "taskIdentity.publicJwksConfigMap.data must contain public key objects" }}
+{{- end }}
+{{- range $privateField := list "d" "p" "q" "dp" "dq" "qi" "oth" "k" }}
+{{- if hasKey $key $privateField }}
+{{- fail "taskIdentity.publicJwksConfigMap.data must contain public keys only" }}
+{{- end }}
+{{- end }}
+{{- $kty := get $key "kty" }}
+{{- $kid := get $key "kid" }}
+{{- if or (not (kindIs "string" $kty)) (empty $kty) (not (kindIs "string" $kid)) (empty $kid) }}
+{{- fail "taskIdentity.publicJwksConfigMap.data keys must have nonempty kty and kid values" }}
+{{- end }}
+{{- if eq (get $key "alg") "ES256" }}
+{{- if or (ne $kty "EC") (ne (get $key "use") "sig") (ne (get $key "crv") "P-256") (empty (get $key "x")) (empty (get $key "y")) }}
+{{- fail "taskIdentity.publicJwksConfigMap.data ES256 keys must be public P-256 signing keys" }}
+{{- end }}
+{{- $identityKeyCount = add1 $identityKeyCount }}
+{{- end }}
+{{- end }}
+{{- if eq $identityKeyCount 0 }}
+{{- fail "taskIdentity.publicJwksConfigMap.data must contain an ES256 signing key" }}
+{{- end }}
+{{- end }}
+{{- with .Values.web.httpRoute.backendTls.caConfigMap.data }}
+{{- if contains "PRIVATE KEY" . }}
+{{- fail "web.httpRoute.backendTls.caConfigMap.data must never contain a private key" }}
+{{- end }}
+{{- if not (regexMatch `(?s)^-----BEGIN CERTIFICATE-----[\r\n]+[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----(?:[\r\n]+-----BEGIN CERTIFICATE-----[\r\n]+[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----)*[\r\n]*$` .) }}
+{{- fail "web.httpRoute.backendTls.caConfigMap.data must contain only PEM certificates" }}
+{{- end }}
+{{- end }}
 {{- if .Values.persistence.enabled }}
 {{- fail "persistence.enabled is unsupported: Steward uses the externally managed database Secret" }}
 {{- end }}
@@ -292,6 +338,26 @@ kind: ConfigMap
 metadata: { name: steward-webhook-ca }
 data:
   ca.crt: {{ .Values.tls.webhook.caBundlePem | quote }}
+{{- end }}
+{{- with .Values.taskIdentity.publicJwksConfigMap.data }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ $.Values.taskIdentity.publicJwksConfigMap.name }} }
+immutable: true
+data:
+  {{ $.Values.taskIdentity.publicJwksConfigMap.key | quote }}: |-
+{{ . | trimSuffix "\n" | nindent 4 }}
+{{- end }}
+{{- with .Values.web.httpRoute.backendTls.caConfigMap.data }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ $.Values.web.httpRoute.backendTls.caConfigMap.name }} }
+immutable: true
+data:
+  ca.crt: |-
+{{ . | trimSuffix "\n" | nindent 4 }}
 {{- end }}
 {{- if .Values.stableBridge.enabled }}
 ---

@@ -80,6 +80,8 @@ web:
       caConfigMap:
         name: ""
         key: ca.crt
+        # Optional public certificate bundle rendered into the named ConfigMap.
+        data: ""
 triggerReceiver:
   # Opt in only after the receiver image, read-only database role, trust bundles,
   # and every referenced Jira webhook signing Secret are available.
@@ -203,6 +205,8 @@ taskIdentity:
   publicJwksConfigMap:
     name: ""
     key: ""
+    # Optional public JWKS rendered into the named ConfigMap.
+    data: ""
 githubSource:
   # Enables exact Git object retrieval for direct Task packages through a read-only GitHub App.
   # With bindings, the apiserver also lists the admitted source repositories through this App.

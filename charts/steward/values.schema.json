@@ -160,11 +160,21 @@
                 "caConfigMap": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["name", "key"],
+                  "required": ["name", "key", "data"],
                   "properties": {
                     "name": {"type": "string"},
-                    "key": {"const": "ca.crt"}
-                  }
+                    "key": {"const": "ca.crt"},
+                    "data": {"type": "string", "maxLength": 1048576}
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {"data": {"minLength": 1}},
+                        "required": ["data"]
+                      },
+                      "then": {"properties": {"name": {"$ref": "#/definitions/nonempty"}}}
+                    }
+                  ]
                 }
               }
             }
@@ -534,8 +544,12 @@
         "publicJwksConfigMap": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["name", "key"],
-          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
+          "required": ["name", "key", "data"],
+          "properties": {
+            "name": {"type": "string"},
+            "key": {"type": "string"},
+            "data": {"type": "string", "maxLength": 131072}
+          }
         }
       },
       "oneOf": [
@@ -547,7 +561,7 @@
             "resource": {"const": ""},
             "federatedSubjects": {"properties": {"enabled": {"const": false}}},
             "publicJwksConfigMap": {
-              "properties": {"name": {"const": ""}, "key": {"const": ""}}
+              "properties": {"name": {"const": ""}, "key": {"const": ""}, "data": {"const": ""}}
             }
           }
         },

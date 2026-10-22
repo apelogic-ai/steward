@@ -212,6 +212,7 @@ printf '%s\n' \
   '{"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"test-key","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","y":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}]}' \
   > "${inline_config_directory}/jwks.json"
 printf '%s\n' '{"keys":[' > "${inline_config_directory}/malformed-jwks.json"
+printf '%s\n' '{"keys":[{}]}' > "${inline_config_directory}/incomplete-jwks.json"
 printf '%s\n' \
   '{"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"test-key","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","y":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","d":"private"}]}' \
   > "${inline_config_directory}/private-jwks.json"
@@ -226,10 +227,10 @@ helm_template \
   --set-file taskIdentity.publicJwksConfigMap.data="${inline_config_directory}/jwks.json" \
   > "${component_rendered}"
 grep -Fq 'metadata: { name: steward-task-jwks }' "${component_rendered}"
-grep -Fq 'jwks.json:' "${component_rendered}"
+grep -Fq '"jwks.json":' "${component_rendered}"
 grep -Fq '"alg":"ES256"' "${component_rendered}"
 
-for invalid_jwks in malformed-jwks.json private-jwks.json; do
+for invalid_jwks in malformed-jwks.json incomplete-jwks.json private-jwks.json; do
   if helm_template \
     --set-string tls.webhook.caBundlePem=public-test-ca \
     --set taskIdentity.enabled=true \
@@ -260,6 +261,15 @@ helm_template \
   > "${component_rendered}"
 grep -Fq 'metadata: { name: steward-apiserver-ca }' "${component_rendered}"
 grep -Fq -- '-----BEGIN CERTIFICATE-----' "${component_rendered}"
+
+if helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-file web.httpRoute.backendTls.caConfigMap.data="${inline_config_directory}/ca.crt" \
+  >/dev/null 2>&1
+then
+  echo 'inline public CA must require a ConfigMap name' >&2
+  exit 1
+fi
 
 for invalid_ca in malformed-ca.crt private.key; do
   if helm_template \

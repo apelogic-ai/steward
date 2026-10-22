@@ -158,6 +158,10 @@ ConfigMap must have a non-empty public PEM CA at `data.ca.crt`. Gateway API does
 not select an alternate ConfigMap key, so the chart requires that exact key.
 The ConfigMap is public trust material only: never put `tls.key`, any private
 key, or a TLS Secret in it.
+When `web.httpRoute.backendTls.caConfigMap.data` is nonempty, the chart creates
+that ConfigMap from the supplied public PEM certificate bundle. Leave `data`
+empty to use a separately managed ConfigMap. Malformed PEM and private key
+material are rejected before any object is rendered.
 
 Set `networkPolicy.ingressNamespace` to the explicit Envoy Gateway data-plane
 namespace from which the route reaches the apiserver. It defaults to empty, so
@@ -190,6 +194,10 @@ web:
       caConfigMap:
         name: steward-apiserver-ca
         key: ca.crt
+        data: |-
+          -----BEGIN CERTIFICATE-----
+          <public issuing CA certificate>
+          -----END CERTIFICATE-----
 networkPolicy:
   ingressNamespace: envoy-gateway-system
 ```
@@ -332,6 +340,24 @@ Deployment. TLS mode `customerSecret` consumes existing TLS Secrets and a
 nonempty public webhook CA; `certManager` renders two Certificate resources
 using `tls.issuerRef`. The binaries accept PEM certificate chains and private
 keys in either mode.
+The API and webhook Secret names may be the same. A certificate covering both
+Service DNS names lets a core installation read its database URL and both TLS
+mounts from one existing Secret, using the standard `url`, `tls.crt`, and
+`tls.key` keys:
+
+```yaml
+secrets:
+  database: { name: steward-runtime, key: url }
+tls:
+  mode: customerSecret
+  api: { secretName: steward-runtime }
+  webhook:
+    secretName: steward-runtime
+    caBundlePem: |-
+      -----BEGIN CERTIFICATE-----
+      <public issuing CA certificate>
+      -----END CERTIFICATE-----
+```
 
 ## Browser authentication
 
@@ -627,7 +653,13 @@ Steward release namespace also creates `steward-workflows`.
     publicJwksConfigMap:
       name: steward-task-identity-jwks
       key: jwks.json
+      data: |-
+        {"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"<key id>","crv":"P-256","x":"<public x>","y":"<public y>"}]}
   ```
+
+  Set `publicJwksConfigMap.data` to have the chart create the ConfigMap, or
+  leave it empty to reference one managed separately. The inline value must be
+  valid JSON with 1–16 public keys; private JWK fields are refused.
 
   `GET /.well-known/oauth-protected-resource` then advertises that resource,
   the exact issuer, bearer authentication, and accepted `steward-task-v2` and
