@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${STEWARD_CONFORMANCE_TARGET:-}"
 PINNED_IMAGE="ghcr.io/berriai/litellm-database:v1.93.0@sha256:72360d8bd5602faa49be5098a8ac3dd069d9fb74503d6bd014242d96dc753e43"
-LATEST_IMAGE="ghcr.io/berriai/litellm-database:main-latest"
+# Bumped deliberately by a reviewed PR; never use a floating tag.
+LATEST_IMAGE="ghcr.io/berriai/litellm-database:v1.106.2@sha256:35f2cec3a14bb297e08bfab56c1fc377432bc4071aaf71978fdff043a5d91e79"
 POSTGRES_IMAGE="postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 
 case "${TARGET}" in

@@ -4,7 +4,8 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${root}"
 
-image_prefix='berriai/'litellm
+image_name="litellm"
+image_prefix="berriai/${image_name}"
 reference_pattern="${image_prefix}[^[:space:]\"',]*"
 digest_pattern="^${image_prefix}[^@[:space:]]*@sha256:[0-9a-f]{64}$"
 violations=0
