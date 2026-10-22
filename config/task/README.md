@@ -64,6 +64,22 @@ config:
           resource: actions_get
           action: read
           accessClass: read
+        - provider: cli
+          resource: kubectl
+          action: read
+          accessClass: read
+        - provider: cli
+          resource: kubectl
+          action: write
+          accessClass: write
+        - provider: cli
+          resource: kubectl
+          action: destructive
+          accessClass: destructive
+        - provider: remote-shell
+          resource: remote_shell_run
+          action: write
+          accessClass: write
       catalogs:
         - provider: github
           catalogId: github-tools
@@ -81,6 +97,11 @@ Access classes and provider availability are descriptive UI metadata. It contain
 TTL, user, template, Envelope, or admission fields. Changing it changes
 what the editor can offer; it does not change an existing template, User Envelope, Task, or
 admission decision.
+
+The governed CLI and remote-shell tuples above are the exact grants checked by MCP-GW. List only
+the command packs and classes installed in that deployment. See
+[Governed CLI and remote shell](../../docs/installation/governed-cli-remote-shell.md) for Task,
+Envelope, and machine run-binding configuration.
 
 Steward reads connection status once for every distinct provider named by `catalogs`, using that
 exact provider identifier with the gateway's stable version-2 status route. Multiple catalog

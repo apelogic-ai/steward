@@ -16,6 +16,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Installations can advertise governed `kubectl` read, write, and destructive classes plus remote
+  shell in the deployment capability catalogue. Envelope requests and templates select those exact
+  grants through the existing API-backed editor, Task admission allows any exact subset, and the
+  new operator guide explains how a trusted provisioner binds a machine to the Run runtime ID.
 - Optional headless user access accepts RS256 or ES256 JWT access tokens from an exact configured
   OIDC issuer on `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum
   token age are configured. The portal audience and token `typ` are separate opt-ins. Tokens reuse

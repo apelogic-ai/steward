@@ -71,4 +71,23 @@ describe("tool picker authority helpers", () => {
       removed: [{ provider: "github", resource: "issues_get", action: "read" }],
     });
   });
+
+  test("offers only governed command tuples returned by the capability API", () => {
+    const governedCommands: Array<CapabilityTool> = [
+      { provider: "cli", resource: "kubectl", action: "read", accessClass: "read", toolsets: ["Governed CLI"] },
+      { provider: "cli", resource: "kubectl", action: "write", accessClass: "write", toolsets: ["Governed CLI"] },
+      { provider: "remote-shell", resource: "remote_shell_run", action: "write", accessClass: "write", toolsets: ["Remote shell"] },
+    ];
+
+    expect(groupCapabilityTools(governedCommands).map((group) => ({
+      name: group.name,
+      tuples: group.tools.map(({ provider, resource, action }) => [provider, resource, action]),
+    }))).toEqual([
+      { name: "Governed CLI", tuples: [["cli", "kubectl", "read"], ["cli", "kubectl", "write"]] },
+      { name: "Remote shell", tuples: [["remote-shell", "remote_shell_run", "write"]] },
+    ]);
+    expect(selectReadOnlyTools([], governedCommands)).toEqual([
+      { provider: "cli", resource: "kubectl", action: "read" },
+    ]);
+  });
 });
