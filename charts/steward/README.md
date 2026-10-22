@@ -375,9 +375,11 @@ Tokens without that configured claim are refused. `emailClaim` names the issuer 
 the organization email and defaults to `email`. `email_verified` is reserved and cannot be used as
 either configured identity claim.
 By default, the token must also carry `email_verified: true`. Set `trustEmail=true` only when the
-configured issuer contract makes that claim unnecessary. An explicit `email_verified=false` is
-always refused. The trust opt-in also allows Steward to link the exact organization email to an
-existing canonical user under the constraints above; issuer groups never grant roles.
+configured issuer contract makes that claim unnecessary and the identity provider prevents users
+from changing their own email. Otherwise, a person could claim another user's email and be linked
+to that account. An explicit `email_verified=false` is always refused. The trust opt-in also allows
+Steward to link the exact organization email to an existing canonical user under the constraints
+above; issuer groups never grant roles.
 
 ## Direct package source resolution
 

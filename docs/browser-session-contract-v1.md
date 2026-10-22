@@ -133,8 +133,10 @@ allowlisted `azp` or `client_id`, an email in the browser workspace domain, a va
 `userIdClaim` selects the stable person identifier and defaults to `sub`; `emailClaim` selects the
 email claim. `email_verified` is reserved and cannot be selected for either identity claim. A token
 missing either configured claim is refused. By default `email_verified` must be true;
-`trustEmail=true` is an explicit operator decision to trust the configured issuer's email. An
-explicit `email_verified=false` is always refused, including for a trusted issuer.
+`trustEmail=true` is an explicit operator decision to trust the configured issuer's email and is
+safe only when the identity provider prevents users from changing their own email. Otherwise, a
+person could claim another user's email and be linked to that account. An explicit
+`email_verified=false` is always refused, including for a trusted issuer.
 If `requiredTyp` is nonempty, the JOSE `typ` must exactly match it. Opaque tokens fail closed.
 
 The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
@@ -154,9 +156,11 @@ issuer. The attachment records actor `user-token:<issuer>` and does not create a
 access-token issuer that still requires `email_verified` cannot use email linking. Access still
 comes only from Steward's local RBAC assignments; token claims do not grant administrator or
 member roles. Every bearer-authenticated request writes exactly one `api_bearer_request` JSON line
-before its response is returned. It contains only the canonical user, verified issuer, allowlisted
-frontend client ID, HTTP method, route template, allowed or refused outcome with a reason code, and
-an RFC 3339 timestamp. Refused cookie-identity conflicts and missing browser CSRF proof are included.
+after the authorization decision and before the route handler runs. It contains only the canonical
+user when resolved, verified issuer, allowlisted frontend client ID, HTTP method, route template,
+allowed or refused outcome with a reason code, and an RFC 3339 timestamp. A verified token refused
+during identity resolution records `canonicalUserId` as `null` rather than copying a token claim.
+Refused identity resolution, cookie-identity conflicts, and missing browser CSRF proof are included.
 The deployment's log pipeline provides retention. Browser Tasks persist the same issuer and
 frontend client ID through their existing caller reference. The authorization value, raw token,
 token hash, and other claims are never logged or stored. The request binding is a SHA-256-derived

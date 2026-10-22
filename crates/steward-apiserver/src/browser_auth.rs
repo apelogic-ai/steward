@@ -371,25 +371,60 @@ impl PgBrowserIdentityResolver {
                         .store
                         .register_canonical_identity(identity, actor)
                         .await
-                        .map_err(map_store_error)?,
+                        .map_err(|error| {
+                            map_user_token_identity_error(
+                                error,
+                                actor,
+                                create_unknown,
+                                email_linking_allowed,
+                            )
+                        })?,
                     Err(StoreError::CanonicalIdentityNotFound) => self
                         .store
                         .activate_preprovisioned_canonical_identity(identity, actor)
                         .await
-                        .map_err(map_store_error)?,
-                    Err(error) => return Err(map_store_error(error)),
+                        .map_err(|error| {
+                            map_user_token_identity_error(
+                                error,
+                                actor,
+                                create_unknown,
+                                email_linking_allowed,
+                            )
+                        })?,
+                    Err(error) => {
+                        return Err(map_user_token_identity_error(
+                            error,
+                            actor,
+                            create_unknown,
+                            email_linking_allowed,
+                        ));
+                    }
                 }
             }
             Err(StoreError::CanonicalIdentityNotFound) if create_unknown => self
                 .store
                 .register_canonical_identity(identity, actor)
                 .await
-                .map_err(map_store_error)?,
+                .map_err(|error| {
+                    map_user_token_identity_error(
+                        error,
+                        actor,
+                        create_unknown,
+                        email_linking_allowed,
+                    )
+                })?,
             Err(StoreError::CanonicalIdentityNotFound) => self
                 .store
                 .activate_preprovisioned_canonical_identity(identity, actor)
                 .await
-                .map_err(map_store_error)?,
+                .map_err(|error| {
+                    map_user_token_identity_error(
+                        error,
+                        actor,
+                        create_unknown,
+                        email_linking_allowed,
+                    )
+                })?,
             Err(error) => return Err(map_store_error(error)),
         };
         let assignments = self
@@ -474,6 +509,27 @@ fn browser_principal_from_assignments(
 fn map_store_error(error: StoreError) -> BrowserAuthFailure {
     match error {
         StoreError::Database(_) => BrowserAuthFailure::IdentityUnavailable,
+        _ => BrowserAuthFailure::InvalidIdentity,
+    }
+}
+
+fn map_user_token_identity_error(
+    error: StoreError,
+    actor: &str,
+    create_unknown: bool,
+    email_linking_allowed: bool,
+) -> BrowserAuthFailure {
+    if !actor.starts_with("user-token:") {
+        return map_store_error(error);
+    }
+    match error {
+        StoreError::Database(_) => BrowserAuthFailure::IdentityUnavailable,
+        StoreError::CanonicalIdentityNotFound if !create_unknown => {
+            BrowserAuthFailure::InvalidSession
+        }
+        StoreError::CanonicalIdentityAmbiguousEmail if !email_linking_allowed => {
+            BrowserAuthFailure::InsufficientAuthority
+        }
         _ => BrowserAuthFailure::InvalidIdentity,
     }
 }
@@ -1182,10 +1238,6 @@ async fn authenticate_browser_user_request(
         Ok(token) => token,
         Err(error) => return error.into_response(),
     };
-    let user_token = match resolve_user_token(&service, credential.as_deref()).await {
-        Ok(token) => token,
-        Err(error) => return error.into_response(),
-    };
     let method = request.method().clone();
     let route_template = request
         .extensions()
@@ -1193,12 +1245,18 @@ async fn authenticate_browser_user_request(
         .map(MatchedPath::as_str)
         .unwrap_or("unmatched")
         .to_owned();
+    let user_token =
+        match resolve_user_token(&service, credential.as_deref(), &method, &route_template).await {
+            Ok(token) => token,
+            Err(error) => return error.into_response(),
+        };
     if let (Some(cookie), Some(token)) = (&cookie_session, &user_token)
         && cookie.principal.canonical_user_id != token.principal.canonical_user_id
     {
         report_browser_user_request(
             &service,
-            token,
+            Some(&token.principal),
+            &token.caller_reference,
             &method,
             &route_template,
             "refused",
@@ -1239,7 +1297,8 @@ async fn authenticate_browser_user_request(
             if let Some(token) = &user_token {
                 report_browser_user_request(
                     &service,
-                    token,
+                    Some(&token.principal),
+                    &token.caller_reference,
                     &method,
                     &route_template,
                     "refused",
@@ -1261,7 +1320,8 @@ async fn authenticate_browser_user_request(
     if let Some(token) = &user_token {
         report_browser_user_request(
             &service,
-            token,
+            Some(&token.principal),
+            &token.caller_reference,
             &method,
             &route_template,
             "allowed",
@@ -1273,7 +1333,8 @@ async fn authenticate_browser_user_request(
 
 fn report_browser_user_request(
     service: &BrowserAuthService,
-    token: &VerifiedUserTokenSession,
+    principal: Option<&BrowserPrincipal>,
+    caller_reference: &CallerReference,
     method: &Method,
     route_template: &str,
     outcome: &str,
@@ -1281,9 +1342,9 @@ fn report_browser_user_request(
 ) {
     let audit_record = serde_json::json!({
         "event": "api_bearer_request",
-        "canonicalUserId": token.principal.canonical_user_id,
-        "issuer": token.caller_reference.url(),
-        "frontendClientId": token.caller_reference.label(),
+        "canonicalUserId": principal.map(|principal| principal.canonical_user_id.as_str()),
+        "issuer": caller_reference.url(),
+        "frontendClientId": caller_reference.label(),
         "method": method.as_str(),
         "routeTemplate": route_template,
         "outcome": outcome,
@@ -1346,6 +1407,8 @@ fn user_token_credential(
 async fn resolve_user_token(
     service: &BrowserAuthService,
     token: Option<&str>,
+    method: &Method,
+    route_template: &str,
 ) -> Result<Option<VerifiedUserTokenSession>, BrowserAuthFailure> {
     let Some(token) = token else {
         return Ok(None);
@@ -1364,17 +1427,31 @@ async fn resolve_user_token(
     )
     .map_err(|_| BrowserAuthFailure::InvalidSession)?;
     let actor = format!("user-token:{}", claims.identity.issuer());
-    let mut principal = resolve_user_token_identity(
+    let mut principal = match resolve_user_token_identity(
         service,
         &claims.identity,
         &actor,
         claims.email_linking_allowed,
     )
     .await
-    .map_err(|error| match error {
-        BrowserAuthFailure::IdentityUnavailable => error,
-        _ => BrowserAuthFailure::InvalidSession,
-    })?;
+    {
+        Ok(principal) => principal,
+        Err(error) => {
+            report_browser_user_request(
+                service,
+                None,
+                &caller_reference,
+                method,
+                route_template,
+                "refused",
+                user_token_identity_refusal_reason(error),
+            );
+            return Err(match error {
+                BrowserAuthFailure::IdentityUnavailable => error,
+                _ => BrowserAuthFailure::InvalidSession,
+            });
+        }
+    };
     if let Some(display_name) = claims.display_name {
         principal.display_name = display_name;
     }
@@ -1387,6 +1464,16 @@ async fn resolve_user_token(
         binding,
         caller_reference,
     }))
+}
+
+fn user_token_identity_refusal_reason(error: BrowserAuthFailure) -> &'static str {
+    match error {
+        BrowserAuthFailure::InvalidIdentity => "identity_conflict",
+        BrowserAuthFailure::InsufficientAuthority => "identity_link_refused",
+        BrowserAuthFailure::InvalidSession => "unknown_user",
+        BrowserAuthFailure::IdentityUnavailable => "identity_unavailable",
+        _ => "identity_resolution_failed",
+    }
 }
 
 async fn resolve_user_token_identity(
@@ -3335,9 +3422,7 @@ mod tests {
     #[tokio::test]
     async fn bearer_auth_records_allowed_decision_before_cancelled_handler_finishes()
     -> Result<(), String> {
-        async fn probe(
-            Extension(started): Extension<Arc<tokio::sync::Notify>>,
-        ) -> StatusCode {
+        async fn probe(Extension(started): Extension<Arc<tokio::sync::Notify>>) -> StatusCode {
             started.notify_one();
             std::future::pending().await
         }
@@ -3427,9 +3512,9 @@ mod tests {
                 Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
                 Arc::new(RefusingUserTokenIdentityResolver { failure }),
             )?
-            .with_user_token_verifier(Arc::new(
-                crate::google_oidc::fixture_user_token_verifier(false)?,
-            ))
+            .with_user_token_verifier(Arc::new(crate::google_oidc::fixture_user_token_verifier(
+                false,
+            )?))
             .with_auto_create_users(auto_create_users)
             .with_request_audit_reporter(move |line| match captured.lock() {
                 Ok(mut lines) => lines.push(line.to_owned()),
@@ -3467,6 +3552,47 @@ mod tests {
             assert_eq!(audit["reasonCode"], reason_code, "{case}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn user_token_store_failures_keep_distinct_audit_reason_classes() {
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityNotFound,
+                "user-token:https://issuer.example.test",
+                false,
+                false,
+            ),
+            BrowserAuthFailure::InvalidSession
+        );
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityAmbiguousEmail,
+                "user-token:https://issuer.example.test",
+                true,
+                false,
+            ),
+            BrowserAuthFailure::InsufficientAuthority
+        );
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityConflict,
+                "user-token:https://issuer.example.test",
+                true,
+                true,
+            ),
+            BrowserAuthFailure::InvalidIdentity
+        );
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityAmbiguousEmail,
+                "browser-oidc",
+                true,
+                false,
+            ),
+            BrowserAuthFailure::InvalidIdentity,
+            "browser sign-in keeps its existing failure mapping"
+        );
     }
 
     #[tokio::test]

@@ -27,9 +27,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Google issues opaque user access tokens. One shared, default-on setting controls first-sign-in
   creation for both browser and access-token users; disabling it still permits pending-invitation
   activation and configured trusted-email linking but never creates a new canonical user. Every
-  bearer-authenticated request emits one sanitized structured-log audit record with its route
-  template and authorization outcome; deployment log shipping provides retention. Tasks retain the
-  same verified issuer and frontend client ID. Authorization values and tokens are never recorded.
+  bearer-authenticated request emits one sanitized structured-log audit record before handler
+  dispatch with its route template and authorization outcome; verified tokens refused before a
+  canonical user is resolved record a null canonical-user field. Deployment log shipping provides
+  retention. Tasks retain the same verified issuer and frontend client ID. Authorization values
+  and tokens are never recorded. Email trust is safe only when users cannot change their own email
+  at the identity provider.
 - Signed-in users can create owner-scoped personal agents from a configured coding agent and an
   active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
   The dispatcher merges messages that arrive during a turn into one next turn, resumes the same
