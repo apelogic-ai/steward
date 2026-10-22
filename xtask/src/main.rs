@@ -5262,6 +5262,71 @@ mod tests {
     }
 
     #[test]
+    fn governed_command_helper_is_pinned_packaged_and_tested() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
+            .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
+        let e2e = fs::read_to_string(root().join("scripts/codex-reference-runtime-e2e.sh"))
+            .map_err(|error| format!("Codex reference runtime E2E is required: {error}"))?;
+        let profile = fs::read_to_string(
+            root().join("config/provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json"),
+        )
+        .map_err(|error| format!("governed command provider profile is required: {error}"))?;
+        let guide = fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
+            .map_err(|error| format!("Codex reference runtime guide is required: {error}"))?;
+
+        for required in [
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e",
+            "sha256sum --check --strict",
+            "/usr/local/bin/mcp-gw-sandbox-helper",
+            "/usr/local/bin/kubectl",
+            "/usr/local/bin/remote-shell",
+        ] {
+            assert!(
+                container.contains(required),
+                "runtime image must retain {required}"
+            );
+        }
+        for required in [
+            "MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder",
+            "MCP_GW_CLI_URL",
+            "MCP_GW_SHELL_URL",
+            "exit code 125",
+            "kubectl",
+            "remote-shell",
+        ] {
+            assert!(
+                e2e.contains(required),
+                "governed sandbox E2E must prove {required}"
+            );
+        }
+        for required in [
+            "/cli/run",
+            "/cli/jobs",
+            "/shell/run",
+            "/shell/jobs",
+            "/usr/local/bin/mcp-gw-sandbox-helper",
+        ] {
+            assert!(
+                profile.contains(required),
+                "provider profile must bind {required}"
+            );
+        }
+        for required in [
+            "MCP-GW 0.7.0",
+            "openshell-token-grant-placeholder",
+            "MCP_GW_CLI_URL",
+            "MCP_GW_SHELL_URL",
+        ] {
+            assert!(
+                guide.contains(required),
+                "operator guide must document {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn gateway_api_route_requires_verified_backend_tls() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))

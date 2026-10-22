@@ -3212,6 +3212,110 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_exact_routes_render_without_host_or_path_escape() -> Result<(), String> {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"},
+          "transitions": {"install": ["absent"], "reconcile": ["same-bundle"]},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "template": "profiles/steward-mcp-gw.json",
+            "inputs": [
+              {"name": "gateway-origin", "kind": "https-origin"},
+              {"name": "runtime-grant-origin", "kind": "https-origin"},
+              {"name": "service-cidrs", "kind": "cidr-list"}
+            ]
+          }]
+        }"#;
+        let template = r#"{
+          "schema": "steward.provider-profile-template/v1",
+          "id": "steward-mcp-gw",
+          "metadata": {"displayName": "Steward MCP gateway", "description": "Runtime-scoped gateway access", "category": "source_control"},
+          "capabilities": ["tool.read"],
+          "network": {
+            "endpointInput": "gateway-origin",
+            "allowedCidrsInput": "service-cidrs",
+            "protocol": "https",
+            "allowedRoutes": [
+              {"method": "POST", "path": "/cli/run"},
+              {"method": "POST", "path": "/cli/jobs"},
+              {"method": "POST", "path": "/shell/run"},
+              {"method": "POST", "path": "/shell/jobs"}
+            ]
+          },
+          "authorization": {
+            "authName": "access_token",
+            "authDescription": "Runtime-bound gateway access",
+            "tokenGrantOriginInput": "runtime-grant-origin",
+            "tokenPath": "/token",
+            "audience": "steward-mcp",
+            "jwtSvidAudience": "steward-mint",
+            "scopes": ["mcp"],
+            "cacheTtlSeconds": 2
+          },
+          "runtime": {"requiredBinaries": ["/usr/local/bin/mcp-gw-sandbox-helper"]}
+        }"#;
+        let inputs = r#"{
+          "schema": "steward.provider-profile-inputs/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "inputs": {
+              "gateway-origin": "https://mcp.gateway.test",
+              "runtime-grant-origin": "https://mint.gateway.test",
+              "service-cidrs": ["192.0.2.0/24"]
+            }
+          }]
+        }"#;
+
+        let rendered = render_provider_profile_bundle(
+            bundle,
+            [("profiles/steward-mcp-gw.json", template)],
+            inputs,
+        )?;
+        let endpoint = rendered
+            .profiles
+            .get("steward-mcp-gw")
+            .and_then(|profile| profile.pointer("/endpoints/0"))
+            .ok_or_else(|| "rendered command endpoint is required".to_owned())?;
+        assert_eq!(
+            endpoint.get("protocol").and_then(Value::as_str),
+            Some("rest")
+        );
+        assert_eq!(
+            endpoint.get("rules"),
+            Some(&serde_json::json!([
+                {"allow": {"method": "POST", "path": "/cli/run"}},
+                {"allow": {"method": "POST", "path": "/cli/jobs"}},
+                {"allow": {"method": "POST", "path": "/shell/run"}},
+                {"allow": {"method": "POST", "path": "/shell/jobs"}}
+            ]))
+        );
+        assert_eq!(
+            endpoint.get("host").and_then(Value::as_str),
+            Some("mcp.gateway.test")
+        );
+
+        for escaped_path in [
+            "/cli/*",
+            "/cli/jobs*",
+            "/shell/run?other=true",
+            "https://other.test/cli/run",
+        ] {
+            let escaped = template.replace("/cli/run", escaped_path);
+            let result = validate_provider_profile_bundle(
+                bundle,
+                [("profiles/steward-mcp-gw.json", escaped.as_str())],
+            );
+            assert!(
+                result.is_err(),
+                "route escape {escaped_path} must fail closed before profile rendering"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn provider_profile_install_is_absent_only_and_reconcile_rejects_drift() -> Result<(), String> {
         let profile = serde_json::json!({"id": "steward-mcp-gw", "policy": "read-only"});
         let mut profiles = BTreeMap::new();

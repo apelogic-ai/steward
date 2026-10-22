@@ -509,6 +509,61 @@ mod tests {
     }
 
     #[test]
+    fn governed_command_grants_expose_only_placeholder_backed_helper_routes() -> Result<(), String>
+    {
+        let adapter =
+            ClaudeCodeTaskExecutionAdapter::new("https://inference.example.test".to_owned())
+                .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        let endpoint = Some("https://tools.example.test/mcp");
+        let command_tools = [
+            ToolGrant {
+                provider: "cli".to_owned(),
+                resource: "kubectl".to_owned(),
+                action: "destructive".to_owned(),
+            },
+            ToolGrant {
+                provider: "remote-shell".to_owned(),
+                resource: "remote_shell_run".to_owned(),
+                action: "write".to_owned(),
+            },
+        ];
+        let command_plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &model(),
+                tools: &command_tools,
+                tool_transport_endpoint: endpoint,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render governed command plan: {error:?}"))?;
+        let shell = &command_plan.command[2];
+        assert!(shell.contains("MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder"));
+        assert!(shell.contains("MCP_GW_CLI_URL=https://tools.example.test/cli/run"));
+        assert!(shell.contains("MCP_GW_SHELL_URL=https://tools.example.test/shell/run"));
+        assert!(!shell.contains("MCP_GW_RUN_TOKEN_FILE"));
+
+        let unrelated_tools = [ToolGrant {
+            provider: "example-tool".to_owned(),
+            resource: "repository".to_owned(),
+            action: "read".to_owned(),
+        }];
+        let unrelated_plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &model(),
+                tools: &unrelated_tools,
+                tool_transport_endpoint: endpoint,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render unrelated tool plan: {error:?}"))?;
+        assert!(!unrelated_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
+        assert!(!unrelated_plan.command[2].contains("MCP_GW_CLI_URL"));
+        assert!(!unrelated_plan.command[2].contains("MCP_GW_SHELL_URL"));
+        Ok(())
+    }
+
+    #[test]
     fn rejects_missing_or_malformed_governed_endpoints_and_unlisted_models() -> Result<(), String> {
         for endpoint in [
             " https://inference.example.test",
