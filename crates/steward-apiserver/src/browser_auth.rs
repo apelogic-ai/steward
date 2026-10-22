@@ -1258,7 +1258,6 @@ async fn authenticate_browser_user_request(
         binding,
         caller_reference,
     });
-    let response = next.run(request).await;
     if let Some(token) = &user_token {
         report_browser_user_request(
             &service,
@@ -1269,7 +1268,7 @@ async fn authenticate_browser_user_request(
             "authenticated",
         );
     }
-    response
+    next.run(request).await
 }
 
 fn report_browser_user_request(
