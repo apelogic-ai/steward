@@ -536,6 +536,17 @@ spec:
             - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: {{ .Values.browserAuth.google.workspaceDomain | quote }} }
             - { name: STEWARD_ORGANIZATION_ID, value: {{ .Values.browserAuth.google.organizationId | quote }} }
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
+            - { name: STEWARD_BROWSER_AUTO_CREATE_USERS, value: {{ .Values.browserAuth.autoCreateUsers | quote }} }
+            - { name: STEWARD_USER_TOKEN_ISSUER, value: {{ .Values.browserAuth.userTokens.issuer | quote }} }
+            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: {{ .Values.browserAuth.userTokens.hyperShellAudience | quote }} }
+            - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE, value: {{ .Values.browserAuth.userTokens.portalAudience | quote }} }
+            - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED, value: {{ .Values.browserAuth.userTokens.acceptPortalAudience | quote }} }
+            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: {{ .Values.browserAuth.userTokens.frontendClientIds | toJson | quote }} }
+            - { name: STEWARD_USER_TOKEN_MAX_AGE_SECONDS, value: {{ .Values.browserAuth.userTokens.maximumTokenAgeSeconds | quote }} }
+            - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: {{ .Values.browserAuth.userTokens.requiredTyp | quote }} }
+            - { name: STEWARD_USER_TOKEN_USER_ID_CLAIM, value: {{ .Values.browserAuth.userTokens.userIdClaim | quote }} }
+            - { name: STEWARD_USER_TOKEN_EMAIL_CLAIM, value: {{ .Values.browserAuth.userTokens.emailClaim | quote }} }
+            - { name: STEWARD_USER_TOKEN_TRUST_EMAIL, value: {{ .Values.browserAuth.userTokens.trustEmail | quote }} }
 {{- end }}
 {{- if .Values.connectionsBridge.enabled }}
             - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }

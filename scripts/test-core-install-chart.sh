@@ -58,6 +58,45 @@ fi
 bash "${root}/scripts/customer-core-install-e2e.sh" \
   --lint-source-chart "${root}/charts/steward"
 
+browser_release='{"actionCommit":"4444444444444444444444444444444444444444","manifestSchemaVersion":3,"version":"0.7.0","workflowCommit":"3333333333333333333333333333333333333333","workflowRepository":"example-org/steward-run"}'
+browser_values=(
+  --set-string tls.webhook.caBundlePem=public-test-ca
+  --set browserAuth.enabled=true
+  --set-string browserAuth.google.clientId=google-client-id
+  --set-string browserAuth.google.origin=https://steward.example.test
+  --set-string browserAuth.google.workspaceDomain=example.test
+  --set-string browserAuth.google.organizationId=org_example
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc
+  --set-string browserAuth.google.clientSecret.key=client-secret
+  --set-json "config.apiserver.stewardRunRelease=${browser_release}"
+  --set-string 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24'
+)
+user_token_values=(
+  --set-string browserAuth.userTokens.issuer=https://issuer.example.test
+  --set-string browserAuth.userTokens.hyperShellAudience=steward-api
+  --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client'
+)
+helm_template "${browser_values[@]}" "${user_token_values[@]}" >/dev/null
+if helm_template "${browser_values[@]}" "${user_token_values[@]}" \
+  --set-string browserAuth.userTokens.portalAudience=portal-audience >/dev/null 2>&1
+then
+  echo 'browser user tokens must reject a portal audience without its opt-in' >&2
+  exit 1
+fi
+if helm_template "${browser_values[@]}" "${user_token_values[@]}" \
+  --set browserAuth.userTokens.acceptPortalAudience=true >/dev/null 2>&1
+then
+  echo 'browser user tokens must reject a portal opt-in without its audience' >&2
+  exit 1
+fi
+if helm_template "${browser_values[@]}" \
+  --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
+  --set-string browserAuth.userTokens.hyperShellAudience=steward-api >/dev/null 2>&1
+then
+  echo 'browser user tokens must reject enabled settings without a frontend client' >&2
+  exit 1
+fi
+
 starter_task_json='{"taskDefinition":{"schemaVersion":"steward.task-definition/v2","name":"hello-world","version":2,"runtime":{"agentRef":"codex@0.140.0"},"promptText":"Write hello world to out/hello.txt.","outputs":[{"path":"out/hello.txt","kind":"file","required":true}]},"inputs":{"greeting":"hello"},"executionLog":"full","packagePath":".steward/tasks/hello-world/task-definition.json","title":"Hello world","description":"A deployment-owned starter task.","git":{"repository":"https://github.com/example-org/agentic-ops.git","revision":"git:ref:main","path":"catalog/hello/task-definition.json"},"publishedWorkflow":"repo-summary@2"}'
 helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca \

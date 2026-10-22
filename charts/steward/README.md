@@ -346,11 +346,40 @@ Service.
 When `networkPolicy.enabled=true`, browser authentication additionally requires
 at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
 apiserver HTTPS egress only to those platform-managed CIDRs; it does not open
-unrestricted internet egress or encode Google IP ranges. The deployment
+unrestricted internet egress or encode provider IP ranges. The deployment
 adapter is responsible for maintaining the approved resolver/egress policy as
-Google's endpoints evolve. A local isolated lane may instead set
-`networkPolicy.enabled=false`; that is not a substitute for a production
-egress policy.
+Google's and the configured access-token issuer's endpoints evolve. A local
+isolated lane may instead set `networkPolicy.enabled=false`; that is not a
+substitute for a production egress policy.
+
+Headless user-token acceptance is optional and disabled by default under
+`browserAuth.userTokens`. Enabling it requires an exact HTTPS `issuer`, a nonempty
+`hyperShellAudience`, at least one `frontendClientIds` entry, and a positive
+`maximumTokenAgeSeconds` no greater than 86,400. To accept the portal's own audience, set both a
+nonempty `portalAudience` and `acceptPortalAudience=true`; either value without the other is
+rejected. `requiredTyp` optionally requires an exact JOSE `typ`, such as `at+jwt`; it is empty by
+default for providers that omit it. These access tokens authenticate only `/app/api/v1/*` and
+reuse the browser workspace domain, canonical-user, and local-RBAC rules. They do not grant access
+to administrator routes. Google sign-in continues to use browser sessions because Google user
+access tokens are opaque and are not accepted by this JWT verifier.
+
+`browserAuth.autoCreateUsers` is one shared browser and bearer policy. Its default is `true`,
+preserving first-sign-in registration. When it is `false`, neither path creates a new canonical
+user, but both may activate an exact pending invitation. Browser sign-in never links a new subject
+to an active user's email. A bearer issuer configured with `trustEmail=true` may still attach a
+subject to an existing active user with the same organization email, provided that user has no
+other subject from that issuer. Other unknown people are refused.
+
+`userIdClaim` names the issuer claim containing the stable person identifier and defaults to `sub`.
+Tokens without that configured claim are refused. `emailClaim` names the issuer claim containing
+the organization email and defaults to `email`. `email_verified` is reserved and cannot be used as
+either configured identity claim.
+By default, the token must also carry `email_verified: true`. Set `trustEmail=true` only when the
+configured issuer contract makes that claim unnecessary and the identity provider prevents users
+from changing their own email. Otherwise, a person could claim another user's email and be linked
+to that account. An explicit `email_verified=false` is always refused. The trust opt-in also allows
+Steward to link the exact organization email to an existing canonical user under the constraints
+above; issuer groups never grant roles.
 
 ## Direct package source resolution
 

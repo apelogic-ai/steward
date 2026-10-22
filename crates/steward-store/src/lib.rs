@@ -1812,8 +1812,8 @@ impl PgStore {
 
     /// Reserve one verified organization email for browser-member onboarding.
     ///
-    /// A pending record has no external identity and cannot act as a principal. The browser OIDC
-    /// registration path is the only operation that can activate it, after it verifies the exact
+    /// A pending record has no external identity and cannot act as a principal. A verified browser
+    /// or user-token identity registration may activate it only after verifying the exact
     /// organization email.
     pub async fn preprovision_canonical_user(
         &self,
@@ -2326,6 +2326,26 @@ impl PgStore {
         identity: &OrganizationIdentity,
         actor: &str,
     ) -> Result<CanonicalPrincipal, StoreError> {
+        self.resolve_or_register_canonical_identity(identity, actor, true)
+            .await
+    }
+
+    /// Activate an exact pending invitation without creating an unknown person.
+    pub async fn activate_preprovisioned_canonical_identity(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        self.resolve_or_register_canonical_identity(identity, actor, false)
+            .await
+    }
+
+    async fn resolve_or_register_canonical_identity(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+        create_unknown: bool,
+    ) -> Result<CanonicalPrincipal, StoreError> {
         if actor.trim().is_empty() {
             return Err(StoreError::CanonicalIdentityInvalidActor);
         }
@@ -2449,6 +2469,10 @@ impl PgStore {
             .map_err(|_| StoreError::CanonicalIdentityInvalidRecord);
         }
 
+        if !create_unknown {
+            return Err(StoreError::CanonicalIdentityNotFound);
+        }
+
         let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))
             .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
         sqlx::query(
@@ -2495,6 +2519,50 @@ impl PgStore {
             identity.verified_email().clone(),
         )
         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+    }
+
+    /// Attach an operator-trusted OIDC subject to the active user with the same exact
+    /// organization email. This narrow path is used only for a configured access-token issuer;
+    /// the normal browser registration path continues to refuse email-based linking.
+    pub async fn link_verified_canonical_identity_by_email(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        if !(actor == "browser-oidc" || actor.starts_with("user-token:")) || actor.trim() != actor {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        match self.resolve_canonical_identity(identity).await {
+            Ok(principal) => return Ok(principal),
+            Err(StoreError::CanonicalIdentityNotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let row = sqlx::query(
+            "SELECT user_id FROM canonical_users \
+             WHERE organization_id = $1 AND lower(display_email) = lower($2) \
+               AND state = 'active'",
+        )
+        .bind(identity.organization_id().as_str())
+        .bind(identity.verified_email().as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        let user_id = CanonicalUserId::parse(
+            row.try_get::<String, _>("user_id")
+                .map_err(database_error)?,
+        )
+        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+        let migration = OrganizationIdentityMigration::new_reviewed(
+            identity.issuer(),
+            identity.subject(),
+            identity.organization_claim(),
+            identity.organization_id().clone(),
+            identity.verified_email().clone(),
+        )
+        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+        self.attach_canonical_identity_subject(&user_id, &migration, actor)
+            .await
     }
 
     /// Attach a newly reviewed external issuer/subject to an existing person.

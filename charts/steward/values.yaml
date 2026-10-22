@@ -151,6 +151,7 @@ jira:
   enabled: false
 browserAuth:
   enabled: false
+  autoCreateUsers: true
   google:
     clientId: ""
     origin: ""
@@ -159,6 +160,19 @@ browserAuth:
     clientSecret:
       name: ""
       key: ""
+  # Optional headless access accepts JWT access tokens from this exact OIDC issuer.
+  # It reuses the browser workspace domain, canonical users, and local RBAC.
+  userTokens:
+    issuer: ""
+    hyperShellAudience: ""
+    portalAudience: ""
+    acceptPortalAudience: false
+    frontendClientIds: []
+    maximumTokenAgeSeconds: 300
+    requiredTyp: ""
+    userIdClaim: sub
+    emailClaim: email
+    trustEmail: false
 workloadExchangeTrust:
   kind: ConfigMap
   name: steward-workload-exchange-ca

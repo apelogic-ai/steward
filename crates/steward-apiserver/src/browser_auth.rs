@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, Request, State};
+use axum::extract::{MatchedPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_store::{BrowserRbacAssignments, PgStore, StoreError};
 use steward_types::{
-    CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentity,
-    OrganizationIdentityPolicy,
+    CallerReference, CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId,
+    OrganizationIdentity, OrganizationIdentityPolicy,
 };
 use uuid::Uuid;
 
@@ -184,6 +184,7 @@ pub struct BrowserSessionBinding(String);
 pub struct BrowserSessionContext {
     pub principal: BrowserPrincipal,
     pub binding: BrowserSessionBinding,
+    pub caller_reference: Option<CallerReference>,
 }
 
 #[derive(Clone)]
@@ -264,6 +265,21 @@ pub trait BrowserOidcProvider: Send + Sync + 'static {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedUserTokenClaims {
+    pub identity: OrganizationIdentity,
+    pub display_name: Option<String>,
+    pub frontend_client_id: String,
+    pub email_linking_allowed: bool,
+}
+
+pub trait BrowserUserTokenVerifier: Send + Sync + 'static {
+    fn verify<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>>;
+}
+
 impl BrowserOidcProvider for GoogleAuthorizationOnlyProvider {
     fn authorization_url(
         &self,
@@ -286,6 +302,13 @@ impl BrowserOidcProvider for GoogleAuthorizationOnlyProvider {
 }
 
 pub trait BrowserIdentityResolver: Send + Sync + 'static {
+    fn resolve_existing<'a>(
+        &'a self,
+        _identity: &'a OrganizationIdentity,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async { Err(BrowserAuthFailure::InvalidIdentity) })
+    }
+
     fn resolve_or_register<'a>(
         &'a self,
         identity: &'a OrganizationIdentity,
@@ -298,6 +321,24 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
     ) -> BrowserFuture<'a, Result<(), BrowserAuthFailure>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn resolve_or_register_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        _actor: &'a str,
+        _email_linking_allowed: bool,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        self.resolve_or_register(identity)
+    }
+
+    fn resolve_existing_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        _actor: &'a str,
+        _email_linking_allowed: bool,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        self.resolve_existing(identity)
+    }
 }
 
 #[derive(Clone)]
@@ -309,30 +350,105 @@ impl PgBrowserIdentityResolver {
     pub fn new(store: PgStore) -> Self {
         Self { store }
     }
+
+    async fn resolve(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+        create_unknown: bool,
+        email_linking_allowed: bool,
+    ) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+        let principal = match self.store.resolve_canonical_identity(identity).await {
+            Ok(principal) => principal,
+            Err(StoreError::CanonicalIdentityNotFound) if email_linking_allowed => {
+                match self
+                    .store
+                    .link_verified_canonical_identity_by_email(identity, actor)
+                    .await
+                {
+                    Ok(principal) => principal,
+                    Err(StoreError::CanonicalIdentityNotFound) if create_unknown => self
+                        .store
+                        .register_canonical_identity(identity, actor)
+                        .await
+                        .map_err(|error| {
+                            map_user_token_identity_error(
+                                error,
+                                actor,
+                                create_unknown,
+                                email_linking_allowed,
+                            )
+                        })?,
+                    Err(StoreError::CanonicalIdentityNotFound) => self
+                        .store
+                        .activate_preprovisioned_canonical_identity(identity, actor)
+                        .await
+                        .map_err(|error| {
+                            map_user_token_identity_error(
+                                error,
+                                actor,
+                                create_unknown,
+                                email_linking_allowed,
+                            )
+                        })?,
+                    Err(error) => {
+                        return Err(map_user_token_identity_error(
+                            error,
+                            actor,
+                            create_unknown,
+                            email_linking_allowed,
+                        ));
+                    }
+                }
+            }
+            Err(StoreError::CanonicalIdentityNotFound) if create_unknown => self
+                .store
+                .register_canonical_identity(identity, actor)
+                .await
+                .map_err(|error| {
+                    map_user_token_identity_error(
+                        error,
+                        actor,
+                        create_unknown,
+                        email_linking_allowed,
+                    )
+                })?,
+            Err(StoreError::CanonicalIdentityNotFound) => self
+                .store
+                .activate_preprovisioned_canonical_identity(identity, actor)
+                .await
+                .map_err(|error| {
+                    map_user_token_identity_error(
+                        error,
+                        actor,
+                        create_unknown,
+                        email_linking_allowed,
+                    )
+                })?,
+            Err(error) => return Err(map_store_error(error)),
+        };
+        let assignments = self
+            .store
+            .browser_rbac_assignments(&principal.user_id)
+            .await
+            .map_err(map_store_error)?;
+        Ok(browser_principal_from_assignments(principal, assignments))
+    }
 }
 
 impl BrowserIdentityResolver for PgBrowserIdentityResolver {
+    fn resolve_existing<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async move { self.resolve(identity, "browser-oidc", false, false).await })
+    }
+
     fn resolve_or_register<'a>(
         &'a self,
         identity: &'a OrganizationIdentity,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
-        Box::pin(async move {
-            let principal = match self.store.resolve_canonical_identity(identity).await {
-                Ok(principal) => principal,
-                Err(StoreError::CanonicalIdentityNotFound) => self
-                    .store
-                    .register_canonical_identity(identity, "browser-oidc")
-                    .await
-                    .map_err(map_store_error)?,
-                Err(error) => return Err(map_store_error(error)),
-            };
-            let assignments = self
-                .store
-                .browser_rbac_assignments(&principal.user_id)
-                .await
-                .map_err(map_store_error)?;
-            Ok(browser_principal_from_assignments(principal, assignments))
-        })
+        Box::pin(async move { self.resolve(identity, "browser-oidc", true, false).await })
     }
 
     fn record_successful_sign_in<'a>(
@@ -345,6 +461,30 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
                 .record_browser_sign_in(user_id, display_name)
                 .await
                 .map_err(map_store_error)
+        })
+    }
+
+    fn resolve_or_register_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        actor: &'a str,
+        email_linking_allowed: bool,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async move {
+            self.resolve(identity, actor, true, email_linking_allowed)
+                .await
+        })
+    }
+
+    fn resolve_existing_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        actor: &'a str,
+        email_linking_allowed: bool,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async move {
+            self.resolve(identity, actor, false, email_linking_allowed)
+                .await
         })
     }
 }
@@ -369,6 +509,27 @@ fn browser_principal_from_assignments(
 fn map_store_error(error: StoreError) -> BrowserAuthFailure {
     match error {
         StoreError::Database(_) => BrowserAuthFailure::IdentityUnavailable,
+        _ => BrowserAuthFailure::InvalidIdentity,
+    }
+}
+
+fn map_user_token_identity_error(
+    error: StoreError,
+    actor: &str,
+    create_unknown: bool,
+    email_linking_allowed: bool,
+) -> BrowserAuthFailure {
+    if !actor.starts_with("user-token:") {
+        return map_store_error(error);
+    }
+    match error {
+        StoreError::Database(_) => BrowserAuthFailure::IdentityUnavailable,
+        StoreError::CanonicalIdentityNotFound if !create_unknown => {
+            BrowserAuthFailure::InvalidSession
+        }
+        StoreError::CanonicalIdentityAmbiguousEmail if !email_linking_allowed => {
+            BrowserAuthFailure::InvalidIdentity
+        }
         _ => BrowserAuthFailure::InvalidIdentity,
     }
 }
@@ -438,9 +599,12 @@ struct BrowserAuthConfig {
 #[derive(Clone)]
 pub struct BrowserAuthService {
     provider: Arc<dyn BrowserOidcProvider>,
+    user_tokens: Option<Arc<dyn BrowserUserTokenVerifier>>,
     identities: Arc<dyn BrowserIdentityResolver>,
+    request_audit_reporter: Arc<dyn Fn(&str) + Send + Sync>,
     registry: BrowserSessionRegistry,
     config: BrowserAuthConfig,
+    auto_create_users: bool,
 }
 
 impl BrowserAuthService {
@@ -451,8 +615,11 @@ impl BrowserAuthService {
     ) -> Result<Self, String> {
         Ok(Self {
             provider,
+            user_tokens: None,
             identities,
+            request_audit_reporter: Arc::new(|line| eprintln!("{line}")),
             registry: BrowserSessionRegistry::default(),
+            auto_create_users: true,
             config: BrowserAuthConfig {
                 browser_origin: config.browser_origin.clone(),
                 callback_uri: config.callback_uri.clone(),
@@ -462,6 +629,25 @@ impl BrowserAuthService {
                 flow_cookie: "__Secure-steward-oidc-flow",
             },
         })
+    }
+
+    pub fn with_user_token_verifier(mut self, verifier: Arc<dyn BrowserUserTokenVerifier>) -> Self {
+        self.user_tokens = Some(verifier);
+        self
+    }
+
+    pub fn with_auto_create_users(mut self, enabled: bool) -> Self {
+        self.auto_create_users = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_request_audit_reporter(
+        mut self,
+        reporter: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        self.request_audit_reporter = Arc::new(reporter);
+        self
     }
 
     /// Revoke every in-memory browser session issued to one canonical user.
@@ -490,8 +676,11 @@ impl BrowserAuthService {
         }
         Ok(Self {
             provider,
+            user_tokens: None,
             identities,
+            request_audit_reporter: Arc::new(|line| eprintln!("{line}")),
             registry: BrowserSessionRegistry::default(),
+            auto_create_users: true,
             config: BrowserAuthConfig {
                 browser_origin: origin.to_owned(),
                 callback_uri: format!("{origin}{CALLBACK_PATH}"),
@@ -796,7 +985,7 @@ async fn callback(
         Ok(identity) => identity,
         Err(_) => return rejected_callback(&service.config),
     };
-    let mut principal = match service.identities.resolve_or_register(&identity).await {
+    let mut principal = match resolve_browser_identity(&service, &identity).await {
         Ok(principal) => principal,
         Err(_) => return rejected_callback(&service.config),
     };
@@ -839,6 +1028,17 @@ async fn callback(
         response.headers_mut().append(header::SET_COOKIE, expired);
     }
     response
+}
+
+async fn resolve_browser_identity(
+    service: &BrowserAuthService,
+    identity: &OrganizationIdentity,
+) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+    if service.auto_create_users {
+        service.identities.resolve_or_register(identity).await
+    } else {
+        service.identities.resolve_existing(identity).await
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -960,7 +1160,7 @@ pub async fn authenticate_browser_session(
     request: Request,
     next: Next,
 ) -> Response {
-    authenticate_browser_request(service, request, next, false).await
+    authenticate_browser_user_request(service, request, next).await
 }
 
 pub async fn authenticate_browser_admin(
@@ -968,10 +1168,10 @@ pub async fn authenticate_browser_admin(
     request: Request,
     next: Next,
 ) -> Response {
-    authenticate_browser_request(service, request, next, true).await
+    authenticate_browser_cookie_request(service, request, next, true).await
 }
 
-async fn authenticate_browser_request(
+async fn authenticate_browser_cookie_request(
     service: BrowserAuthService,
     mut request: Request,
     next: Next,
@@ -1002,6 +1202,7 @@ async fn authenticate_browser_request(
     let context = BrowserSessionContext {
         principal: session.principal,
         binding: BrowserSessionBinding(session.token),
+        caller_reference: None,
     };
     if require_admin {
         request.extensions_mut().insert(BrowserAdminAuthority {
@@ -1011,6 +1212,291 @@ async fn authenticate_browser_request(
     }
     request.extensions_mut().insert(context);
     next.run(request).await
+}
+
+struct VerifiedUserTokenSession {
+    principal: BrowserPrincipal,
+    binding: BrowserSessionBinding,
+    caller_reference: CallerReference,
+}
+
+async fn authenticate_browser_user_request(
+    service: BrowserAuthService,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let cookie_token = cookie_value(request.headers(), service.config.session_cookie);
+    let cookie_session = match cookie_token {
+        Some(_) => match resolve_session(&service, request.headers()) {
+            Ok(session) => Some(session),
+            Err(error) => return error.into_response(),
+        },
+        None => None,
+    };
+    let credential = match user_token_credential(&service, request.headers(), request.uri().path())
+    {
+        Ok(token) => token,
+        Err(error) => return error.into_response(),
+    };
+    let method = request.method().clone();
+    let route_template = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched")
+        .to_owned();
+    let user_token =
+        match resolve_user_token(&service, credential.as_deref(), &method, &route_template).await {
+            Ok(token) => token,
+            Err(error) => return error.into_response(),
+        };
+    if let (Some(cookie), Some(token)) = (&cookie_session, &user_token)
+        && cookie.principal.canonical_user_id != token.principal.canonical_user_id
+    {
+        report_browser_user_request(
+            &service,
+            Some(&token.principal),
+            &token.caller_reference,
+            &method,
+            &route_template,
+            "refused",
+            "identity_conflict",
+        );
+        return BrowserAuthFailure::InvalidSession.into_response();
+    }
+    let (principal, binding, caller_reference) = if let Some(cookie) = &cookie_session {
+        (
+            cookie.principal.clone(),
+            BrowserSessionBinding(cookie.token.clone()),
+            user_token
+                .as_ref()
+                .map(|token| token.caller_reference.clone()),
+        )
+    } else if let Some(token) = &user_token {
+        (
+            token.principal.clone(),
+            token.binding.clone(),
+            Some(token.caller_reference.clone()),
+        )
+    } else {
+        return BrowserAuthFailure::InvalidSession.into_response();
+    };
+    let is_mutation = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if is_mutation {
+        if let Some(cookie) = &cookie_session
+            && !valid_mutation(
+                &service.config,
+                request.headers(),
+                request.method(),
+                &cookie.csrf,
+            )
+        {
+            if let Some(token) = &user_token {
+                report_browser_user_request(
+                    &service,
+                    Some(&token.principal),
+                    &token.caller_reference,
+                    &method,
+                    &route_template,
+                    "refused",
+                    "invalid_mutation",
+                );
+            }
+            return BrowserAuthFailure::InvalidMutation.into_response();
+        }
+        request.extensions_mut().insert(BrowserMutationProof(()));
+    }
+    if let Some(reference) = &caller_reference {
+        request.extensions_mut().insert(reference.clone());
+    }
+    request.extensions_mut().insert(BrowserSessionContext {
+        principal,
+        binding,
+        caller_reference,
+    });
+    if let Some(token) = &user_token {
+        report_browser_user_request(
+            &service,
+            Some(&token.principal),
+            &token.caller_reference,
+            &method,
+            &route_template,
+            "allowed",
+            "authenticated",
+        );
+    }
+    next.run(request).await
+}
+
+fn report_browser_user_request(
+    service: &BrowserAuthService,
+    principal: Option<&BrowserPrincipal>,
+    caller_reference: &CallerReference,
+    method: &Method,
+    route_template: &str,
+    outcome: &str,
+    reason_code: &str,
+) {
+    let audit_record = serde_json::json!({
+        "event": "api_bearer_request",
+        "canonicalUserId": principal.map(|principal| principal.canonical_user_id.as_str()),
+        "issuer": caller_reference.url(),
+        "frontendClientId": caller_reference.label(),
+        "method": method.as_str(),
+        "routeTemplate": route_template,
+        "outcome": outcome,
+        "reasonCode": reason_code,
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    })
+    .to_string();
+    (service.request_audit_reporter)(&audit_record);
+}
+
+fn user_token_credential(
+    service: &BrowserAuthService,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Option<String>, BrowserAuthFailure> {
+    if service.user_tokens.is_none() {
+        return Ok(None);
+    }
+    if !(path == "/app/api/v1" || path.starts_with("/app/api/v1/")) {
+        return Ok(None);
+    }
+    let authorization = headers
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .collect::<Vec<_>>();
+    if authorization.is_empty() {
+        return Ok(None);
+    }
+    let bearer_count = authorization
+        .iter()
+        .filter(|value| {
+            value
+                .as_bytes()
+                .split(|byte| *byte == b' ')
+                .next()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"Bearer"))
+        })
+        .count();
+    if bearer_count == 0 {
+        return Ok(None);
+    }
+    if authorization.len() != 1 {
+        return Err(BrowserAuthFailure::InvalidSession);
+    }
+    let value = authorization[0]
+        .to_str()
+        .map_err(|_| BrowserAuthFailure::InvalidSession)?;
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return Ok(None);
+    };
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Ok(None);
+    }
+    if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(BrowserAuthFailure::InvalidSession);
+    }
+    Ok(Some(token.to_owned()))
+}
+
+async fn resolve_user_token(
+    service: &BrowserAuthService,
+    token: Option<&str>,
+    method: &Method,
+    route_template: &str,
+) -> Result<Option<VerifiedUserTokenSession>, BrowserAuthFailure> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let verifier = service
+        .user_tokens
+        .as_ref()
+        .ok_or(BrowserAuthFailure::InvalidSession)?;
+    let claims = verifier.verify(token).await.map_err(|error| match error {
+        BrowserAuthFailure::ProviderUnavailable | BrowserAuthFailure::IdentityUnavailable => error,
+        _ => BrowserAuthFailure::InvalidSession,
+    })?;
+    let caller_reference = CallerReference::new(
+        claims.frontend_client_id,
+        Some(claims.identity.issuer().to_owned()),
+    )
+    .map_err(|_| BrowserAuthFailure::InvalidSession)?;
+    let actor = format!("user-token:{}", claims.identity.issuer());
+    let mut principal = match resolve_user_token_identity(
+        service,
+        &claims.identity,
+        &actor,
+        claims.email_linking_allowed,
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(error) => {
+            report_browser_user_request(
+                service,
+                None,
+                &caller_reference,
+                method,
+                route_template,
+                "refused",
+                user_token_identity_refusal_reason(error, claims.email_linking_allowed),
+            );
+            return Err(match error {
+                BrowserAuthFailure::IdentityUnavailable => error,
+                _ => BrowserAuthFailure::InvalidSession,
+            });
+        }
+    };
+    if let Some(display_name) = claims.display_name {
+        principal.display_name = display_name;
+    }
+    let binding = BrowserSessionBinding(format!(
+        "user-token:{}",
+        base64_url(&Sha256::digest(token.as_bytes()))
+    ));
+    Ok(Some(VerifiedUserTokenSession {
+        principal,
+        binding,
+        caller_reference,
+    }))
+}
+
+fn user_token_identity_refusal_reason(
+    error: BrowserAuthFailure,
+    email_linking_allowed: bool,
+) -> &'static str {
+    match error {
+        BrowserAuthFailure::InvalidIdentity if !email_linking_allowed => "identity_link_refused",
+        BrowserAuthFailure::InvalidIdentity => "identity_conflict",
+        BrowserAuthFailure::InsufficientAuthority => "identity_link_refused",
+        BrowserAuthFailure::InvalidSession => "unknown_user",
+        BrowserAuthFailure::IdentityUnavailable => "identity_unavailable",
+        _ => "identity_resolution_failed",
+    }
+}
+
+async fn resolve_user_token_identity(
+    service: &BrowserAuthService,
+    identity: &OrganizationIdentity,
+    actor: &str,
+    email_linking_allowed: bool,
+) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+    if service.auto_create_users {
+        service
+            .identities
+            .resolve_or_register_user_token(identity, actor, email_linking_allowed)
+            .await
+    } else {
+        service
+            .identities
+            .resolve_existing_user_token(identity, actor, email_linking_allowed)
+            .await
+    }
 }
 
 fn valid_mutation(
@@ -1356,22 +1842,258 @@ fn percent_encode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Extension, Json, Router};
     use steward_store::BrowserRbacAssignments;
-    use steward_types::{CanonicalUserId, Email, OrganizationId};
+    use steward_types::{
+        CallerReference, CanonicalUserId, Email, OrganizationId, OrganizationIdentityPolicy,
+    };
     use tower::ServiceExt;
 
     use super::{
-        BrowserAdminAuthority, BrowserAuthError, BrowserAuthFailure, BrowserMutationProof,
-        BrowserOidcProvider, BrowserPrincipal, BrowserRole, BrowserSessionContext,
-        BrowserSessionRegistry, GoogleOidcConfig, LocalFakeIdentity, LocalFakeOidcProvider,
-        MAX_BROWSER_SESSIONS, MAX_PENDING_AUTHORIZATIONS, PendingAuthorization,
-        browser_auth_router, local_fake_browser_auth_service, protect_browser_admin_routes,
-        protect_browser_routes,
+        BrowserAdminAuthority, BrowserAuthError, BrowserAuthFailure, BrowserIdentityResolver,
+        BrowserMutationProof, BrowserOidcProvider, BrowserPrincipal, BrowserRole,
+        BrowserSessionContext, BrowserSessionRegistry, BrowserUserTokenVerifier, GoogleOidcConfig,
+        LocalFakeIdentity, LocalFakeOidcProvider, MAX_BROWSER_SESSIONS, MAX_PENDING_AUTHORIZATIONS,
+        PendingAuthorization, VerifiedUserTokenClaims, browser_auth_router,
+        local_fake_browser_auth_service, protect_browser_admin_routes, protect_browser_routes,
     };
+
+    fn parse_bearer_request_audit(
+        line: &str,
+        access_token: &str,
+    ) -> Result<serde_json::Value, String> {
+        assert!(!line.contains(access_token));
+        assert!(!line.contains("Authorization"));
+        assert!(!line.contains("authorization"));
+        assert!(!line.contains("Bearer "));
+        let audit: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("parse request audit record: {error}"))?;
+        let audit_fields = audit
+            .as_object()
+            .ok_or_else(|| "request audit record must be a JSON object".to_owned())?
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            audit_fields,
+            std::collections::BTreeSet::from([
+                "canonicalUserId",
+                "event",
+                "frontendClientId",
+                "issuer",
+                "method",
+                "outcome",
+                "reasonCode",
+                "routeTemplate",
+                "timestamp",
+            ]),
+            "the process-log contract must not gain token or claim fields"
+        );
+        chrono::DateTime::parse_from_rfc3339(
+            audit["timestamp"]
+                .as_str()
+                .ok_or_else(|| "audit timestamp must be a string".to_owned())?,
+        )
+        .map_err(|error| format!("audit timestamp must be RFC 3339: {error}"))?;
+        Ok(audit)
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixtureTokenIdentityResolver;
+
+    impl BrowserIdentityResolver for FixtureTokenIdentityResolver {
+        fn resolve_or_register<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move {
+                if identity.subject() != "fixture-user-subject" {
+                    return Err(BrowserAuthFailure::InvalidIdentity);
+                }
+                Ok(BrowserPrincipal {
+                    canonical_user_id: CanonicalUserId::parse(
+                        "usr_0123456789abcdef0123456789abcdef",
+                    )
+                    .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                    display_name: "Alice Example".to_owned(),
+                    display_email: Email::parse("alice@example.com".to_owned())
+                        .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                    role: BrowserRole::User,
+                    member_roles: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingUserTokenIdentityResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BrowserIdentityResolver for RecordingUserTokenIdentityResolver {
+        fn resolve_or_register<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            self.resolve_or_register_user_token(identity, "test", false)
+        }
+
+        fn resolve_or_register_user_token<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+            _actor: &'a str,
+            _email_linking_allowed: bool,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(BrowserPrincipal {
+                    canonical_user_id: CanonicalUserId::parse(
+                        "usr_0123456789abcdef0123456789abcdef",
+                    )
+                    .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                    display_name: "Alice Example".to_owned(),
+                    display_email: identity.verified_email().clone(),
+                    role: BrowserRole::User,
+                    member_roles: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct InvalidAuditMetadataVerifier;
+
+    impl BrowserUserTokenVerifier for InvalidAuditMetadataVerifier {
+        fn verify<'a>(
+            &'a self,
+            _token: &'a str,
+        ) -> super::BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>> {
+            Box::pin(async move {
+                let policy = OrganizationIdentityPolicy::new_configured_oidc(
+                    "https://idp_internal.example.test",
+                    "example.com",
+                    OrganizationId::parse("org_example")
+                        .map_err(|_| BrowserAuthFailure::InvalidIdentity)?,
+                )
+                .map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
+                let identity = policy
+                    .validate(
+                        "https://idp_internal.example.test",
+                        "alice",
+                        "example.com",
+                        "alice@example.com",
+                        true,
+                    )
+                    .map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
+                Ok(VerifiedUserTokenClaims {
+                    identity,
+                    display_name: Some("Alice Example".to_owned()),
+                    frontend_client_id: "portal-client".to_owned(),
+                    email_linking_allowed: false,
+                })
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct PolicyIdentityResolver {
+        known: bool,
+    }
+
+    impl PolicyIdentityResolver {
+        fn principal(
+            identity: &steward_types::OrganizationIdentity,
+        ) -> Result<BrowserPrincipal, BrowserAuthFailure> {
+            Ok(BrowserPrincipal {
+                canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                    .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                display_name: "Alice Example".to_owned(),
+                display_email: identity.verified_email().clone(),
+                role: BrowserRole::User,
+                member_roles: Vec::new(),
+            })
+        }
+    }
+
+    impl BrowserIdentityResolver for PolicyIdentityResolver {
+        fn resolve_existing<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move {
+                if !self.known {
+                    return Err(BrowserAuthFailure::InvalidIdentity);
+                }
+                Self::principal(identity)
+            })
+        }
+
+        fn resolve_or_register<'a>(
+            &'a self,
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move { Self::principal(identity) })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct RefusingUserTokenIdentityResolver {
+        failure: BrowserAuthFailure,
+    }
+
+    impl BrowserIdentityResolver for RefusingUserTokenIdentityResolver {
+        fn resolve_or_register<'a>(
+            &'a self,
+            _identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move { Err(self.failure) })
+        }
+
+        fn resolve_existing<'a>(
+            &'a self,
+            _identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move { Err(self.failure) })
+        }
+    }
+
+    fn user_token_test_service() -> Result<super::BrowserAuthService, String> {
+        user_token_test_service_with_verifier(crate::google_oidc::fixture_user_token_verifier(
+            false,
+        )?)
+    }
+
+    fn user_token_test_service_with_verifier(
+        verifier: crate::google_oidc::OidcUserTokenVerifier,
+    ) -> Result<super::BrowserAuthService, String> {
+        let service = super::BrowserAuthService::local_fake(
+            "http://127.0.0.1:33001",
+            Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+            Arc::new(FixtureTokenIdentityResolver),
+        )?;
+        Ok(service.with_user_token_verifier(Arc::new(verifier)))
+    }
+
+    fn valid_user_token_claims() -> serde_json::Value {
+        serde_json::json!({
+            "iss": "https://issuer.example.test",
+            "sub": "fixture-user-subject",
+            "azp": "portal-client",
+            "aud": "steward-api",
+            "exp": 2_000,
+            "iat": 1_000,
+            "nbf": 1_000,
+            "email": "alice@example.com",
+            "email_verified": true,
+            "name": "Alice Example"
+        })
+    }
 
     #[test]
     fn user_workspace_return_paths_are_exactly_allowlisted() {
@@ -1910,6 +2632,12 @@ mod tests {
         identity: LocalFakeIdentity,
     ) -> Result<(super::BrowserAuthService, String, String), String> {
         let service = local_fake_browser_auth_service("http://127.0.0.1:33001", identity)?;
+        start_local_flow_with_service(service).await
+    }
+
+    async fn start_local_flow_with_service(
+        service: super::BrowserAuthService,
+    ) -> Result<(super::BrowserAuthService, String, String), String> {
         let login = browser_auth_router(service.clone())
             .oneshot(
                 Request::builder()
@@ -1944,6 +2672,92 @@ mod tests {
             .ok_or_else(|| "fake authorization omitted callback redirect".to_owned())?
             .to_owned();
         Ok((service, flow_cookie, callback))
+    }
+
+    async fn complete_local_flow(
+        service: super::BrowserAuthService,
+        flow_cookie: &str,
+        callback_uri: &str,
+    ) -> Result<axum::response::Response, String> {
+        browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri(callback_uri)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute callback request: {error}"))
+    }
+
+    #[tokio::test]
+    async fn shared_auto_create_policy_governs_browser_sign_in() -> Result<(), String> {
+        for (known, auto_create, expected_session) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let service = super::BrowserAuthService::local_fake(
+                "http://127.0.0.1:33001",
+                Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+                Arc::new(PolicyIdentityResolver { known }),
+            )?
+            .with_auto_create_users(auto_create);
+            let (service, flow_cookie, callback_uri) =
+                start_local_flow_with_service(service).await?;
+            let callback = complete_local_flow(service, &flow_cookie, &callback_uri).await?;
+            assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                cookie_pair(&callback, "steward-local-session").is_ok(),
+                expected_session,
+                "known={known} auto_create={auto_create}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_auto_create_policy_governs_user_bearers() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        for (known, auto_create, expected) in [
+            (false, false, StatusCode::UNAUTHORIZED),
+            (true, false, StatusCode::OK),
+            (false, true, StatusCode::OK),
+        ] {
+            let service = super::BrowserAuthService::local_fake(
+                "http://127.0.0.1:33001",
+                Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+                Arc::new(PolicyIdentityResolver { known }),
+            )?
+            .with_user_token_verifier(Arc::new(crate::google_oidc::fixture_user_token_verifier(
+                false,
+            )?))
+            .with_auto_create_users(auto_create);
+            let response = protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe)),
+                service,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build bearer policy request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute bearer policy request: {error}"))?;
+            assert_eq!(
+                response.status(),
+                expected,
+                "known={known} auto_create={auto_create}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -2298,6 +3112,660 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_user_routes_accept_a_verified_bearer_without_csrf_and_refuse_identity_conflicts()
+    -> Result<(), String> {
+        async fn probe(
+            Extension(session): Extension<BrowserSessionContext>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "userId": session.principal.canonical_user_id,
+                "issuer": session
+                    .caller_reference
+                    .as_ref()
+                    .and_then(CallerReference::url),
+                "frontendClientId": session
+                    .caller_reference
+                    .as_ref()
+                    .map(CallerReference::label),
+            }))
+        }
+
+        let disabled_service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let disabled = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            disabled_service,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, "Bearer alice-token")
+                .body(Body::empty())
+                .map_err(|error| format!("build disabled bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute disabled bearer request: {error}"))?;
+        assert_eq!(disabled.status(), StatusCode::UNAUTHORIZED);
+
+        let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_lines.clone();
+        let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
+            match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            }
+        });
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let routes = || {
+            protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe).post(probe)),
+                service.clone(),
+            )
+        };
+
+        let opaque = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, "Bearer alice-token")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build opaque bearer request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute opaque bearer request: {error}"))?;
+        assert_eq!(opaque.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = routes()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build bearer user request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute bearer user request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = to_bytes(accepted.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read bearer user response: {error}"))?;
+        let audit: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse bearer user response: {error}"))?;
+        assert_eq!(audit["userId"], "usr_0123456789abcdef0123456789abcdef");
+        assert_eq!(audit["issuer"], "https://issuer.example.test");
+        assert_eq!(audit["frontendClientId"], "portal-client");
+        assert!(audit.get("token").is_none());
+
+        let id_token = crate::google_oidc::fixture_user_id_token();
+        let browser_id_token = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {id_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build browser ID-token request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute browser ID-token request: {error}"))?;
+        assert_eq!(browser_id_token.status(), StatusCode::UNAUTHORIZED);
+
+        let outside_user_api = protect_browser_routes(
+            Router::new().route("/admin/api/v1/probe", get(probe)),
+            service.clone(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/admin/api/v1/probe")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .map_err(|error| format!("build out-of-scope bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute out-of-scope bearer request: {error}"))?;
+        assert_eq!(outside_user_api.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = service
+            .registry
+            .issue(principal()?, super::epoch_seconds())
+            .map_err(|error| format!("issue conflict cookie: {error:?}"))?;
+        let cookie_with_unrelated_authorization = protect_browser_routes(
+            Router::new().route("/outside-bearer-scope", get(probe)),
+            service.clone(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/outside-bearer-scope")
+                .header(
+                    header::COOKIE,
+                    format!("steward-local-session={}", cookie.token),
+                )
+                .header(header::AUTHORIZATION, "Basic proxy-credential")
+                .body(Body::empty())
+                .map_err(|error| format!("build cookie request with proxy auth: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute cookie request with proxy auth: {error}"))?;
+        assert_eq!(cookie_with_unrelated_authorization.status(), StatusCode::OK);
+
+        let scoped_cookie_with_non_bearer = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", cookie.token),
+                    )
+                    .header(header::AUTHORIZATION, "Basic proxy-credential")
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("build scoped cookie request with Basic auth: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("execute scoped cookie request with Basic auth: {error}"))?;
+        assert_eq!(scoped_cookie_with_non_bearer.status(), StatusCode::OK);
+
+        let audit_count_before_csrf_rejection = audit_lines
+            .lock()
+            .map_err(|_| "request audit capture lock poisoned".to_owned())?
+            .len();
+        let same_person_without_csrf = routes()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", cookie.token),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .header(header::ORIGIN, "http://127.0.0.1:33001")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build cookie and bearer mutation: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute cookie and bearer mutation: {error}"))?;
+        assert_eq!(same_person_without_csrf.status(), StatusCode::FORBIDDEN);
+        {
+            let audit_lines = audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                audit_count_before_csrf_rejection + 1,
+                "an identified bearer request must be audited before CSRF refusal"
+            );
+            let audit = parse_bearer_request_audit(
+                audit_lines
+                    .last()
+                    .ok_or_else(|| "missing CSRF-refusal audit line".to_owned())?,
+                &access_token,
+            )?;
+            assert_eq!(audit["outcome"], "refused");
+            assert_eq!(audit["reasonCode"], "invalid_mutation");
+        }
+
+        let mut other_principal = principal()?;
+        other_principal.canonical_user_id =
+            CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")?;
+        other_principal.display_email = Email::parse("bob@example.org".to_owned())?;
+        let other_cookie = service
+            .registry
+            .issue(other_principal, super::epoch_seconds())
+            .map_err(|error| format!("issue conflicting cookie: {error:?}"))?;
+        let audit_count_before_identity_conflict = audit_lines
+            .lock()
+            .map_err(|_| "request audit capture lock poisoned".to_owned())?
+            .len();
+        let conflict = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", other_cookie.token),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build conflicting identities request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute conflicting identities request: {error}"))?;
+        assert_eq!(conflict.status(), StatusCode::UNAUTHORIZED);
+        {
+            let audit_lines = audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                audit_count_before_identity_conflict + 1,
+                "a verified bearer must be audited before a cookie identity conflict is refused"
+            );
+            let audit = parse_bearer_request_audit(
+                audit_lines
+                    .last()
+                    .ok_or_else(|| "missing identity-conflict audit line".to_owned())?,
+                &access_token,
+            )?;
+            assert_eq!(audit["outcome"], "refused");
+            assert_eq!(audit["reasonCode"], "identity_conflict");
+        }
+        assert_eq!(
+            audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?
+                .len(),
+            3,
+            "allowed, CSRF-refused, and identity-conflict requests must each emit one line"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_records_request_audit_context_for_personal_agent_routes()
+    -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_lines.clone();
+        let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
+            match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            }
+        });
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/agents/{agent_id}/messages", post(probe)),
+            service,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/agents/fixture/messages")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .map_err(|error| format!("build personal-agent bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute personal-agent bearer request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let audit_lines = audit_lines
+            .lock()
+            .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+        assert_eq!(
+            audit_lines.len(),
+            1,
+            "one request must make one audit record"
+        );
+        let audit = parse_bearer_request_audit(&audit_lines[0], &access_token)?;
+        assert_eq!(audit["event"], "api_bearer_request");
+        assert_eq!(
+            audit["canonicalUserId"],
+            "usr_0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(audit["issuer"], "https://issuer.example.test");
+        assert_eq!(audit["frontendClientId"], "portal-client");
+        assert_eq!(audit["method"], "POST");
+        assert_eq!(
+            audit["routeTemplate"],
+            "/app/api/v1/agents/{agent_id}/messages"
+        );
+        assert_eq!(audit["outcome"], "allowed");
+        assert_eq!(audit["reasonCode"], "authenticated");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_records_allowed_decision_before_cancelled_handler_finishes()
+    -> Result<(), String> {
+        async fn probe(Extension(started): Extension<Arc<tokio::sync::Notify>>) -> StatusCode {
+            started.notify_one();
+            std::future::pending().await
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_lines.clone();
+        let service = user_token_test_service()?.with_request_audit_reporter(move |line| {
+            match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            }
+        });
+        let handler_started = Arc::new(tokio::sync::Notify::new());
+        let routes = protect_browser_routes(
+            Router::new()
+                .route("/app/api/v1/probe", get(probe))
+                .layer(Extension(handler_started.clone())),
+            service,
+        );
+        let request = Request::builder()
+            .uri("/app/api/v1/probe")
+            .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .body(Body::empty())
+            .map_err(|error| format!("build cancellable bearer request: {error}"))?;
+        let request_task = tokio::spawn(routes.oneshot(request));
+
+        handler_started.notified().await;
+        {
+            let audit_lines = audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                1,
+                "the authorization decision must be audited before the handler can be cancelled"
+            );
+            let audit = parse_bearer_request_audit(&audit_lines[0], &access_token)?;
+            assert_eq!(audit["outcome"], "allowed");
+            assert_eq!(audit["reasonCode"], "authenticated");
+        }
+
+        request_task.abort();
+        let _ = request_task.await;
+        assert_eq!(
+            audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?
+                .len(),
+            1,
+            "cancelling the handler must not add or remove audit records"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_bearer_identity_refusals_write_reasoned_audit_lines() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        for (case, failure, auto_create_users, trust_email, reason_code) in [
+            (
+                "subject or email conflict",
+                BrowserAuthFailure::InvalidIdentity,
+                true,
+                true,
+                "identity_conflict",
+            ),
+            (
+                "email linking refused",
+                BrowserAuthFailure::InvalidIdentity,
+                true,
+                false,
+                "identity_link_refused",
+            ),
+            (
+                "unknown user",
+                BrowserAuthFailure::InvalidSession,
+                false,
+                false,
+                "unknown_user",
+            ),
+        ] {
+            let access_token = crate::google_oidc::fixture_user_access_token();
+            let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = audit_lines.clone();
+            let service = super::BrowserAuthService::local_fake(
+                "http://127.0.0.1:33001",
+                Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+                Arc::new(RefusingUserTokenIdentityResolver { failure }),
+            )?
+            .with_user_token_verifier(Arc::new(crate::google_oidc::fixture_user_token_verifier(
+                trust_email,
+            )?))
+            .with_auto_create_users(auto_create_users)
+            .with_request_audit_reporter(move |line| match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            });
+            let response = protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe)),
+                service,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build {case} request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute {case} request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+
+            let audit_lines = audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                1,
+                "{case} must emit exactly one refusal audit line"
+            );
+            let audit = parse_bearer_request_audit(&audit_lines[0], &access_token)?;
+            assert!(
+                audit["canonicalUserId"].is_null(),
+                "{case} must not invent a canonical user"
+            );
+            assert_eq!(audit["outcome"], "refused", "{case}");
+            assert_eq!(audit["reasonCode"], reason_code, "{case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn user_token_store_failures_keep_existing_contracts_and_distinct_audit_reasons() {
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityNotFound,
+                "user-token:https://issuer.example.test",
+                false,
+                false,
+            ),
+            BrowserAuthFailure::InvalidSession
+        );
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityAmbiguousEmail,
+                "user-token:https://issuer.example.test",
+                true,
+                false,
+            ),
+            BrowserAuthFailure::InvalidIdentity,
+            "refusing untrusted email linking keeps the resolver's invalid-identity contract"
+        );
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityConflict,
+                "user-token:https://issuer.example.test",
+                true,
+                true,
+            ),
+            BrowserAuthFailure::InvalidIdentity
+        );
+        assert_eq!(
+            super::map_user_token_identity_error(
+                steward_store::StoreError::CanonicalIdentityAmbiguousEmail,
+                "browser-oidc",
+                true,
+                false,
+            ),
+            BrowserAuthFailure::InvalidIdentity,
+            "browser sign-in keeps its existing failure mapping"
+        );
+        assert_eq!(
+            super::user_token_identity_refusal_reason(BrowserAuthFailure::InvalidIdentity, false),
+            "identity_link_refused"
+        );
+        assert_eq!(
+            super::user_token_identity_refusal_reason(BrowserAuthFailure::InvalidIdentity, true),
+            "identity_conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_accepts_case_insensitive_authorization_scheme() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let access_token = crate::google_oidc::fixture_user_access_token();
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            user_token_test_service()?,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, format!("bearer {access_token}"))
+                .body(Body::empty())
+                .map_err(|error| format!("build lowercase bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute lowercase bearer request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_validates_audit_metadata_before_identity_resolution() -> Result<(), String>
+    {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = super::BrowserAuthService::local_fake(
+            "http://127.0.0.1:33001",
+            Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+            Arc::new(RecordingUserTokenIdentityResolver {
+                calls: calls.clone(),
+            }),
+        )?
+        .with_user_token_verifier(Arc::new(InvalidAuditMetadataVerifier));
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            service,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, "Bearer fixture-token")
+                .body(Body::empty())
+                .map_err(|error| format!("build invalid-audit-metadata request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute invalid-audit-metadata request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "invalid audit metadata must fail before identity state can change"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_bearer_refusals_reach_the_real_verifier_and_middleware() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let mut cases = Vec::new();
+        let mut wrong_issuer = valid_user_token_claims();
+        wrong_issuer["iss"] = serde_json::json!("https://other.example.test");
+        cases.push(("wrong issuer", wrong_issuer, "sub"));
+
+        let mut wrong_audience = valid_user_token_claims();
+        wrong_audience["aud"] = serde_json::json!("other-api");
+        cases.push(("wrong audience", wrong_audience, "sub"));
+
+        let mut unlisted_client = valid_user_token_claims();
+        unlisted_client["azp"] = serde_json::json!("other-client");
+        cases.push(("client not allowlisted", unlisted_client, "sub"));
+
+        let mut expired = valid_user_token_claims();
+        expired["exp"] = serde_json::json!(1_039);
+        cases.push(("expired", expired, "sub"));
+
+        let mut over_age = valid_user_token_claims();
+        over_age["iat"] = serde_json::json!(799);
+        cases.push(("over age", over_age, "sub"));
+
+        cases.push((
+            "missing configured user ID",
+            valid_user_token_claims(),
+            "oid",
+        ));
+
+        for (case, claims, user_id_claim) in cases {
+            let (verifier, token) =
+                crate::google_oidc::signed_user_token_fixture(claims, user_id_claim)?;
+            let response = protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe)),
+                user_token_test_service_with_verifier(verifier)?,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build {case} bearer request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute {case} bearer request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_groups_cannot_raise_local_user_authority() -> Result<(), String> {
+        async fn probe(
+            Extension(session): Extension<BrowserSessionContext>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "role": session.principal.role,
+                "memberRoles": session.principal.member_roles,
+            }))
+        }
+
+        let mut claims = valid_user_token_claims();
+        claims["groups"] = serde_json::json!(["admin", "owners"]);
+        let (verifier, token) = crate::google_oidc::signed_user_token_fixture(claims, "sub")?;
+        let response = protect_browser_routes(
+            Router::new().route("/app/api/v1/probe", get(probe)),
+            user_token_test_service_with_verifier(verifier)?,
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/probe")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .map_err(|error| format!("build grouped bearer request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute grouped bearer request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read grouped bearer response: {error}"))?;
+        let authority: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse grouped bearer response: {error}"))?;
+        assert_eq!(authority["role"], "user");
+        assert_eq!(authority["memberRoles"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn typed_browser_admin_guard_denies_user_and_bearer_but_accepts_admin()
     -> Result<(), String> {
         async fn admin_probe(
@@ -2309,8 +3777,8 @@ mod tests {
             }))
         }
 
-        let service =
-            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let service = user_token_test_service()?;
+        let access_token = crate::google_oidc::fixture_user_access_token();
         let routes = || {
             protect_browser_admin_routes(
                 Router::new().route("/admin-probe", axum::routing::get(admin_probe)),
@@ -2339,17 +3807,17 @@ mod tests {
             .map_err(|error| format!("execute unauthenticated admin request: {error}"))?;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
-        let token_review_bearer = routes()
+        let valid_user_bearer = routes()
             .oneshot(
                 Request::builder()
                     .uri("/admin-probe")
-                    .header(header::AUTHORIZATION, "Bearer operator-token")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                     .body(Body::empty())
-                    .map_err(|error| format!("build bearer-only browser request: {error}"))?,
+                    .map_err(|error| format!("build valid user bearer admin request: {error}"))?,
             )
             .await
-            .map_err(|error| format!("execute bearer-only browser request: {error}"))?;
-        assert_eq!(token_review_bearer.status(), StatusCode::UNAUTHORIZED);
+            .map_err(|error| format!("execute valid user bearer admin request: {error}"))?;
+        assert_eq!(valid_user_bearer.status(), StatusCode::UNAUTHORIZED);
 
         let forbidden = routes()
             .oneshot(

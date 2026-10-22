@@ -651,6 +651,7 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.organizationId=org_example \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set browserAuth.autoCreateUsers=false \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${web_rendered}"
 
 awk '
@@ -884,6 +885,12 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.organizationId=org_example \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set browserAuth.autoCreateUsers=false \
+  --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
+  --set-string browserAuth.userTokens.hyperShellAudience=steward-api \
+  --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client' \
+  --set-string browserAuth.userTokens.requiredTyp=at+jwt \
+  --set-string browserAuth.userTokens.userIdClaim=oid \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${browser_auth_rendered}"
 
 awk '
@@ -895,13 +902,25 @@ for required in \
   '            - { name: STEWARD_BROWSER_ORIGIN, value: "https://steward.example.test" }' \
   '            - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: "example.test" }' \
   '            - { name: STEWARD_ORGANIZATION_ID, value: "org_example" }' \
-  '            - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: steward-google-oidc, key: client-secret } } }'
+  '            - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: steward-google-oidc, key: client-secret } } }' \
+  '            - { name: STEWARD_BROWSER_AUTO_CREATE_USERS, value: "false" }' \
+  '            - { name: STEWARD_USER_TOKEN_ISSUER, value: "https://issuer.example.test" }' \
+  '            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: "steward-api" }' \
+  '            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: "[\"portal-client\"]" }' \
+  '            - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: "at+jwt" }' \
+  '            - { name: STEWARD_USER_TOKEN_USER_ID_CLAIM, value: "oid" }' \
+  '            - { name: STEWARD_USER_TOKEN_EMAIL_CLAIM, value: "email" }' \
+  '            - { name: STEWARD_USER_TOKEN_TRUST_EMAIL, value: "false" }'
 do
-  grep -Fxq "${required}" "${browser_auth_deployment}"
+  if ! grep -Fxq "${required}" "${browser_auth_deployment}"; then
+    echo "browser auth deployment omitted required configuration: ${required}" >&2
+    exit 1
+  fi
 done
 grep -Fxq '        - ipBlock: { cidr: 203.0.113.0/24 }' "${browser_auth_rendered}"
 if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
   || grep -Fq 'STEWARD_BROWSER_ORIGIN' "${rendered}" \
+  || grep -Fq 'STEWARD_USER_TOKEN_' "${rendered}" \
   || grep -Fq 'steward-google-oidc' "${rendered}" \
   || grep -Fq 'STEWARD_CONNECTIONS_' "${rendered}" \
   || grep -Fq 'STEWARD_IDENTITY_TASK_' "${rendered}"

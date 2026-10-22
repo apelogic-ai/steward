@@ -505,8 +505,9 @@ pub struct OrganizationIdentityMigration {
 
 /// Exact trust boundary applied after a supported organization OIDC token is verified.
 ///
-/// The normal registration path is pinned to Google's exact issuer and `hd` claim. A reviewed
-/// issuer migration uses the distinct `OrganizationIdentityMigration` type instead.
+/// Browser registration is pinned to Google's exact issuer and `hd` claim. A separately verified
+/// JWT access-token path may construct the same boundary for one deployment-configured issuer. A
+/// reviewed issuer migration uses the distinct `OrganizationIdentityMigration` type instead.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrganizationIdentityPolicy {
@@ -534,6 +535,21 @@ impl OrganizationIdentityPolicy {
         if issuer != GOOGLE_ORGANIZATION_ISSUER {
             return Err("organization identity policy requires the exact Google issuer".to_owned());
         }
+        Self::new_configured_oidc(issuer, organization_claim, organization_id)
+    }
+
+    /// Builds the exact identity boundary for a deployment-configured OIDC issuer.
+    ///
+    /// The caller must separately verify the token signature and claims against discovery and
+    /// JWKS fetched for this exact issuer before calling [`Self::validate`].
+    pub fn new_configured_oidc(
+        issuer: impl Into<String>,
+        organization_claim: impl Into<String>,
+        organization_id: OrganizationId,
+    ) -> Result<Self, String> {
+        let issuer = issuer.into();
+        let organization_claim = organization_claim.into();
+        validate_exact_https_issuer(&issuer)?;
         validate_organization_claim(&organization_claim)?;
         Ok(Self {
             issuer,
@@ -1893,6 +1909,42 @@ mod tests {
                     )
                     .is_err(),
                 "accepted mismatched organization identity issuer={issuer} hd={hosted_domain} email={email} verified={verified}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_oidc_policy_keeps_one_exact_https_identity_boundary() -> Result<(), String> {
+        let policy = OrganizationIdentityPolicy::new_configured_oidc(
+            "https://issuer.example.test/tenant",
+            "example.com",
+            OrganizationId::parse("org_example")?,
+        )?;
+        let identity = policy.validate(
+            "https://issuer.example.test/tenant",
+            "immutable-subject-001",
+            "example.com",
+            "alice@example.com",
+            true,
+        )?;
+        assert_eq!(identity.issuer(), "https://issuer.example.test/tenant");
+        for issuer in [
+            "http://issuer.example.test/tenant",
+            "https://issuer.example.test/other",
+            "https://issuer.example.test/tenant?other=true",
+        ] {
+            assert!(
+                policy
+                    .validate(
+                        issuer,
+                        "immutable-subject-001",
+                        "example.com",
+                        "alice@example.com",
+                        true,
+                    )
+                    .is_err(),
+                "accepted identity from {issuer}"
             );
         }
         Ok(())

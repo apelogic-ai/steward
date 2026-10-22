@@ -2201,6 +2201,7 @@ where
             .submit_browser(
                 &format!("personal-agent-turn:{turn_id}"),
                 identity,
+                None,
                 &request,
             )
             .await
@@ -2360,14 +2361,24 @@ where
         canonical_user_id: session.principal.canonical_user_id,
         source_provenance: None,
     };
+    let caller_reference = browser_caller_reference(session.caller_reference.as_ref());
     match state
         .application
-        .submit_browser(idempotency_key, identity, &request)
+        .submit_browser(
+            idempotency_key,
+            identity,
+            caller_reference.as_ref(),
+            &request,
+        )
         .await
     {
         Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn browser_caller_reference(reference: Option<&CallerReference>) -> Option<CallerReference> {
+    reference.cloned()
 }
 
 pub fn task_router<L, I>(ledger: L, identities: I, config: TaskApiConfig) -> Router
@@ -2777,6 +2788,7 @@ where
         &self,
         idempotency_key: &str,
         identity: TaskIdentity,
+        caller_reference: Option<&CallerReference>,
         request: &BrowserTaskSubmission,
     ) -> Result<BrowserRunSubmissionResponse, ApiError> {
         request.validate().map_err(ApiError::Admission)?;
@@ -2786,13 +2798,23 @@ where
             ));
         }
         let (mut record, evidence) = if request.package.source.starts_with("steward:registry/") {
-            self.submit_browser_registry(idempotency_key, identity.clone(), request)
-                .await
-                .map_err(|error| self.browser_task_persistence_error(error))?
+            self.submit_browser_registry(
+                idempotency_key,
+                identity.clone(),
+                caller_reference,
+                request,
+            )
+            .await
+            .map_err(|error| self.browser_task_persistence_error(error))?
         } else {
-            self.submit_browser_package(idempotency_key, identity.clone(), request)
-                .await
-                .map_err(|error| self.browser_task_persistence_error(error))?
+            self.submit_browser_package(
+                idempotency_key,
+                identity.clone(),
+                caller_reference,
+                request,
+            )
+            .await
+            .map_err(|error| self.browser_task_persistence_error(error))?
         };
         let caller_input_archive = browser_inputs_archive(&request.inputs)?;
         if !record
@@ -2879,6 +2901,7 @@ where
         &self,
         idempotency_key: &str,
         identity: TaskIdentity,
+        caller_reference: Option<&CallerReference>,
         request: &BrowserTaskSubmission,
     ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
         let name = request
@@ -2926,7 +2949,7 @@ where
         evidence.validate().map_err(ApiError::Admission)?;
         let task_request = TaskSubmissionRequest {
             workflow: format!("{name}@{version}"),
-            caller_reference: None,
+            caller_reference: caller_reference.cloned(),
             envelope_digest: request.envelope_digest.clone(),
             coding_agent_runtime: None,
             agent_runtime_uid: None,
@@ -2962,6 +2985,7 @@ where
         &self,
         idempotency_key: &str,
         identity: TaskIdentity,
+        caller_reference: Option<&CallerReference>,
         request: &BrowserTaskSubmission,
     ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
         let existing = self
@@ -2974,7 +2998,7 @@ where
             .await
             .map_err(ApiError::Store)?;
         if let Some(record) = existing {
-            validate_browser_task_retry_request(&identity, request, &record)?;
+            validate_browser_task_retry_request(&identity, caller_reference, request, &record)?;
             let evidence = record
                 .browser_task_evidence
                 .clone()
@@ -3030,7 +3054,7 @@ where
                 operation_id,
                 idempotency_key,
                 submitter_service: &identity.service,
-                caller_reference: None,
+                caller_reference,
                 acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
                 acting_user_id: identity
                     .acting_user
@@ -3440,8 +3464,14 @@ where
                 canonical_user_id: session.principal.canonical_user_id.clone(),
                 source_provenance: None,
             };
+            let caller_reference = browser_caller_reference(session.caller_reference.as_ref());
             self.application
-                .submit_browser(idempotency_key, identity, &request)
+                .submit_browser(
+                    idempotency_key,
+                    identity,
+                    caller_reference.as_ref(),
+                    &request,
+                )
                 .await
                 .map(|response| response.task_uid)
                 .map_err(|error| match error {
@@ -6022,6 +6052,7 @@ where
 
 fn validate_browser_task_retry_request(
     identity: &TaskIdentity,
+    caller_reference: Option<&CallerReference>,
     request: &BrowserTaskSubmission,
     record: &TaskRecord,
 ) -> Result<(), ApiError> {
@@ -6053,6 +6084,10 @@ fn validate_browser_task_retry_request(
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || !browser_caller_reference_retry_matches(
+            record.caller_reference.as_ref(),
+            caller_reference,
+        )
         || record.runtime_ownership != RuntimeOwnership::Provisioned
         || record.task_origin != TaskOrigin::Browser
         || request.package.source != stored.source
@@ -6066,6 +6101,13 @@ fn validate_browser_task_retry_request(
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }
     Ok(())
+}
+
+fn browser_caller_reference_retry_matches(
+    stored: Option<&CallerReference>,
+    requested: Option<&CallerReference>,
+) -> bool {
+    stored == requested
 }
 
 fn browser_task_evidence_matches(
@@ -7277,6 +7319,7 @@ mod workflow_request_tests {
         DirectGitResolver, MAX_WORKSPACE_MATERIALIZED_BYTES, TaskApiConfig, TaskCreateRequest,
         TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
         WorkspaceGitPackTarget, WorkspaceResolutionBudget, append_workspace_git_pack,
+        browser_caller_reference, browser_caller_reference_retry_matches,
         browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
         browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
@@ -7305,9 +7348,47 @@ mod workflow_request_tests {
         WorkspaceEvidence, WorkspaceGitNamedRef, WorkspacePath,
     };
     use steward_types::{
-        Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
+        Budget, CallerReference, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements,
+        ToolGrant,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn bearer_task_caller_reference_records_issuer_and_frontend_client() -> Result<(), String> {
+        let request_audit = CallerReference::new(
+            "portal-client",
+            Some("https://issuer.example.test".to_owned()),
+        )?;
+        let reference = browser_caller_reference(Some(&request_audit))
+            .ok_or_else(|| "bearer caller reference missing".to_owned())?;
+        assert_eq!(reference.label(), "portal-client");
+        assert_eq!(reference.url(), Some("https://issuer.example.test"));
+        assert!(browser_caller_reference(None).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn browser_retry_requires_the_same_caller_reference() -> Result<(), String> {
+        let first = CallerReference::new(
+            "portal-client",
+            Some("https://issuer.example.test".to_owned()),
+        )?;
+        let second = CallerReference::new(
+            "other-client",
+            Some("https://issuer.example.test".to_owned()),
+        )?;
+        assert!(browser_caller_reference_retry_matches(
+            Some(&first),
+            Some(&first)
+        ));
+        assert!(!browser_caller_reference_retry_matches(
+            Some(&first),
+            Some(&second)
+        ));
+        assert!(!browser_caller_reference_retry_matches(Some(&first), None));
+        assert!(!browser_caller_reference_retry_matches(None, Some(&first)));
+        Ok(())
+    }
 
     #[test]
     fn workspace_byte_messages_use_readable_rounded_units() {
@@ -9308,9 +9389,10 @@ mod identity_task_authentication_tests {
         BoxFuture, IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, IdentityTaskIdentityResolver,
         IdentityTaskStore, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
         TaskIdentityResolver, compatibility_task_identity_from_claims,
-        map_canonical_identity_error, task_identity_from_identity_claims, valid_identity_issuer,
-        validate_identity_task_jwks, verify_identity_task_token,
+        map_canonical_identity_error, resolve_task_identity, task_identity_from_identity_claims,
+        valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
     };
+    use axum::http::{HeaderMap, HeaderValue, header};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use jsonwebtoken::jwk::JwkSet;
@@ -9631,6 +9713,44 @@ mod identity_task_authentication_tests {
             resolver.resolve(&assertion).await,
             Err(TaskAuthenticationError::UnknownUser)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_route_authentication_refuses_a_user_access_token() -> Result<(), String> {
+        let (_task_key, task_jwks) = key_material()?;
+        let resolver = IdentityTaskIdentityResolver {
+            jwks: task_jwks,
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            canonical_identities: Arc::new(UnknownCanonicalUserStore),
+            federated_subjects_enabled: false,
+        };
+        let (_user_verifier, user_token) = crate::google_oidc::signed_user_token_fixture(
+            serde_json::json!({
+                "iss": "https://issuer.example.test",
+                "sub": "fixture-user-subject",
+                "azp": "portal-client",
+                "aud": "steward-api",
+                "exp": 2_000,
+                "iat": 1_000,
+                "nbf": 1_000,
+                "email": "alice@example.com",
+                "email_verified": true
+            }),
+            "sub",
+        )?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {user_token}"))
+                .map_err(|error| format!("build user-token authorization header: {error}"))?,
+        );
+
+        assert!(matches!(
+            resolve_task_identity(&resolver, &headers).await,
+            Err(super::ApiError::TaskAuthentication)
+        ));
         Ok(())
     }
 

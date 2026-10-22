@@ -1,8 +1,8 @@
 # Steward browser session contract v1
 
-Status: local callback/session slice plus production Google code exchange and signed ID-token
-verification. Runtime activation remains fail-closed until LBE-235 supplies the Google web-client
-metadata and client secret through the reviewed configuration and secret paths.
+Status: Google code exchange and signed ID-token verification were released in Steward v0.3.20.
+Configured-issuer headless JWT access-token acceptance on the application API is Unreleased. Both
+paths are disabled unless their reviewed configuration and secret inputs are present.
 
 ## Identity boundary
 
@@ -22,6 +22,12 @@ the ordinary user role with no member-role access; administrator and member-role
 explicit local grant events, and revocation appends a new event. Google email or hosted-domain
 membership does not imply any Steward authority. This boundary has no AWS or Kubernetes identity
 dependency.
+
+The headless path accepts only a signed RS256 or ES256 JWT access token from the configured issuer.
+An operator may require an exact protected JOSE `typ`, such as `at+jwt`; otherwise `typ` is
+optional. A browser ID token is not interchangeable with an API access token because its audience
+is a frontend client rather than the configured API audience. Provider `groups` claims are ignored;
+the canonical user's existing local RBAC assignments remain the only role source.
 
 ## First local RBAC grant
 
@@ -115,6 +121,64 @@ Missing browser authentication returns 401, an authenticated ordinary user retur
 session resolved with the administrator role receives the typed authority. A Kubernetes
 TokenReview bearer cannot satisfy this browser guard, and a browser cookie cannot satisfy the
 separate operator TokenReview boundary.
+
+## Optional headless user access
+
+When `browserAuth.userTokens.issuer` and `hyperShellAudience` are nonempty, a native or third-party
+frontend may call only `/app/api/v1/*` with `Authorization: Bearer <access-token>`. Steward fetches
+bounded discovery and JWKS documents from that exact HTTPS issuer, follows no redirects, and
+accepts only RS256 or ES256 signatures. It requires the configured HyperShell audience, one
+allowlisted `azp` or `client_id`, an email in the browser workspace domain, a valid key ID, current
+`exp` and `nbf` with bounded clock skew, and an `iat` within `maximumTokenAgeSeconds`.
+`userIdClaim` selects the stable person identifier and defaults to `sub`; `emailClaim` selects the
+email claim. `email_verified` is reserved and cannot be selected for either identity claim. A token
+missing either configured claim is refused. By default `email_verified` must be true;
+`trustEmail=true` is an explicit operator decision to trust the configured issuer's email and is
+safe only when the identity provider prevents users from changing their own email. Otherwise, a
+person could claim another user's email and be linked to that account. An explicit
+`email_verified=false` is always refused, including for a trusted issuer.
+If `requiredTyp` is nonempty, the JOSE `typ` must exactly match it. Opaque tokens fail closed.
+
+The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
+`portalAudience` is configured, and the frontend client ID is allowlisted. It does not replace the
+HyperShell audience or relax the client and age checks. Empty user-token values retain the existing
+cookie-only behavior.
+
+Google user access tokens are opaque, so Google sign-in remains browser-session only. Google ID
+tokens are not API bearer credentials: their client-ID audience does not satisfy the configured
+HyperShell audience. Opaque-token introspection or exchange is outside this contract.
+
+The verified subject is resolved or registered through the canonical identity resolver. Google
+browser sign-in never attaches a new subject to an active user's email. A trusted-email
+access-token issuer may attach its exact subject to an existing canonical user only when the
+organization and workspace email domain match and that user has no other subject from the same
+issuer. The attachment records actor `user-token:<issuer>` and does not create a second user. An
+access-token issuer that still requires `email_verified` cannot use email linking. Access still
+comes only from Steward's local RBAC assignments; token claims do not grant administrator or
+member roles. Every bearer-authenticated request writes exactly one `api_bearer_request` JSON line
+after the authorization decision and before the route handler runs. It contains only the canonical
+user when resolved, verified issuer, allowlisted frontend client ID, HTTP method, route template,
+allowed or refused outcome with a reason code, and an RFC 3339 timestamp. A verified token refused
+during identity resolution records `canonicalUserId` as `null` rather than copying a token claim.
+Refused identity resolution, cookie-identity conflicts, and missing browser CSRF proof are included.
+The deployment's log pipeline provides retention. Browser Tasks persist the same issuer and
+frontend client ID through their existing caller reference. The authorization value, raw token,
+token hash, and other claims are never logged or stored. The request binding is a SHA-256-derived
+opaque value and never exposes the token.
+
+`browserAuth.autoCreateUsers` defaults to `true`, preserving existing first-sign-in registration.
+When disabled, neither authentication path creates a new canonical user. Both paths may activate
+an exact pending invitation. Browser sign-in otherwise requires an already registered exact
+issuer/subject and never email-links an active user. A bearer from an issuer configured with
+`trustEmail=true` may still attach to an existing active user under the constraints above; all
+other previously unseen bearer identities are refused.
+
+A bearer-only mutation does not need browser CSRF proof. If a request also contains a browser
+cookie, the cookie remains subject to the existing origin, fetch-site, content-type, and CSRF
+checks. If cookie and bearer resolve to different people, Steward returns 401. User bearer tokens
+never authenticate `/admin/*`, operator, hook, or direct Task-token routes.
+Authorization headers outside `/app/api/v1/*`, and non-Bearer schemes, do not change cookie-session
+behavior.
 
 ## Production verifier and activation boundary
 

@@ -14,6 +14,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Optional headless user access accepts RS256 or ES256 JWT access tokens from an exact configured
+  OIDC issuer on `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum
+  token age are configured. The portal audience and token `typ` are separate opt-ins. Tokens reuse
+  canonical users and local RBAC, ignore provider groups, never grant administrator-route access,
+  and persist the issuer and frontend client ID without recording the token. The stable user-ID
+  and email claims are configurable; operators may either require `email_verified` or explicitly
+  trust the issuer's email, which also permits exact same-organization email linking to an existing
+  canonical user that has no other subject from that issuer. `email_verified` is reserved from
+  identity-claim mapping, and an explicit false value is always refused. Google browser sign-in
+  never email-links an active user, and Google access tokens remain browser-session only because
+  Google issues opaque user access tokens. One shared, default-on setting controls first-sign-in
+  creation for both browser and access-token users; disabling it still permits pending-invitation
+  activation and configured trusted-email linking but never creates a new canonical user. Every
+  bearer-authenticated request emits one sanitized structured-log audit record before handler
+  dispatch with its route template and authorization outcome; verified tokens refused before a
+  canonical user is resolved record a null canonical-user field. Deployment log shipping provides
+  retention. Tasks retain the same verified issuer and frontend client ID. Authorization values
+  and tokens are never recorded. Email trust is safe only when users cannot change their own email
+  at the identity provider.
 - Signed-in users can create owner-scoped personal agents from a configured coding agent and an
   active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
   The dispatcher merges messages that arrive during a turn into one next turn, resumes the same

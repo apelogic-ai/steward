@@ -732,6 +732,160 @@ struct BrowserApplicationConfig {
     managed_inference_cipher: Option<ManagedInferenceKeyCipher>,
 }
 
+struct BrowserUserTokenEnvironment {
+    issuer: Option<String>,
+    api_audience: Option<String>,
+    portal_audience: Option<String>,
+    portal_audience_enabled: Option<String>,
+    frontend_client_ids_json: Option<String>,
+    maximum_token_age_seconds: Option<String>,
+    required_typ: Option<String>,
+    user_id_claim: Option<String>,
+    email_claim: Option<String>,
+    trust_email: Option<String>,
+}
+
+fn configured_browser_user_tokens(
+    organization_claim: String,
+    organization_id: OrganizationId,
+) -> Result<Option<google_oidc::UserTokenConfig>, io::Error> {
+    parse_browser_user_token_config(
+        BrowserUserTokenEnvironment {
+            issuer: optional_unicode_environment("STEWARD_USER_TOKEN_ISSUER")?,
+            api_audience: optional_unicode_environment("STEWARD_USER_TOKEN_API_AUDIENCE")?,
+            portal_audience: optional_unicode_environment("STEWARD_USER_TOKEN_PORTAL_AUDIENCE")?,
+            portal_audience_enabled: optional_unicode_environment(
+                "STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED",
+            )?,
+            frontend_client_ids_json: optional_unicode_environment(
+                "STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS",
+            )?,
+            maximum_token_age_seconds: optional_unicode_environment(
+                "STEWARD_USER_TOKEN_MAX_AGE_SECONDS",
+            )?,
+            required_typ: optional_unicode_environment("STEWARD_USER_TOKEN_REQUIRED_TYP")?,
+            user_id_claim: optional_unicode_environment("STEWARD_USER_TOKEN_USER_ID_CLAIM")?,
+            email_claim: optional_unicode_environment("STEWARD_USER_TOKEN_EMAIL_CLAIM")?,
+            trust_email: optional_unicode_environment("STEWARD_USER_TOKEN_TRUST_EMAIL")?,
+        },
+        organization_claim,
+        organization_id,
+    )
+}
+
+fn configured_browser_auto_create_users() -> Result<bool, io::Error> {
+    let value = optional_unicode_environment("STEWARD_BROWSER_AUTO_CREATE_USERS")?;
+    parse_browser_auto_create_users(value.as_deref())
+}
+
+fn parse_browser_auto_create_users(value: Option<&str>) -> Result<bool, io::Error> {
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(io::Error::other(
+            "STEWARD_BROWSER_AUTO_CREATE_USERS must be true or false",
+        )),
+    }
+}
+
+fn parse_browser_user_token_config(
+    environment: BrowserUserTokenEnvironment,
+    organization_claim: String,
+    organization_id: OrganizationId,
+) -> Result<Option<google_oidc::UserTokenConfig>, io::Error> {
+    let issuer = environment.issuer.unwrap_or_default();
+    let api_audience = environment.api_audience.unwrap_or_default();
+    let portal_audience = environment.portal_audience.unwrap_or_default();
+    let portal_audience_enabled = match environment.portal_audience_enabled.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED must be true or false",
+            ));
+        }
+    };
+    let frontend_client_ids: Vec<String> = serde_json::from_str(
+        environment
+            .frontend_client_ids_json
+            .as_deref()
+            .unwrap_or("[]"),
+    )
+    .map_err(|_| {
+        io::Error::other("STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS must be a JSON string array")
+    })?;
+    let maximum_was_configured = environment.maximum_token_age_seconds.is_some();
+    let maximum_token_age_seconds = environment
+        .maximum_token_age_seconds
+        .as_deref()
+        .unwrap_or("300")
+        .parse::<u64>()
+        .map_err(|_| {
+            io::Error::other("STEWARD_USER_TOKEN_MAX_AGE_SECONDS must be a positive integer")
+        })?;
+    let required_typ = environment.required_typ.unwrap_or_default();
+    let user_id_claim = environment
+        .user_id_claim
+        .unwrap_or_else(|| "sub".to_owned());
+    let email_claim = environment
+        .email_claim
+        .unwrap_or_else(|| "email".to_owned());
+    let trust_email = match environment.trust_email.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_USER_TOKEN_TRUST_EMAIL must be true or false",
+            ));
+        }
+    };
+    if issuer.is_empty() && api_audience.is_empty() {
+        if !portal_audience.is_empty()
+            || portal_audience_enabled
+            || !frontend_client_ids.is_empty()
+            || (maximum_was_configured && maximum_token_age_seconds != 300)
+            || !required_typ.is_empty()
+            || user_id_claim != "sub"
+            || email_claim != "email"
+            || trust_email
+        {
+            return Err(io::Error::other(
+                "user token configuration requires an issuer and HyperShell API audience",
+            ));
+        }
+        return Ok(None);
+    }
+    if issuer.is_empty() || api_audience.is_empty() {
+        return Err(io::Error::other(
+            "user token configuration requires an issuer and HyperShell API audience",
+        ));
+    }
+    let portal_audience = match (portal_audience_enabled, portal_audience.is_empty()) {
+        (true, false) => Some(portal_audience),
+        (false, true) => None,
+        _ => {
+            return Err(io::Error::other(
+                "the portal audience must be non-empty exactly when its opt-in is enabled",
+            ));
+        }
+    };
+    google_oidc::UserTokenConfig::new(google_oidc::UserTokenSettings {
+        issuer,
+        organization_claim,
+        organization_id,
+        user_id_claim,
+        email_claim,
+        trust_email,
+        api_audience,
+        portal_audience,
+        frontend_client_ids,
+        maximum_token_age_seconds,
+        required_typ: (!required_typ.is_empty()).then_some(required_typ),
+    })
+    .map(Some)
+    .map_err(io::Error::other)
+}
+
 async fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
@@ -799,12 +953,14 @@ async fn browser_application_router(
     )
     .map_err(io::Error::other)?;
     let origin = required("STEWARD_BROWSER_ORIGIN")?;
+    let workspace_domain = required("STEWARD_GOOGLE_WORKSPACE_DOMAIN")?;
+    let organization_id = OrganizationId::parse(required("STEWARD_ORGANIZATION_ID")?)?;
     let config = browser_auth::GoogleOidcConfig::new(
         client_id,
         &origin,
         format!("{origin}/admin/auth/callback"),
-        required("STEWARD_GOOGLE_WORKSPACE_DOMAIN")?,
-        OrganizationId::parse(required("STEWARD_ORGANIZATION_ID")?)?,
+        workspace_domain.clone(),
+        organization_id.clone(),
     )
     .map_err(io::Error::other)?;
     let provider = google_oidc::GoogleOidcProvider::new(
@@ -812,12 +968,20 @@ async fn browser_application_router(
         required("STEWARD_GOOGLE_OIDC_CLIENT_SECRET")?,
     )
     .map_err(io::Error::other)?;
-    let auth = browser_auth::BrowserAuthService::google(
+    let user_tokens = configured_browser_user_tokens(workspace_domain, organization_id)?;
+    let auto_create_users = configured_browser_auto_create_users()?;
+    let mut auth = browser_auth::BrowserAuthService::google(
         config,
-        Arc::new(provider),
+        Arc::new(provider.clone()),
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
-    .map_err(io::Error::other)?;
+    .map_err(io::Error::other)?
+    .with_auto_create_users(auto_create_users);
+    if let Some(user_tokens) = user_tokens {
+        auth = auth.with_user_token_verifier(Arc::new(
+            google_oidc::OidcUserTokenVerifier::new(user_tokens).map_err(io::Error::other)?,
+        ));
+    }
     let personal_agent_config = personal_agent_configuration()?;
     let personal_agent_refs = workflow_agents
         .iter()
@@ -2091,13 +2255,14 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, OPERATOR_EXIT_CONFLICT,
-        OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
-        OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
-        bootstrap_rbac_arguments, connection_auto_association_issuer,
+        BrowserUserTokenEnvironment, CodexTaskExecutionAdapter, KubernetesTokenReviewAudience,
+        OPERATOR_EXIT_CONFLICT, OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND,
+        OPERATOR_EXIT_UNAVAILABLE, OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig,
+        TlsListener, bootstrap_rbac_arguments, connection_auto_association_issuer,
         custom_envelope_safety_ceiling_startup_warning, decode_tls_material,
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
         github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
+        parse_browser_auto_create_users, parse_browser_user_token_config,
         parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
         personal_agent_configuration_from_values, rustls_crypto_provider,
         stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
@@ -2105,6 +2270,36 @@ mod tests {
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn parse_test_user_token_config(
+        api_audience: Option<String>,
+        portal_audience: Option<String>,
+        portal_audience_enabled: Option<String>,
+        frontend_client_ids_json: Option<String>,
+        maximum_token_age_seconds: Option<String>,
+    ) -> Result<Option<crate::google_oidc::UserTokenConfig>, std::io::Error> {
+        let issuer = api_audience
+            .as_ref()
+            .filter(|audience| !audience.is_empty())
+            .map(|_| "https://issuer.example.test".to_owned());
+        parse_browser_user_token_config(
+            BrowserUserTokenEnvironment {
+                issuer,
+                api_audience,
+                portal_audience,
+                portal_audience_enabled,
+                frontend_client_ids_json,
+                maximum_token_age_seconds,
+                required_typ: None,
+                user_id_claim: None,
+                email_claim: None,
+                trust_email: None,
+            },
+            "example.com".to_owned(),
+            steward_types::OrganizationId::parse("org_example".to_owned())
+                .map_err(std::io::Error::other)?,
+        )
+    }
 
     #[test]
     fn personal_agent_dispatcher_configuration_is_bounded_and_coherent() {
@@ -2160,6 +2355,118 @@ mod tests {
             Some(steward_types::InferenceMode::Managed),
             "the apiserver must admit managed mode once Mint can resolve stored credentials"
         );
+    }
+
+    #[test]
+    fn user_token_startup_configuration_is_disabled_by_default_and_refuses_partial_portal_opt_in()
+    -> Result<(), String> {
+        assert!(
+            parse_test_user_token_config(None, None, None, None, None)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            parse_test_user_token_config(
+                Some(String::new()),
+                Some(String::new()),
+                Some("false".to_owned()),
+                Some("[]".to_owned()),
+                Some("300".to_owned()),
+            )
+            .map_err(|error| error.to_string())?
+            .is_none()
+        );
+        assert!(
+            parse_test_user_token_config(
+                Some("steward-api".to_owned()),
+                None,
+                Some("false".to_owned()),
+                Some("[\"portal-client\"]".to_owned()),
+                Some("600".to_owned()),
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+        );
+        for (portal_audience, enabled) in [
+            (Some("portal-audience".to_owned()), Some("false".to_owned())),
+            (None, Some("true".to_owned())),
+        ] {
+            assert!(
+                parse_test_user_token_config(
+                    Some("steward-api".to_owned()),
+                    portal_audience,
+                    enabled,
+                    Some("[\"portal-client\"]".to_owned()),
+                    Some("600".to_owned()),
+                )
+                .is_err(),
+                "portal audience and opt-in must be configured together"
+            );
+        }
+        assert!(
+            parse_test_user_token_config(
+                Some(String::new()),
+                None,
+                None,
+                Some("[\"portal-client\"]".to_owned()),
+                None,
+            )
+            .is_err(),
+            "client allowlists cannot silently enable without the API audience"
+        );
+        assert!(
+            parse_browser_user_token_config(
+                BrowserUserTokenEnvironment {
+                    issuer: None,
+                    api_audience: Some("steward-api".to_owned()),
+                    portal_audience: None,
+                    portal_audience_enabled: None,
+                    frontend_client_ids_json: Some("[\"portal-client\"]".to_owned()),
+                    maximum_token_age_seconds: Some("600".to_owned()),
+                    required_typ: None,
+                    user_id_claim: None,
+                    email_claim: None,
+                    trust_email: None,
+                },
+                "example.com".to_owned(),
+                steward_types::OrganizationId::parse("org_example".to_owned())?,
+            )
+            .is_err(),
+            "an audience without its exact issuer must fail closed"
+        );
+        assert!(
+            parse_browser_user_token_config(
+                BrowserUserTokenEnvironment {
+                    issuer: Some("https://issuer.example.test".to_owned()),
+                    api_audience: Some("steward-api".to_owned()),
+                    portal_audience: None,
+                    portal_audience_enabled: Some("false".to_owned()),
+                    frontend_client_ids_json: Some("[\"portal-client\"]".to_owned()),
+                    maximum_token_age_seconds: Some("600".to_owned()),
+                    required_typ: Some("at+jwt".to_owned()),
+                    user_id_claim: Some("oid".to_owned()),
+                    email_claim: Some("preferred_email".to_owned()),
+                    trust_email: Some("true".to_owned()),
+                },
+                "example.com".to_owned(),
+                steward_types::OrganizationId::parse("org_example".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?
+            .is_some(),
+            "an optional exact token type must be accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_auto_create_users_defaults_on_and_accepts_only_booleans() -> Result<(), String> {
+        assert!(parse_browser_auto_create_users(None).map_err(|error| error.to_string())?);
+        assert!(parse_browser_auto_create_users(Some("true")).map_err(|error| error.to_string())?);
+        assert!(
+            !parse_browser_auto_create_users(Some("false")).map_err(|error| error.to_string())?
+        );
+        assert!(parse_browser_auto_create_users(Some("sometimes")).is_err());
+        Ok(())
     }
 
     #[test]

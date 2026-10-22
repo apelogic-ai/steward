@@ -14,6 +14,9 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Uuid;
 use steward_apiserver::BoxFuture;
+use steward_apiserver::browser_auth::{
+    BrowserAuthFailure, BrowserIdentityResolver, PgBrowserIdentityResolver,
+};
 use steward_apiserver::connections::{
     ConnectionBrokerError, ConnectionSession, ConnectionStartOperation, ConnectionSubject,
     ProviderConnectionBroker, ProviderConnectionStatus, ReservedConnectionStart,
@@ -442,6 +445,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     verify_direct_connection_auto_association(&store).await?;
     verify_pending_member_identity_state(&store).await?;
     verify_browser_member_invitation_lifecycle(&store).await?;
+    verify_user_token_identity_resolution_policy(&store).await?;
 
     let tls_active =
         sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
@@ -1153,6 +1157,159 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
             .await,
         Err(StoreError::LastBrowserAdministrator)
     ));
+    Ok(())
+}
+
+async fn verify_user_token_identity_resolution_policy(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let resolver = PgBrowserIdentityResolver::new(store.clone());
+    let organization_id = OrganizationId::parse("org_acme")?;
+    let google_policy = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.com",
+        organization_id.clone(),
+    )?;
+    let browser_email = Email::parse("alice@example.com")?;
+    let browser_owner = google_policy.validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "alice",
+        "example.com",
+        browser_email.as_str(),
+        true,
+    )?;
+    let browser_owner = store
+        .register_canonical_identity(&browser_owner, "browser-oidc")
+        .await?;
+    let browser_takeover = google_policy.validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "bob",
+        "example.com",
+        browser_email.as_str(),
+        true,
+    )?;
+    assert!(
+        matches!(
+            resolver.resolve_or_register(&browser_takeover).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "Google sign-in must not adopt an active email owner"
+    );
+
+    let token_issuer = "https://issuer.example.test";
+    let token_policy = OrganizationIdentityPolicy::new_configured_oidc(
+        token_issuer,
+        "example.com",
+        organization_id.clone(),
+    )?;
+    let untrusted_candidate = token_policy.validate(
+        token_issuer,
+        "carol",
+        "example.com",
+        browser_email.as_str(),
+        true,
+    )?;
+    assert!(
+        matches!(
+            resolver
+                .resolve_or_register_user_token(
+                    &untrusted_candidate,
+                    "user-token:https://issuer.example.test",
+                    false,
+                )
+                .await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "trustEmail=false must not link an existing email owner"
+    );
+
+    let trusted_candidate = token_policy.validate(
+        token_issuer,
+        "dave",
+        "example.com",
+        browser_email.as_str(),
+        true,
+    )?;
+    let linked = resolver
+        .resolve_existing_user_token(
+            &trusted_candidate,
+            "user-token:https://issuer.example.test",
+            true,
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("link trusted identity: {error:?}")))?;
+    assert_eq!(
+        linked.canonical_user_id, browser_owner.user_id,
+        "auto-create off must still allow configured trusted linking to an existing user"
+    );
+
+    let second_subject = token_policy.validate(
+        token_issuer,
+        "carol",
+        "example.com",
+        browser_email.as_str(),
+        true,
+    )?;
+    assert!(
+        matches!(
+            resolver
+                .resolve_or_register_user_token(
+                    &second_subject,
+                    "user-token:https://issuer.example.test",
+                    true,
+                )
+                .await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "email linking must refuse a user who already has another subject from that issuer"
+    );
+
+    let pending_organization_id = OrganizationId::parse("org_team-a")?;
+    let pending_email = Email::parse("alice@example.com")?;
+    let pending = store
+        .preprovision_canonical_user(
+            &pending_organization_id,
+            &pending_email,
+            "usr_0123456789abcdef0123456789abcdef",
+        )
+        .await?;
+    let pending_policy = OrganizationIdentityPolicy::new_configured_oidc(
+        token_issuer,
+        "example.com",
+        pending_organization_id,
+    )?;
+    let pending_identity = pending_policy.validate(
+        token_issuer,
+        "alice",
+        "example.com",
+        pending_email.as_str(),
+        true,
+    )?;
+    let activated = resolver
+        .resolve_existing(&pending_identity)
+        .await
+        .map_err(|error| io::Error::other(format!("activate pending identity: {error:?}")))?;
+    assert_eq!(activated.canonical_user_id, pending.user_id);
+
+    let unknown_policy = OrganizationIdentityPolicy::new_configured_oidc(
+        token_issuer,
+        "example.com",
+        OrganizationId::parse("org_example-org")?,
+    )?;
+    let unknown = unknown_policy.validate(
+        token_issuer,
+        "bob",
+        "example.com",
+        "alice@example.com",
+        true,
+    )?;
+    assert!(
+        matches!(
+            resolver.resolve_existing(&unknown).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ),
+        "auto-create off must refuse a truly unknown user"
+    );
     Ok(())
 }
 

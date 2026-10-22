@@ -344,9 +344,10 @@
     "browserAuth": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "google"],
+      "required": ["enabled", "autoCreateUsers", "google", "userTokens"],
       "properties": {
         "enabled": {"type": "boolean"},
+        "autoCreateUsers": {"type": "boolean"},
         "google": {
           "type": "object",
           "additionalProperties": false,
@@ -366,12 +367,67 @@
               }
             }
           }
+        },
+        "userTokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["issuer", "hyperShellAudience", "portalAudience", "acceptPortalAudience", "frontendClientIds", "maximumTokenAgeSeconds", "requiredTyp", "userIdClaim", "emailClaim", "trustEmail"],
+          "properties": {
+            "issuer": {"type": "string", "maxLength": 2048},
+            "hyperShellAudience": {"type": "string", "maxLength": 512, "pattern": "^[!-~]*$"},
+            "portalAudience": {"type": "string", "maxLength": 512, "pattern": "^[!-~]*$"},
+            "acceptPortalAudience": {"type": "boolean"},
+            "frontendClientIds": {
+              "type": "array",
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._#/:@+()-]+$"}
+            },
+            "maximumTokenAgeSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+            "requiredTyp": {"type": "string", "maxLength": 64, "pattern": "^[!-~]*$"},
+            "userIdClaim": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$"},
+            "emailClaim": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$"},
+            "trustEmail": {"type": "boolean"}
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "issuer": {"const": ""},
+                "hyperShellAudience": {"const": ""},
+                "portalAudience": {"const": ""},
+                "acceptPortalAudience": {"const": false},
+                "frontendClientIds": {"maxItems": 0}
+              }
+            },
+            {
+              "properties": {
+                "issuer": {"minLength": 1},
+                "hyperShellAudience": {"minLength": 1},
+                "frontendClientIds": {"minItems": 1}
+              },
+              "oneOf": [
+                {
+                  "properties": {
+                    "portalAudience": {"const": ""},
+                    "acceptPortalAudience": {"const": false}
+                  }
+                },
+                {
+                  "properties": {
+                    "portalAudience": {"minLength": 1},
+                    "acceptPortalAudience": {"const": true}
+                  }
+                }
+              ]
+            }
+          ]
         }
       },
       "oneOf": [
         {
           "properties": {
             "enabled": {"const": false},
+            "autoCreateUsers": {"const": true},
             "google": {
               "properties": {
                 "clientId": {"const": ""},
@@ -384,6 +440,20 @@
                     "key": {"const": ""}
                   }
                 }
+              }
+            },
+            "userTokens": {
+              "properties": {
+                "issuer": {"const": ""},
+                "hyperShellAudience": {"const": ""},
+                "portalAudience": {"const": ""},
+                "acceptPortalAudience": {"const": false},
+                "frontendClientIds": {"maxItems": 0},
+                "maximumTokenAgeSeconds": {"const": 300},
+                "requiredTyp": {"const": ""},
+                "userIdClaim": {"const": "sub"},
+                "emailClaim": {"const": "email"},
+                "trustEmail": {"const": false}
               }
             }
           }
