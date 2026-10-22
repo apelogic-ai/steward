@@ -3763,6 +3763,72 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_upgrade_to_1_3_0_adds_only_governed_command_routes() -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1.2.2",
+            "1.2.2",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        let mut replacement = RenderedProviderProfileBundle {
+            profiles: current.profiles.clone(),
+            state: current.state.clone(),
+        };
+        replacement.state["bundle"]["version"] = serde_json::json!("1.3.0");
+        let mcp = replacement
+            .profiles
+            .get_mut("steward-mcp-gw")
+            .ok_or_else(|| "replacement MCP profile is required".to_owned())?;
+        mcp["endpoints"][0]["rules"] = serde_json::json!([
+            {"allow": {"method": "POST", "path": "/cli/run"}},
+            {"allow": {"method": "POST", "path": "/cli/jobs"}},
+            {"allow": {"method": "POST", "path": "/shell/run"}},
+            {"allow": {"method": "POST", "path": "/shell/jobs"}}
+        ]);
+        mcp["binaries"]
+            .as_array_mut()
+            .ok_or_else(|| "replacement MCP profile binaries are required".to_owned())?
+            .push(serde_json::json!("/usr/local/bin/mcp-gw-sandbox-helper"));
+        replacement.state["profiles"] = serde_json::to_value(&replacement.profiles)
+            .map_err(|error| format!("render replacement state: {error}"))?;
+
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-1-3-0-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
+
+            let mut escaped = RenderedProviderProfileBundle {
+                profiles: replacement.profiles.clone(),
+                state: replacement.state.clone(),
+            };
+            *escaped
+                .profiles
+                .get_mut("steward-mcp-gw")
+                .and_then(|profile| profile.pointer_mut("/endpoints/0/rules/0/allow/path"))
+                .ok_or_else(|| "escaped route fixture is required".to_owned())? =
+                serde_json::json!("/cli/**");
+            escaped.state["profiles"] = serde_json::to_value(&escaped.profiles)
+                .map_err(|error| format!("render escaped state: {error}"))?;
+            if validate_provider_profile_upgrade_delta(&current, &escaped, "1.2.2", "1.3.0").is_ok()
+            {
+                return Err("provider profile upgrade must reject broader command paths".to_owned());
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
+    }
+
+    #[test]
     fn neutrality_rejects_extension_shaped_hostnames() {
         let host = ["svc", "go"].join(".");
         let basename = ["deploy", "sh"].join(".");
