@@ -2,20 +2,28 @@ images:
   # No distribution is assumed. Supply a fork-owned repository and exact
   # immutable component coordinates from one verified release handoff.
   repository: ""
+  # Keep digest pinning unless the hosting platform promotes and verifies
+  # component images by repository and tag.
+  requireDigest: true
   pullPolicy: IfNotPresent
   apiserver:
+    repository: ""
     tag: ""
     digest: ""
   controller:
+    repository: ""
     tag: ""
     digest: ""
   mint:
+    repository: ""
     tag: ""
     digest: ""
   web:
+    repository: ""
     tag: ""
     digest: ""
   triggerReceiver:
+    repository: ""
     tag: ""
     digest: ""
 imagePullSecrets: []

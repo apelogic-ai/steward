@@ -43,22 +43,87 @@ helm_template() {
 
 tag_only_images=(
   --set images.requireDigest=false
+  --set-string images.repository=
   --set-string images.apiserver.repository=registry.example.test/platform/steward-apiserver
   --set-string images.apiserver.tag=release-apiserver
   --set-string images.apiserver.digest=
   --set-string images.controller.repository=registry.example.test/platform/steward-controller
   --set-string images.controller.tag=release-controller
   --set-string images.controller.digest=
+  --set-string images.mint.repository=registry.example.test/platform/steward-mint
+  --set-string images.mint.tag=release-mint
+  --set-string images.mint.digest=
+  --set-string images.web.repository=registry.example.test/platform/steward-web
+  --set-string images.web.tag=release-web
+  --set-string images.web.digest=
+  --set-string images.triggerReceiver.repository=registry.example.test/platform/steward-trigger-receiver
+  --set-string images.triggerReceiver.tag=release-trigger-receiver
+  --set-string images.triggerReceiver.digest=
+)
+legacy_complete_images=(
+  --set-string images.mint.tag=release-mint
+  --set-string images.mint.digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
+  --set-string images.web.tag=release-web
+  --set-string images.web.digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
+  --set-string images.triggerReceiver.tag=release-trigger-receiver
+  --set-string images.triggerReceiver.digest=sha256:4444444444444444444444444444444444444444444444444444444444444444
+)
+receiver_trigger='[{"id":"Jira_read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":["acct-1"],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecret":{"name":"steward-jira-webhook","key":"secret"}}]'
+complete_profile=(
+  --set execution.enabled=true
+  --set web.enabled=true
+  --set browserAuth.enabled=true
+  --set triggerReceiver.enabled=true
+  --set-json "triggerReceiver.triggers=${receiver_trigger}"
+  --set-string triggerReceiver.databaseSecret.name=steward-trigger-database
+  --set-string triggerReceiver.databaseSecret.key=url
+  --set-string triggerReceiver.workloadExchange.endpoint=https://identity.example.test/v1/workload/exchange
+  --set-string triggerReceiver.workloadExchange.serverName=identity.example.test
+  --set-string triggerReceiver.workloadExchange.audience=steward-workload-exchange
+  --set-string triggerReceiver.taskApi.ca.kind=ConfigMap
+  --set-string triggerReceiver.taskApi.ca.name=steward-apiserver-ca
+  --set-string triggerReceiver.taskApi.ca.key=ca.crt
+  --set-string spire.className=spire-spire
+  --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1/responses
+  --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"3333333333333333333333333333333333333333","actionCommit":"4444444444444444444444444444444444444444"}'
+  --set-string config.controller.openshellEndpoint=https://openshell.example.test
+  --set-string config.controller.openshellServerName=openshell.example.test
+  --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
+  --set-string config.controller.workloadExchangeServerName=identity.example.test
+  --set-string config.controller.litellmUrl=https://inference.example.test
+  --set-string config.mint.issuer=https://mint.example.test
+  --set-string config.mint.spiffeTrustDomain=example.test
+  --set-string config.mint.openshellNamespace=openshell
+  --set-string 'runtimeNamespaces[0]=steward-workflows'
+  --set-string browserAuth.google.clientId=obviously-fake-client-id
+  --set-string browserAuth.google.origin=https://steward.example.test
+  --set-string browserAuth.google.workspaceDomain=example.test
+  --set-string browserAuth.google.organizationId=org_example
+  --set-string browserAuth.google.clientSecret.name=steward-browser-auth
+  --set-string browserAuth.google.clientSecret.key=client-secret
+  --set-string networkPolicy.ingressNamespace=edge-system
+  --set-string 'networkPolicy.kubeApiCidrs[0]=192.0.2.10/32'
+  --set-string 'networkPolicy.postgresCidrs[0]=192.0.2.11/32'
+  --set-string 'networkPolicy.browserAuthEgressCidrs[0]=192.0.2.12/32'
 )
 
 helm_template \
   "${tag_only_images[@]}" \
+  "${complete_profile[@]}" \
   --set-string tls.webhook.caBundlePem=public-test-ca > "${component_rendered}"
-grep -Fq 'image: registry.example.test/platform/steward-apiserver:release-apiserver' \
-  "${component_rendered}"
-grep -Fq 'image: registry.example.test/platform/steward-controller:release-controller' \
-  "${component_rendered}"
-if grep -Eq 'image: registry\.example\.test/platform/steward-(apiserver|controller):[^[:space:]]+@' \
+for image in \
+  registry.example.test/platform/steward-apiserver:release-apiserver \
+  registry.example.test/platform/steward-controller:release-controller \
+  registry.example.test/platform/steward-mint:release-mint \
+  registry.example.test/platform/steward-web:release-web \
+  registry.example.test/platform/steward-trigger-receiver:release-trigger-receiver
+do
+  if [[ "$(grep -cF "image: ${image}" "${component_rendered}")" != 1 ]]; then
+    echo "tag-only component image must appear in exactly one Deployment: ${image}" >&2
+    exit 1
+  fi
+done
+if grep -Eq 'image: registry\.example\.test/platform/steward-[^[:space:]]+@' \
   "${component_rendered}"
 then
   echo 'tag-only component images must not render a digest separator' >&2
@@ -119,6 +184,21 @@ if git -C "${root}" cat-file -e "${compatibility_base}:charts/steward/Chart.yaml
   if ! cmp -s "${compatibility_directory}/base-core.yaml" "${compatibility_directory}/head-core.yaml"; then
     diff -u "${compatibility_directory}/base-core.yaml" "${compatibility_directory}/head-core.yaml" >&2 || true
     echo 'existing core profile render changed' >&2
+    exit 1
+  fi
+  helm template steward "${compatibility_directory}/charts/steward" --namespace steward \
+    "${customer_images[@]}" \
+    "${legacy_complete_images[@]}" \
+    "${complete_profile[@]}" \
+    --set-string tls.webhook.caBundlePem=public-test-ca > "${compatibility_directory}/base-complete.yaml"
+  helm_template \
+    "${legacy_complete_images[@]}" \
+    "${complete_profile[@]}" \
+    --set-string tls.webhook.caBundlePem=public-test-ca > "${compatibility_directory}/head-complete.yaml"
+  if ! cmp -s "${compatibility_directory}/base-complete.yaml" "${compatibility_directory}/head-complete.yaml"; then
+    diff -u "${compatibility_directory}/base-complete.yaml" \
+      "${compatibility_directory}/head-complete.yaml" >&2 || true
+    echo 'existing complete profile render changed' >&2
     exit 1
   fi
 else
