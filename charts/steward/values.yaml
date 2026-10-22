@@ -72,6 +72,10 @@ web:
     hostname: ""
     apiPaths: []
     webPaths: []
+    # Optional Gateway API timeouts for each rendered route. Empty objects
+    # leave the fields absent so the selected Gateway keeps its defaults.
+    apiTimeouts: {}
+    webTimeouts: {}
     # The Gateway validates the apiserver's TLS certificate against this
     # same-namespace ConfigMap. It must contain the public issuing CA at
     # caConfigMap.key; never place a private key in this object.
