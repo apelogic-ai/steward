@@ -2173,6 +2173,61 @@ mod tests {
     }
 
     #[test]
+    fn governed_command_grants_allow_exact_and_narrower_requests_but_refuse_expansion() {
+        let cli_read = ToolGrant {
+            provider: "cli".to_owned(),
+            resource: "kubectl".to_owned(),
+            action: "read".to_owned(),
+        };
+        let cli_write = ToolGrant {
+            provider: "cli".to_owned(),
+            resource: "kubectl".to_owned(),
+            action: "write".to_owned(),
+        };
+        let remote_shell = ToolGrant {
+            provider: "remote-shell".to_owned(),
+            resource: "remote_shell_run".to_owned(),
+            action: "write".to_owned(),
+        };
+        let cli_destructive = ToolGrant {
+            provider: "cli".to_owned(),
+            resource: "kubectl".to_owned(),
+            action: "destructive".to_owned(),
+        };
+        let mut envelope = envelope_with_budget("200.00");
+        envelope.spec.tools = vec![cli_read.clone(), cli_write.clone(), remote_shell.clone()];
+
+        let mut requested = request_with_budget("100.00");
+        requested.tools = envelope.spec.tools.clone();
+        assert_eq!(
+            evaluate(&requested, &envelope),
+            Ok(AdmissionDecision::Admit),
+            "a Task may request the exact governed command ceiling"
+        );
+
+        requested.tools = vec![cli_read.clone()];
+        assert_eq!(
+            evaluate(&requested, &envelope),
+            Ok(AdmissionDecision::Admit),
+            "a Task may request fewer governed command grants than its Envelope allows"
+        );
+
+        requested.tools = vec![cli_read, cli_write, remote_shell, cli_destructive.clone()];
+        assert!(
+            matches!(
+                evaluate(&requested, &envelope),
+                Ok(AdmissionDecision::Reject { deltas })
+                    if matches!(
+                        deltas.as_slice(),
+                        [AdmissionDelta::Tools { requested, .. }]
+                            if requested == std::slice::from_ref(&cli_destructive)
+                    )
+            ),
+            "a Task must not add an unapproved command class"
+        );
+    }
+
+    #[test]
     fn rejection_message_uses_plain_labels_and_units_for_both_front_doors() {
         let decision = AdmissionDecision::Reject {
             deltas: vec![

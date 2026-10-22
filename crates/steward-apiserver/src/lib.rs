@@ -5719,11 +5719,28 @@ mod tests {
                 .to_string(),
             ))?
             .workspace_deployment_capabilities();
+        let mut admin_capabilities = browser_capability_catalog();
+        admin_capabilities.tools = vec![
+            browser_admin::CapabilityTool {
+                provider: "cli".to_owned(),
+                resource: "kubectl".to_owned(),
+                action: "read".to_owned(),
+                access_class: browser_admin::ToolAccessClass::Read,
+                toolsets: Vec::new(),
+            },
+            browser_admin::CapabilityTool {
+                provider: "remote-shell".to_owned(),
+                resource: "remote_shell_run".to_owned(),
+                action: "write".to_owned(),
+                access_class: browser_admin::ToolAccessClass::Write,
+                toolsets: Vec::new(),
+            },
+        ];
         let admin_app = browser_admin::protected_router_with_workspace_capabilities(
             runtime_repository.clone(),
             admin_ledger.clone(),
             admin_decisions.clone(),
-            browser_capability_catalog(),
+            admin_capabilities,
             workspace_capabilities,
             admin_auth.clone(),
         );
@@ -5837,6 +5854,24 @@ mod tests {
                 "provider": "provider-a",
                 "model": "model-a"
             }))
+        );
+        assert_eq!(
+            capabilities.pointer("/tools"),
+            Some(&serde_json::json!([
+                {
+                    "provider": "cli",
+                    "resource": "kubectl",
+                    "action": "read",
+                    "accessClass": "read"
+                },
+                {
+                    "provider": "remote-shell",
+                    "resource": "remote_shell_run",
+                    "action": "write",
+                    "accessClass": "write"
+                }
+            ])),
+            "the API must return the exact deployment-configured command grants"
         );
         assert_eq!(
             capabilities.pointer("/workspace/enabledTypes"),
@@ -6754,9 +6789,9 @@ mod tests {
             .requested_envelope
             .spec
             .tools = vec![ToolGrant {
-            provider: "github".to_owned(),
-            resource: "actions_get".to_owned(),
-            action: "read".to_owned(),
+            provider: "cli".to_owned(),
+            resource: "kubectl".to_owned(),
+            action: "destructive".to_owned(),
         }];
         review_ledger.pending_envelope_requests[0]
             .requested_envelope
@@ -6802,7 +6837,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "a rationale must not bypass the current capability catalog"
+            "approval must refuse a command class absent from the current capability catalog"
         );
         let body = to_bytes(response.into_body(), 16 * 1024)
             .await
