@@ -528,7 +528,7 @@ fn map_user_token_identity_error(
             BrowserAuthFailure::InvalidSession
         }
         StoreError::CanonicalIdentityAmbiguousEmail if !email_linking_allowed => {
-            BrowserAuthFailure::InsufficientAuthority
+            BrowserAuthFailure::InvalidIdentity
         }
         _ => BrowserAuthFailure::InvalidIdentity,
     }
@@ -1444,7 +1444,7 @@ async fn resolve_user_token(
                 method,
                 route_template,
                 "refused",
-                user_token_identity_refusal_reason(error),
+                user_token_identity_refusal_reason(error, claims.email_linking_allowed),
             );
             return Err(match error {
                 BrowserAuthFailure::IdentityUnavailable => error,
@@ -1466,8 +1466,12 @@ async fn resolve_user_token(
     }))
 }
 
-fn user_token_identity_refusal_reason(error: BrowserAuthFailure) -> &'static str {
+fn user_token_identity_refusal_reason(
+    error: BrowserAuthFailure,
+    email_linking_allowed: bool,
+) -> &'static str {
     match error {
+        BrowserAuthFailure::InvalidIdentity if !email_linking_allowed => "identity_link_refused",
         BrowserAuthFailure::InvalidIdentity => "identity_conflict",
         BrowserAuthFailure::InsufficientAuthority => "identity_link_refused",
         BrowserAuthFailure::InvalidSession => "unknown_user",
@@ -3484,22 +3488,25 @@ mod tests {
             StatusCode::OK
         }
 
-        for (case, failure, auto_create_users, reason_code) in [
+        for (case, failure, auto_create_users, trust_email, reason_code) in [
             (
                 "subject or email conflict",
                 BrowserAuthFailure::InvalidIdentity,
+                true,
                 true,
                 "identity_conflict",
             ),
             (
                 "email linking refused",
-                BrowserAuthFailure::InsufficientAuthority,
+                BrowserAuthFailure::InvalidIdentity,
                 true,
+                false,
                 "identity_link_refused",
             ),
             (
                 "unknown user",
                 BrowserAuthFailure::InvalidSession,
+                false,
                 false,
                 "unknown_user",
             ),
@@ -3513,7 +3520,7 @@ mod tests {
                 Arc::new(RefusingUserTokenIdentityResolver { failure }),
             )?
             .with_user_token_verifier(Arc::new(crate::google_oidc::fixture_user_token_verifier(
-                false,
+                trust_email,
             )?))
             .with_auto_create_users(auto_create_users)
             .with_request_audit_reporter(move |line| match captured.lock() {
@@ -3555,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn user_token_store_failures_keep_distinct_audit_reason_classes() {
+    fn user_token_store_failures_keep_existing_contracts_and_distinct_audit_reasons() {
         assert_eq!(
             super::map_user_token_identity_error(
                 steward_store::StoreError::CanonicalIdentityNotFound,
@@ -3593,6 +3600,14 @@ mod tests {
             ),
             BrowserAuthFailure::InvalidIdentity,
             "browser sign-in keeps its existing failure mapping"
+        );
+        assert_eq!(
+            super::user_token_identity_refusal_reason(BrowserAuthFailure::InvalidIdentity, false),
+            "identity_link_refused"
+        );
+        assert_eq!(
+            super::user_token_identity_refusal_reason(BrowserAuthFailure::InvalidIdentity, true),
+            "identity_conflict"
         );
     }
 
