@@ -211,6 +211,9 @@ fi
 printf '%s\n' \
   '{"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"test-key","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","y":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}]}' \
   > "${inline_config_directory}/jwks.json"
+printf '%s\n' \
+  '{"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"rotated-key","crv":"P-256","x":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","y":"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"}]}' \
+  > "${inline_config_directory}/rotated-jwks.json"
 printf '%s\n' '{"keys":[' > "${inline_config_directory}/malformed-jwks.json"
 printf '%s\n' '{"keys":[{}]}' > "${inline_config_directory}/incomplete-jwks.json"
 printf '%s\n' \
@@ -229,6 +232,26 @@ helm_template \
 grep -Fq 'metadata: { name: steward-task-jwks }' "${component_rendered}"
 grep -Fq '"jwks.json":' "${component_rendered}"
 grep -Fq '"alg":"ES256"' "${component_rendered}"
+jwks_config_map="$(awk '/^metadata: \{ name: steward-task-jwks \}/ { found = 1 } found { print } found && /^---$/ { exit }' "${component_rendered}")"
+if grep -Fq 'immutable: true' <<< "${jwks_config_map}"; then
+  echo 'inline public JWKS ConfigMap must support key rotation' >&2
+  exit 1
+fi
+jwks_checksum="$(awk '$1 == "checksum/task-jwks:" { gsub(/"/, "", $2); print $2; exit }' "${component_rendered}")"
+helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set taskIdentity.enabled=true \
+  --set-string taskIdentity.issuer=https://identity.example.test \
+  --set-string taskIdentity.audience=steward-task-api \
+  --set-string taskIdentity.publicJwksConfigMap.name=steward-task-jwks \
+  --set-string taskIdentity.publicJwksConfigMap.key=jwks.json \
+  --set-file taskIdentity.publicJwksConfigMap.data="${inline_config_directory}/rotated-jwks.json" \
+  > "${component_rendered}"
+rotated_jwks_checksum="$(awk '$1 == "checksum/task-jwks:" { gsub(/"/, "", $2); print $2; exit }' "${component_rendered}")"
+if [[ -z "${jwks_checksum}" || -z "${rotated_jwks_checksum}" || "${jwks_checksum}" == "${rotated_jwks_checksum}" ]]; then
+  echo 'inline public JWKS rotation must change the apiserver pod checksum' >&2
+  exit 1
+fi
 
 for invalid_jwks in malformed-jwks.json incomplete-jwks.json private-jwks.json; do
   if helm_template \
@@ -261,6 +284,11 @@ helm_template \
   > "${component_rendered}"
 grep -Fq 'metadata: { name: steward-apiserver-ca }' "${component_rendered}"
 grep -Fq -- '-----BEGIN CERTIFICATE-----' "${component_rendered}"
+ca_config_map="$(awk '/^metadata: \{ name: steward-apiserver-ca \}/ { found = 1 } found { print } found && /^---$/ { exit }' "${component_rendered}")"
+if grep -Fq 'immutable: true' <<< "${ca_config_map}"; then
+  echo 'inline public CA ConfigMap must support certificate rotation' >&2
+  exit 1
+fi
 
 if helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca \
