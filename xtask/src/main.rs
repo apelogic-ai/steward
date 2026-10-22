@@ -5277,8 +5277,11 @@ mod tests {
             .map_err(|error| format!("Codex reference runtime guide is required: {error}"))?;
 
         for required in [
+            "ARG TARGETARCH",
             "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
             "cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e",
+            "ca2493fbca2b442b342c06815ea15cc34c68ebd7df65ff1440a19a122bb53b07",
             "sha256sum --check --strict",
             "/usr/local/bin/mcp-gw-sandbox-helper",
             "/usr/local/bin/kubectl",

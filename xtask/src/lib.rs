@@ -3888,6 +3888,8 @@ mod tests {
             .get_mut("steward-mcp-gw")
             .ok_or_else(|| "replacement MCP profile is required".to_owned())?;
         mcp["endpoints"][0]["rules"] = serde_json::json!([
+            {"allow": {"method": "POST", "path": "/mcp"}},
+            {"allow": {"method": "DELETE", "path": "/mcp"}},
             {"allow": {"method": "POST", "path": "/cli/run"}},
             {"allow": {"method": "POST", "path": "/cli/jobs"}},
             {"allow": {"method": "POST", "path": "/shell/run"}},
