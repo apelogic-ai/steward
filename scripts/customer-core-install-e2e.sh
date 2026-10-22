@@ -13,6 +13,9 @@ build_release_value_sets() {
     --set-string "images.controller.digest=${controller_digest}"
     --set-string "networkPolicy.kubeApiCidrs[0]=${api_ip}/32"
     --set-string "networkPolicy.postgresCidrs[0]=${postgres_ip}/32"
+    --set-string secrets.database.name=steward-runtime
+    --set-string tls.api.secretName=steward-runtime
+    --set-string tls.webhook.secretName=steward-runtime
     --set-file "tls.webhook.caBundlePem=${run_dir}/ca.crt"
   )
   complete_values=(
@@ -235,31 +238,26 @@ openssl rand -hex 24 > "${run_dir}/postgres-password"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "${run_dir}/ca.key" -out "${run_dir}/ca.crt" \
   -subj '/CN=Steward disposable core install CA' >/dev/null 2>&1
-for service in steward-apiserver steward-webhook; do
-  openssl req -newkey rsa:2048 -nodes \
-    -keyout "${run_dir}/${service}.key" -out "${run_dir}/${service}.csr" \
-    -subj "/CN=${service}.steward.svc" >/dev/null 2>&1
-  printf 'subjectAltName=DNS:%s,DNS:%s.steward.svc,DNS:%s.steward.svc.cluster.local\n' \
-    "${service}" "${service}" "${service}" > "${run_dir}/${service}.ext"
-  openssl x509 -req -in "${run_dir}/${service}.csr" \
-    -CA "${run_dir}/ca.crt" -CAkey "${run_dir}/ca.key" -CAcreateserial \
-    -out "${run_dir}/${service}.crt" -days 1 -sha256 \
-    -extfile "${run_dir}/${service}.ext" >/dev/null 2>&1
-  openssl verify -CAfile "${run_dir}/ca.crt" "${run_dir}/${service}.crt" >/dev/null
-done
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "${run_dir}/steward-runtime.key" -out "${run_dir}/steward-runtime.csr" \
+  -subj '/CN=steward-apiserver.steward.svc' >/dev/null 2>&1
+cat > "${run_dir}/steward-runtime.ext" <<'EOF'
+subjectAltName=DNS:steward-apiserver,DNS:steward-apiserver.steward.svc,DNS:steward-apiserver.steward.svc.cluster.local,DNS:steward-webhook,DNS:steward-webhook.steward.svc,DNS:steward-webhook.steward.svc.cluster.local
+EOF
+openssl x509 -req -in "${run_dir}/steward-runtime.csr" \
+  -CA "${run_dir}/ca.crt" -CAkey "${run_dir}/ca.key" -CAcreateserial \
+  -out "${run_dir}/steward-runtime.crt" -days 1 -sha256 \
+  -extfile "${run_dir}/steward-runtime.ext" >/dev/null 2>&1
+openssl verify -CAfile "${run_dir}/ca.crt" "${run_dir}/steward-runtime.crt" >/dev/null
 K=(kubectl --kubeconfig "${kubeconfig}" --context "${context}" -n steward)
-"${K[@]}" create secret generic steward-database \
-  --from-file="url=${run_dir}/database-url" >/dev/null
+"${K[@]}" create secret generic steward-runtime \
+  --from-file="url=${run_dir}/database-url" \
+  --from-file="tls.crt=${run_dir}/steward-runtime.crt" \
+  --from-file="tls.key=${run_dir}/steward-runtime.key" >/dev/null
 "${K[@]}" create secret generic core-test-postgres \
   --from-file="password=${run_dir}/postgres-password" >/dev/null
-"${K[@]}" create secret tls steward-apiserver-tls \
-  --cert="${run_dir}/steward-apiserver.crt" \
-  --key="${run_dir}/steward-apiserver.key" >/dev/null
-"${K[@]}" create secret tls steward-webhook-tls \
-  --cert="${run_dir}/steward-webhook.crt" \
-  --key="${run_dir}/steward-webhook.key" >/dev/null
-"${K[@]}" label secret steward-database core-test-postgres \
-  steward-apiserver-tls steward-webhook-tls "steward.test/run-id=${run_id}" >/dev/null
+"${K[@]}" label secret steward-runtime core-test-postgres \
+  "steward.test/run-id=${run_id}" >/dev/null
 
 stage=postgres
 "${K[@]}" apply -f - >/dev/null <<YAML
