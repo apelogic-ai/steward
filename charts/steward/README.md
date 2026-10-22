@@ -17,25 +17,39 @@ operators set a fork-owned repository and publish their own images and chart:
 ```yaml
 images:
   repository: <registry>/<repository>
+  requireDigest: true
   pullPolicy: IfNotPresent
   apiserver:
+    repository: "" # falls back to images.repository
     tag: <version>-apiserver
     digest: sha256:<digest>
   controller:
+    repository: "" # falls back to images.repository
     tag: <version>-controller
     digest: sha256:<digest>
   mint:
+    repository: ""
     tag: "" # set tag and digest when execution.enabled=true
     digest: ""
   web:
+    repository: ""
     tag: "" # set tag and digest when web.enabled=true
     digest: ""
   triggerReceiver:
+    repository: ""
     tag: "" # set tag and digest when triggerReceiver.enabled=true
     digest: ""
 ```
 
-Never set a tag without the matching digest or use a mutable image reference.
+Each component can select its own repository. An empty component repository
+uses `images.repository`, and an empty tag uses the chart `appVersion`.
+Digest pinning remains the default. A hosting platform that verifies and
+promotes images by repository and tag can set `images.requireDigest=false` and
+leave component digests empty; that platform is then responsible for ensuring
+the promoted tags cannot change unexpectedly.
+
+With `images.requireDigest=true`, never set a tag without the matching digest
+or use a mutable image reference.
 The chart rejects the all-zero SHA-256 sentinel: it is a placeholder, not a
 released immutable digest. The same rejection applies to execution-binding
 images, provider-profile digests, and enabled bridge images.
