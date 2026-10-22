@@ -5273,6 +5273,8 @@ mod tests {
             root().join("config/provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json"),
         )
         .map_err(|error| format!("governed command provider profile is required: {error}"))?;
+        let profile_json: serde_json::Value = serde_json::from_str(&profile)
+            .map_err(|error| format!("governed command provider profile must be JSON: {error}"))?;
         let guide = fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
             .map_err(|error| format!("Codex reference runtime guide is required: {error}"))?;
 
@@ -5292,6 +5294,18 @@ mod tests {
                 "runtime image must retain {required}"
             );
         }
+        assert_eq!(
+            profile_json.pointer("/network/allowedRoutes"),
+            Some(&serde_json::json!([
+                {"method": "POST", "path": "/mcp"},
+                {"method": "DELETE", "path": "/mcp"},
+                {"method": "POST", "path": "/cli/run"},
+                {"method": "POST", "path": "/cli/jobs"},
+                {"method": "POST", "path": "/shell/run"},
+                {"method": "POST", "path": "/shell/jobs"}
+            ])),
+            "the command profile must preserve only the existing MCP transport and exact command routes"
+        );
         for required in [
             "MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder",
             "MCP_GW_CLI_URL",
