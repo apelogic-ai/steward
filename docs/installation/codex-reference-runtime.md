@@ -34,6 +34,54 @@ output processing:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
+| `kubectl` | MCP-GW 0.7.0 helper | Governed Kubernetes commands |
+| `remote-shell` | MCP-GW 0.7.0 helper | Governed commands on a run-bound machine |
+
+## Governed commands and sign-in
+
+The reference image installs the checksum-pinned MCP-GW 0.7.0 sandbox helper
+at `/usr/local/bin/mcp-gw-sandbox-helper`. `kubectl` and `remote-shell` are
+symlinks to that executable. The helper selects `/cli/run` or `/shell/run`
+from its invoked name; it does not contain a gateway credential or implement a
+second sign-in flow.
+
+When a Task has the matching approved grant, both supported agent adapters add
+only these values to the agent process:
+
+- `MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder`
+- `MCP_GW_CLI_URL=https://<configured-gateway-host>/cli/run` for an approved
+  `cli/kubectl` command class
+- `MCP_GW_SHELL_URL=https://<configured-gateway-host>/shell/run` for an
+  approved `remote-shell/remote_shell_run/write` grant
+
+The URLs are derived from the Task's configured MCP endpoint. An unrelated or
+unrecognized grant adds none of these values. The agent never receives a
+usable token: OpenShell recognizes the placeholder and substitutes a
+short-lived, run-bound token only on the allowed network request. MCP-GW then
+checks the token's run identifier, target, and approved command class. A
+missing grant, a command classified above the approved class, or a machine not
+tagged for that run is refused by MCP-GW. Helper configuration and request
+failures return exit code `125` with a generic message and do not print the
+placeholder or substituted token.
+
+Use `steward-runtime-providers@1.3.0` with an image containing the helper. Its
+MCP-GW profile permits exactly `POST /cli/run`, `POST /cli/jobs`,
+`POST /shell/run`, and `POST /shell/jobs` on the configured gateway host.
+Wildcard paths, query variants, other hosts, and all other methods remain
+blocked. The same Task and Envelope API grants drive native UI submissions;
+the UI does not create a separate command or sign-in path.
+
+Example agent commands are:
+
+```sh
+kubectl get pods
+remote-shell machine.test -- uname -a
+```
+
+Operators must bind remote-shell targets to the same run identifier used in
+the Task token. Do not inject a gateway bearer token, token file, cloud access
+key, or Systems Manager credential into the image, execution binding, Task, or
+agent environment.
 
 ## Mirror the exact manifest
 

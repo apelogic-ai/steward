@@ -26,12 +26,13 @@ use process::{checked_command, require_executed_tool_version, require_tool_versi
 
 type TaskResult = Result<(), String>;
 
-const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 5] = [
+const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 6] = [
     ("1.0.0", "config/provider-profile-bundle/v1"),
     ("1.1.0", "config/provider-profile-bundle/v1.1.0"),
     ("1.2.0", "config/provider-profile-bundle/v1.2.0"),
     ("1.2.1", "config/provider-profile-bundle/v1.2.1"),
     ("1.2.2", "config/provider-profile-bundle/v1.2.2"),
+    ("1.3.0", "config/provider-profile-bundle/v1.3.0"),
 ];
 
 fn main() -> ExitCode {
@@ -1936,6 +1937,7 @@ mod tests {
             ("1.2.0", "/v1.2.0"),
             ("1.2.1", "/v1.2.1"),
             ("1.2.2", "/v1.2.2"),
+            ("1.3.0", "/v1.3.0"),
         ] {
             let inputs = serde_json::json!({
                 "bundle": {"id": "steward-runtime-providers", "version": version}
@@ -1948,11 +1950,11 @@ mod tests {
             );
         }
         let unsupported = serde_json::json!({
-            "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"}
+            "bundle": {"id": "steward-runtime-providers", "version": "1.3.1"}
         });
         let result = provider_profile_bundle_directory_for_inputs(&unsupported.to_string());
         assert!(
-            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.0")),
+            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.1")),
             "unknown bundle identities must fail closed: {result:?}"
         );
         Ok(())

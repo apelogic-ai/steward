@@ -31,12 +31,18 @@ RUN curl --fail --silent --show-error --location \
     && curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
+    && curl --fail --silent --show-error --location \
+        "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz" \
+        --output /tmp/mcp-gw-sandbox-helper.tar.gz \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${JQ_SHA256}" /tmp/jq.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBJQ_SHA256}" /tmp/libjq1.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBONIG_SHA256}" /tmp/libonig5.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${FD_FIND_SHA256}" /tmp/fd-find.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${TREE_SHA256}" /tmp/tree.deb | sha256sum --check --strict \
+    && printf '%s  %s\n' \
+        cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e \
+        /tmp/mcp-gw-sandbox-helper.tar.gz | sha256sum --check --strict \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install \
         /tmp/ripgrep.deb \
         /tmp/libonig5.deb \
@@ -47,6 +53,12 @@ RUN curl --fail --silent --show-error --location \
     && rm /tmp/ripgrep.deb /tmp/libonig5.deb \
         /tmp/libjq1.deb /tmp/jq.deb /tmp/fd-find.deb /tmp/tree.deb \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && tar --extract --gzip --file /tmp/mcp-gw-sandbox-helper.tar.gz \
+        --directory /usr/local/bin mcp-gw-sandbox-helper \
+    && rm /tmp/mcp-gw-sandbox-helper.tar.gz \
+    && chmod 0755 /usr/local/bin/mcp-gw-sandbox-helper \
+    && ln -s mcp-gw-sandbox-helper /usr/local/bin/kubectl \
+    && ln -s mcp-gw-sandbox-helper /usr/local/bin/remote-shell \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \
     && npm pack --silent tar@7.5.22 --pack-destination /tmp \
     && rm -rf /usr/lib/node_modules/npm/node_modules/tar \
@@ -67,4 +79,7 @@ USER sandbox
 RUN rg --version \
     && jq --version \
     && fd --version \
-    && tree --version
+    && tree --version \
+    && test -x /usr/local/bin/mcp-gw-sandbox-helper \
+    && test "$(readlink /usr/local/bin/kubectl)" = mcp-gw-sandbox-helper \
+    && test "$(readlink /usr/local/bin/remote-shell)" = mcp-gw-sandbox-helper
