@@ -140,7 +140,7 @@
         "httpRoute": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "parentRefs", "hostname", "apiPaths", "webPaths", "backendTls"],
+          "required": ["enabled", "parentRefs", "hostname", "apiPaths", "webPaths", "apiTimeouts", "webTimeouts", "backendTls"],
           "properties": {
             "enabled": {"type": "boolean"},
             "parentRefs": {
@@ -151,6 +151,8 @@
             "hostname": {"type": "string"},
             "apiPaths": {"$ref": "#/definitions/httpRoutePaths"},
             "webPaths": {"$ref": "#/definitions/httpRoutePaths"},
+            "apiTimeouts": {"$ref": "#/definitions/httpRouteTimeouts"},
+            "webTimeouts": {"$ref": "#/definitions/httpRouteTimeouts"},
             "backendTls": {
               "type": "object",
               "additionalProperties": false,
@@ -1931,6 +1933,18 @@
         }
       },
       "uniqueItems": true
+    },
+    "httpRouteTimeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request": {"$ref": "#/definitions/httpRouteDuration"},
+        "backendRequest": {"$ref": "#/definitions/httpRouteDuration"}
+      }
+    },
+    "httpRouteDuration": {
+      "type": "string",
+      "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"
     },
     "port": {"type": "integer", "minimum": 1, "maximum": 65535},
     "cidrs": {

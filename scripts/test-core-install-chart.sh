@@ -4,6 +4,8 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
 component_rendered="$(mktemp)"
+http_route_default_rendered="$(mktemp)"
+http_route_timeout_rendered="$(mktemp)"
 compatibility_directory="$(mktemp -d)"
 inline_config_directory="$(mktemp -d)"
 missing_namespace_error="$(mktemp)"
@@ -24,7 +26,8 @@ cleanup() {
     kill "${receiver_stub_pid}" 2>/dev/null || true
     wait "${receiver_stub_pid}" 2>/dev/null || true
   fi
-  rm -f "${rendered}" "${component_rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
+  rm -f "${rendered}" "${component_rendered}" "${http_route_default_rendered}" \
+    "${http_route_timeout_rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
     "${receiver_startup_output}" "${receiver_stub_port}" "${receiver_stub_kubeconfig}"
   find "${compatibility_directory}" -depth -delete
   find "${inline_config_directory}" -depth -delete
@@ -108,6 +111,81 @@ complete_profile=(
   --set-string 'networkPolicy.postgresCidrs[0]=192.0.2.11/32'
   --set-string 'networkPolicy.browserAuthEgressCidrs[0]=192.0.2.12/32'
 )
+http_route_profile=(
+  --set-string tls.webhook.caBundlePem=public-test-ca
+  --set-string web.host=steward.example.test
+  --set web.httpRoute.enabled=true
+  --set-string web.httpRoute.hostname=steward.example.test
+  --set-string 'web.httpRoute.parentRefs[0].name=shared-gateway'
+  --set-string 'web.httpRoute.parentRefs[0].namespace=edge-system'
+  --set-string 'web.httpRoute.parentRefs[0].sectionName=https'
+  --set-string 'web.httpRoute.apiPaths[0].type=Exact'
+  --set-string 'web.httpRoute.apiPaths[0].value=/.well-known/oauth-protected-resource'
+  --set-string 'web.httpRoute.apiPaths[1].type=PathPrefix'
+  --set-string 'web.httpRoute.apiPaths[1].value=/admin/api'
+  --set-string 'web.httpRoute.apiPaths[2].type=PathPrefix'
+  --set-string 'web.httpRoute.apiPaths[2].value=/admin/auth'
+  --set-string 'web.httpRoute.apiPaths[3].type=Exact'
+  --set-string 'web.httpRoute.apiPaths[3].value=/admin/connections/github/callback'
+  --set-string 'web.httpRoute.apiPaths[4].type=PathPrefix'
+  --set-string 'web.httpRoute.apiPaths[4].value=/admin/operator'
+  --set-string 'web.httpRoute.apiPaths[5].type=PathPrefix'
+  --set-string 'web.httpRoute.apiPaths[5].value=/app/api'
+  --set-string 'web.httpRoute.apiPaths[6].type=PathPrefix'
+  --set-string 'web.httpRoute.apiPaths[6].value=/v1'
+  --set-string 'web.httpRoute.webPaths[0].type=PathPrefix'
+  --set-string 'web.httpRoute.webPaths[0].value=/'
+  --set-string web.httpRoute.backendTls.hostname=steward-apiserver.steward.svc.cluster.local
+  --set-string web.httpRoute.backendTls.caConfigMap.name=steward-apiserver-ca
+  --set-string web.httpRoute.backendTls.caConfigMap.key=ca.crt
+)
+
+helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  "${http_route_profile[@]}" > "${http_route_default_rendered}"
+if grep -Fq '      timeouts:' "${http_route_default_rendered}"; then
+  echo 'HTTPRoute timeouts must remain absent unless explicitly configured' >&2
+  exit 1
+fi
+
+helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  "${http_route_profile[@]}" \
+  --set-string web.httpRoute.apiTimeouts.request=90s \
+  --set-string web.httpRoute.apiTimeouts.backendRequest=85s \
+  --set-string web.httpRoute.webTimeouts.request=30s \
+  --set-string web.httpRoute.webTimeouts.backendRequest=25s > "${http_route_timeout_rendered}"
+api_route="$(awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: HTTPRoute/ && $0 ~ /name: steward-api/ { print; exit }
+' "${http_route_timeout_rendered}")"
+web_route="$(awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: HTTPRoute/ && $0 ~ /name: steward-web/ { print; exit }
+' "${http_route_timeout_rendered}")"
+grep -Fq 'request: "90s"' <<<"${api_route}"
+grep -Fq 'backendRequest: "85s"' <<<"${api_route}"
+grep -Fq 'request: "30s"' <<<"${web_route}"
+grep -Fq 'backendRequest: "25s"' <<<"${web_route}"
+
+for timeout_value in \
+  web.httpRoute.apiTimeouts.request \
+  web.httpRoute.apiTimeouts.backendRequest \
+  web.httpRoute.webTimeouts.request \
+  web.httpRoute.webTimeouts.backendRequest
+do
+  if helm_template \
+    "${legacy_complete_images[@]}" \
+    "${complete_profile[@]}" \
+    "${http_route_profile[@]}" \
+    --set-string "${timeout_value}=90seconds" >/dev/null 2>&1
+  then
+    echo "HTTPRoute ${timeout_value} must reject malformed durations" >&2
+    exit 1
+  fi
+done
 
 helm_template \
   "${tag_only_images[@]}" \
