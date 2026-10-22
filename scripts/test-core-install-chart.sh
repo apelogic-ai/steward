@@ -5,6 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
 component_rendered="$(mktemp)"
 compatibility_directory="$(mktemp -d)"
+inline_config_directory="$(mktemp -d)"
 missing_namespace_error="$(mktemp)"
 receiver_startup_config="$(mktemp)"
 receiver_startup_output="$(mktemp)"
@@ -26,6 +27,7 @@ cleanup() {
   rm -f "${rendered}" "${component_rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
     "${receiver_startup_output}" "${receiver_stub_port}" "${receiver_stub_kubeconfig}"
   find "${compatibility_directory}" -depth -delete
+  find "${inline_config_directory}" -depth -delete
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -203,6 +205,82 @@ if git -C "${root}" cat-file -e "${compatibility_base}:charts/steward/Chart.yaml
   fi
 else
   echo "chart compatibility base is unavailable: ${compatibility_base}" >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  '{"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"test-key","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","y":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}]}' \
+  > "${inline_config_directory}/jwks.json"
+printf '%s\n' '{"keys":[' > "${inline_config_directory}/malformed-jwks.json"
+printf '%s\n' \
+  '{"keys":[{"kty":"EC","use":"sig","alg":"ES256","kid":"test-key","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","y":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","d":"private"}]}' \
+  > "${inline_config_directory}/private-jwks.json"
+
+helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set taskIdentity.enabled=true \
+  --set-string taskIdentity.issuer=https://identity.example.test \
+  --set-string taskIdentity.audience=steward-task-api \
+  --set-string taskIdentity.publicJwksConfigMap.name=steward-task-jwks \
+  --set-string taskIdentity.publicJwksConfigMap.key=jwks.json \
+  --set-file taskIdentity.publicJwksConfigMap.data="${inline_config_directory}/jwks.json" \
+  > "${component_rendered}"
+grep -Fq 'metadata: { name: steward-task-jwks }' "${component_rendered}"
+grep -Fq 'jwks.json:' "${component_rendered}"
+grep -Fq '"alg":"ES256"' "${component_rendered}"
+
+for invalid_jwks in malformed-jwks.json private-jwks.json; do
+  if helm_template \
+    --set-string tls.webhook.caBundlePem=public-test-ca \
+    --set taskIdentity.enabled=true \
+    --set-string taskIdentity.issuer=https://identity.example.test \
+    --set-string taskIdentity.audience=steward-task-api \
+    --set-string taskIdentity.publicJwksConfigMap.name=steward-task-jwks \
+    --set-string taskIdentity.publicJwksConfigMap.key=jwks.json \
+    --set-file taskIdentity.publicJwksConfigMap.data="${inline_config_directory}/${invalid_jwks}" \
+    >/dev/null 2>&1
+  then
+    echo "inline public JWKS must reject ${invalid_jwks}" >&2
+    exit 1
+  fi
+done
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout "${inline_config_directory}/private.key" \
+  -out "${inline_config_directory}/ca.crt" \
+  -subj '/CN=Steward test CA' >/dev/null 2>&1
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'not-base64' '-----END CERTIFICATE-----' \
+  > "${inline_config_directory}/malformed-ca.crt"
+
+helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-string web.httpRoute.backendTls.caConfigMap.name=steward-apiserver-ca \
+  --set-string web.httpRoute.backendTls.caConfigMap.key=ca.crt \
+  --set-file web.httpRoute.backendTls.caConfigMap.data="${inline_config_directory}/ca.crt" \
+  > "${component_rendered}"
+grep -Fq 'metadata: { name: steward-apiserver-ca }' "${component_rendered}"
+grep -Fq -- '-----BEGIN CERTIFICATE-----' "${component_rendered}"
+
+for invalid_ca in malformed-ca.crt private.key; do
+  if helm_template \
+    --set-string tls.webhook.caBundlePem=public-test-ca \
+    --set-string web.httpRoute.backendTls.caConfigMap.name=steward-apiserver-ca \
+    --set-string web.httpRoute.backendTls.caConfigMap.key=ca.crt \
+    --set-file web.httpRoute.backendTls.caConfigMap.data="${inline_config_directory}/${invalid_ca}" \
+    >/dev/null 2>&1
+  then
+    echo "inline public CA must reject ${invalid_ca}" >&2
+    exit 1
+  fi
+done
+
+helm_template \
+  --set-string secrets.database.name=steward-runtime \
+  --set-string tls.api.secretName=steward-runtime \
+  --set-string tls.webhook.secretName=steward-runtime \
+  --set-string tls.webhook.caBundlePem=public-test-ca > "${component_rendered}"
+if [[ "$(grep -oE 'secretName: [A-Za-z0-9.-]+' "${component_rendered}" | awk '{print $2}' | sort -u)" != steward-runtime ]]; then
+  echo 'core chart must support one existing Secret for database and TLS material' >&2
   exit 1
 fi
 
