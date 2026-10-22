@@ -3572,7 +3572,8 @@ mod tests {
                 true,
                 false,
             ),
-            BrowserAuthFailure::InsufficientAuthority
+            BrowserAuthFailure::InvalidIdentity,
+            "refusing untrusted email linking keeps the resolver's invalid-identity contract"
         );
         assert_eq!(
             super::map_user_token_identity_error(
