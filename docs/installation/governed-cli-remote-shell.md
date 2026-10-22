@@ -1,8 +1,7 @@
 # Governed CLI and remote shell
 
-> **Release scope:** This guide applies to the Steward release containing the Sandbox CLI and
-> remote shell milestone and to MCP-GW 0.7.0 or later. Earlier releases do not ship the complete
-> helper and route set.
+> **Release scope: Unreleased.** This guide requires MCP-GW 0.7.0 or later. Earlier Steward and
+> MCP-GW releases do not ship the complete helper and route set.
 
 Steward uses its existing exact tool-grant tuples for governed command-line access. MCP-GW
 classifies each command and requires one matching grant from the Task. Remote shell requires its
@@ -25,15 +24,16 @@ config:
 The capability catalogue supplies choices to the Envelope editor; it grants nothing by itself.
 An administrator includes the exact tuples in an Envelope template or approved request. A Task
 may use all or any subset of its Envelope grants. A different CLI name or class, or a remote-shell
-grant absent from the Envelope, is refused. The user and administrator editors read this same
-catalogue through `/app/api/v1/capabilities` and `/admin/api/v1/capabilities`; do not maintain a
-second list in the web deployment.
+grant absent from the Envelope, is refused. The administrator editor reads the deployment
+catalogue through `/admin/api/v1/capabilities`. The user editor reads the allowed tuples from the
+selected Envelope template through the user Envelope API. Both editors submit exact API tuples;
+do not maintain a second list in the web deployment.
 
 ## Bind a machine to one Run
 
 Remote shell accepts a configured target role rather than an address or instance ID. MCP-GW maps
 that role to a machine and, before every command, requires the machine tag value to equal the
-Task token's immutable runtime UID.
+immutable runtime UID in the runtime-bound MCP-GW credential minted for the sandbox.
 
 1. Submit and execute the Task through the normal Task API. Keep the returned `taskUid` only as
    the Task lookup key.
