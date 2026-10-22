@@ -21,6 +21,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   grants through the existing API-backed editor, Task admission allows any exact subset, and the
   new operator guide explains how a trusted provisioner binds a machine to the Run runtime ID.
   These command routes require MCP-GW 0.7.0 or later.
+- The Helm chart can now create the public task-token JWKS and gateway backend
+  CA ConfigMaps from values. It rejects malformed public material and private
+  keys, while unchanged values continue to reference separately managed
+  ConfigMaps. Core deployments can also reuse one existing Secret for the
+  database URL and both TLS mounts.
 - The Helm chart now accepts a repository for each component and can use the
   chart application version when a component tag is empty. Digest pinning
   remains the default; hosting platforms that verify promoted tags can opt in
