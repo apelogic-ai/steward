@@ -402,6 +402,46 @@ mod capability_catalog_tests {
     }
 
     #[test]
+    fn governed_complete_catalog_advertises_cli_classes_and_remote_shell() -> Result<(), String> {
+        let platform_input: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../config/platform-preflight/v1/examples/governed-complete.json"
+        ))
+        .map_err(|error| format!("parse governed complete platform input: {error}"))?;
+        let catalog = CapabilityCatalog::from_json(
+            &serde_json::to_string(&platform_input["capabilityCatalog"])
+                .map_err(|error| format!("serialize capability catalog: {error}"))?,
+        )?;
+
+        for (provider, resource, action, access_class) in [
+            ("cli", "kubectl", "read", ToolAccessClass::Read),
+            ("cli", "kubectl", "write", ToolAccessClass::Write),
+            (
+                "cli",
+                "kubectl",
+                "destructive",
+                ToolAccessClass::Destructive,
+            ),
+            (
+                "remote-shell",
+                "remote_shell_run",
+                "write",
+                ToolAccessClass::Write,
+            ),
+        ] {
+            assert!(
+                catalog.tools.iter().any(|tool| {
+                    tool.provider == provider
+                        && tool.resource == resource
+                        && tool.action == action
+                        && tool.access_class == access_class
+                }),
+                "governed complete catalog omitted {provider}/{resource}/{action}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_fields_duplicates_and_malformed_identifiers() {
         let unknown = r#"{"schemaVersion":"steward.capability-catalog/v2","models":[],"tools":[],"catalogs":[],"budget":{}}"#;
         assert!(CapabilityCatalog::from_json(unknown).is_err());
