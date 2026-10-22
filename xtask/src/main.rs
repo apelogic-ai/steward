@@ -122,6 +122,7 @@ fn root() -> PathBuf {
 fn ci() -> TaskResult {
     require_ci_tool_versions()?;
     quality_after_tool_checks()?;
+    run("bash", &["scripts/check-litellm-image-pins.sh"])?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
