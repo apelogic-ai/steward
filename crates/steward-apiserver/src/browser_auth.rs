@@ -1951,6 +1951,27 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct RefusingUserTokenIdentityResolver {
+        failure: BrowserAuthFailure,
+    }
+
+    impl BrowserIdentityResolver for RefusingUserTokenIdentityResolver {
+        fn resolve_or_register<'a>(
+            &'a self,
+            _identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move { Err(self.failure) })
+        }
+
+        fn resolve_existing<'a>(
+            &'a self,
+            _identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+            Box::pin(async move { Err(self.failure) })
+        }
+    }
+
     fn user_token_test_service() -> Result<super::BrowserAuthService, String> {
         user_token_test_service_with_verifier(crate::google_oidc::fixture_user_token_verifier(
             false,
@@ -3369,6 +3390,82 @@ mod tests {
             1,
             "cancelling the handler must not add or remove audit records"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_bearer_identity_refusals_write_reasoned_audit_lines() -> Result<(), String> {
+        async fn probe() -> StatusCode {
+            StatusCode::OK
+        }
+
+        for (case, failure, auto_create_users, reason_code) in [
+            (
+                "subject or email conflict",
+                BrowserAuthFailure::InvalidIdentity,
+                true,
+                "identity_conflict",
+            ),
+            (
+                "email linking refused",
+                BrowserAuthFailure::InsufficientAuthority,
+                true,
+                "identity_link_refused",
+            ),
+            (
+                "unknown user",
+                BrowserAuthFailure::InvalidSession,
+                false,
+                "unknown_user",
+            ),
+        ] {
+            let access_token = crate::google_oidc::fixture_user_access_token();
+            let audit_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = audit_lines.clone();
+            let service = super::BrowserAuthService::local_fake(
+                "http://127.0.0.1:33001",
+                Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+                Arc::new(RefusingUserTokenIdentityResolver { failure }),
+            )?
+            .with_user_token_verifier(Arc::new(
+                crate::google_oidc::fixture_user_token_verifier(false)?,
+            ))
+            .with_auto_create_users(auto_create_users)
+            .with_request_audit_reporter(move |line| match captured.lock() {
+                Ok(mut lines) => lines.push(line.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(line.to_owned()),
+            });
+            let response = protect_browser_routes(
+                Router::new().route("/app/api/v1/probe", get(probe)),
+                service,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build {case} request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute {case} request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+
+            let audit_lines = audit_lines
+                .lock()
+                .map_err(|_| "request audit capture lock poisoned".to_owned())?;
+            assert_eq!(
+                audit_lines.len(),
+                1,
+                "{case} must emit exactly one refusal audit line"
+            );
+            let audit = parse_bearer_request_audit(&audit_lines[0], &access_token)?;
+            assert!(
+                audit["canonicalUserId"].is_null(),
+                "{case} must not invent a canonical user"
+            );
+            assert_eq!(audit["outcome"], "refused", "{case}");
+            assert_eq!(audit["reasonCode"], reason_code, "{case}");
+        }
         Ok(())
     }
 
