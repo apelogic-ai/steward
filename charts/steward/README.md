@@ -148,7 +148,10 @@ then renders two `HTTPRoute` objects and one `BackendTLSPolicy`:
 apiserver's TLS listener on 8443), `steward-web` targets `steward-web` port
 `http` (3000), and the policy requires TLS for the apiserver backend. Their
 `parentRefs`, hostname, API paths, web paths, and public-CA ConfigMap have no
-defaults and must be supplied explicitly.
+defaults and must be supplied explicitly. Optional `apiTimeouts` and
+`webTimeouts` objects set the Gateway API `request` and `backendRequest`
+timeouts independently on the two routes. They default to empty objects, so
+the chart emits no timeout fields unless they are configured.
 
 The backend policy is a same-namespace direct attachment to
 `steward-apiserver` port section `https`. Its hostname is fixed to the full
@@ -190,6 +193,12 @@ web:
       - { type: PathPrefix, value: /v1 }
     webPaths:
       - { type: PathPrefix, value: / }
+    apiTimeouts:
+      request: 90s
+      backendRequest: 85s
+    webTimeouts:
+      request: 90s
+      backendRequest: 85s
     backendTls:
       hostname: steward-apiserver.steward.svc.cluster.local
       caConfigMap:
@@ -217,12 +226,11 @@ action. Neither GitHub mutation requires a long-lived edge request while its
 governed runtime starts. A non-GitHub start such as Jira is synchronous and
 returns HTTP 200 with the provider consent URL for the browser to open in a new
 tab.
-Rerun may
-still spend up to 40 seconds waiting for the governed operation, so an edge
-that exposes rerun should allow at least 60 seconds (60–90 seconds is the
-recommended operator range). Configure that timeout on the platform-owned
-Gateway policy because the portable Steward chart does not own the
-controller-specific policy.
+Rerun may still spend up to 40 seconds waiting for the governed operation, so
+an edge that exposes rerun should allow at least 60 seconds (60–90 seconds is
+the recommended operator range). Set `web.httpRoute.apiTimeouts.request` when
+the chart owns the HTTPRoute, or configure the timeout on a platform-owned
+route or policy.
 
 Publish the CA ConfigMap through the platform's public trust-distribution
 controller (for example, a trust-manager `Bundle` whose ConfigMap target is in

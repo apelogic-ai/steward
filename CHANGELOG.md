@@ -16,6 +16,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- The Helm chart can now set independent request and backend-request timeouts
+  on its API and web HTTPRoutes. Timeout fields remain absent by default, so
+  existing route behavior is unchanged until an operator opts in.
 - The Helm chart can now create the public task-token JWKS and gateway backend
   CA ConfigMaps from values. It rejects malformed public material and private
   keys, while unchanged values continue to reference separately managed

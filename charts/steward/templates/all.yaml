@@ -1225,6 +1225,15 @@ spec:
 {{- range .Values.web.httpRoute.apiPaths }}
         - path: { type: {{ .type }}, value: {{ .value | quote }} }
 {{- end }}
+{{- with .Values.web.httpRoute.apiTimeouts }}
+      timeouts:
+{{- with .request }}
+        request: {{ . | quote }}
+{{- end }}
+{{- with .backendRequest }}
+        backendRequest: {{ . | quote }}
+{{- end }}
+{{- end }}
       backendRefs:
         - name: steward-apiserver
           port: {{ .Values.services.apiserverPort }}
@@ -1245,6 +1254,15 @@ spec:
     - matches:
 {{- range .Values.web.httpRoute.webPaths }}
         - path: { type: {{ .type }}, value: {{ .value | quote }} }
+{{- end }}
+{{- with .Values.web.httpRoute.webTimeouts }}
+      timeouts:
+{{- with .request }}
+        request: {{ . | quote }}
+{{- end }}
+{{- with .backendRequest }}
+        backendRequest: {{ . | quote }}
+{{- end }}
 {{- end }}
       backendRefs:
         - name: steward-web
