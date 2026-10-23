@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.22] - 2026-10-23
+
+Steward v0.3.22 adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
+evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
+LiteLLM, and Actions Runner Controller, and a bundle chart that installs them with Steward as one
+release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
+
 ### Added
 
 - Added the optional `steward-bundle` OCI chart for installations that need one
@@ -45,6 +52,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Security
 
 - Update Tokio to 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness).
+
+### Upgrade and rollback
+
+- No database migration is required when upgrading from v0.3.21. Deploy the chart and component
+  images as one release unit, mirror the digest-pinned Claude Code reference runtime, and update
+  `claude-code-v1` execution bindings to that digest before activating it.
+- The governed dependency charts are separate, opt-in release artifacts. Before adopting one,
+  provide its target namespaces, existing Secret references, required cluster-wide permissions,
+  and any Gateway configuration documented by that chart. The existing Steward chart keeps its
+  prior default rendering.
+- Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then
+  restore execution bindings to a reference runtime supported by that release. Remove dependency
+  charts only when the installation adopted them solely for v0.3.22, and restore its previous
+  dependency ownership. No database rollback is required.
 
 ## [0.3.21] - 2026-10-22
 
@@ -1587,7 +1608,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.21...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.22...HEAD
+[0.3.22]: https://github.com/apelogic-ai/steward/compare/v0.3.21...v0.3.22
 [0.3.21]: https://github.com/apelogic-ai/steward/compare/v0.3.20...v0.3.21
 [0.3.20]: https://github.com/apelogic-ai/steward/compare/v0.3.19...v0.3.20
 [0.3.19]: https://github.com/apelogic-ai/steward/compare/v0.3.18...v0.3.19

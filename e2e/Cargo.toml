@@ -4,7 +4,7 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 rust-version = "1.95"
-version = "0.3.21"
+version = "0.3.22"
 
 [workspace]
 
@@ -38,14 +38,14 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
-steward-admission = { path = "../crates/steward-admission", version = "=0.3.21" }
-steward-adapter-codex = { path = "../adapters/codex", version = "=0.3.21" }
-steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.3.21", features = ["runtime"] }
-steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.3.21" }
-steward-controller = { path = "../crates/steward-controller", version = "=0.3.21" }
-steward-store = { path = "../crates/steward-store", version = "=0.3.21" }
-steward-ports = { path = "../crates/steward-ports", version = "=0.3.21" }
-steward-types = { path = "../crates/steward-types", version = "=0.3.21" }
+steward-admission = { path = "../crates/steward-admission", version = "=0.3.22" }
+steward-adapter-codex = { path = "../adapters/codex", version = "=0.3.22" }
+steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.3.22", features = ["runtime"] }
+steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.3.22" }
+steward-controller = { path = "../crates/steward-controller", version = "=0.3.22" }
+steward-store = { path = "../crates/steward-store", version = "=0.3.22" }
+steward-ports = { path = "../crates/steward-ports", version = "=0.3.22" }
+steward-types = { path = "../crates/steward-types", version = "=0.3.22" }
 tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["util"] }

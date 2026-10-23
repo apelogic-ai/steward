@@ -110,13 +110,13 @@ if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>
   exit 1
 fi
 
-write_fixture 0.3.21 0.3.21 0.3.21 0.3.21 0.3.0
-test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.3.21
+write_fixture 0.3.22 0.3.22 0.3.22 0.3.22 0.3.0
+test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.3.22
 for mismatch in chart-readme changelog upgrade; do
-  write_fixture 0.3.21 0.3.21 0.3.21 0.3.21 0.3.0
+  write_fixture 0.3.22 0.3.22 0.3.22 0.3.22 0.3.0
   case "${mismatch}" in
-    chart-readme) sed -i.bak "s/chart \`0.3.21\`/chart \`0.1.23\`/" "${fixture}/charts/steward/README.md" ;;
-    changelog) sed -i.bak 's/\[0.3.21\]/[0.1.23]/' "${fixture}/CHANGELOG.md" ;;
+    chart-readme) sed -i.bak "s/chart \`0.3.22\`/chart \`0.1.23\`/" "${fixture}/charts/steward/README.md" ;;
+    changelog) sed -i.bak 's/\[0.3.22\]/[0.1.23]/' "${fixture}/CHANGELOG.md" ;;
     upgrade) sed -i.bak 's/v0.3.0/v0.1.23/' "${fixture}/docs/installation/upgrade-v0.3.0.md" ;;
   esac
   if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then

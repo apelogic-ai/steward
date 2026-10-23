@@ -2,7 +2,7 @@ apiVersion: v2
 name: openshell
 description: Pinned OpenShell runtime dependency for governed Steward installations
 type: application
-version: 0.3.21
+version: 0.3.22
 appVersion: 0.0.98
 kubeVersion: ">=1.32.0-0"
 home: https://github.com/apelogic-ai/steward

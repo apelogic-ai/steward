@@ -79,7 +79,7 @@ done
 
 missing_receiver_status=0
 missing_receiver_output="$({
-  STEWARD_RELEASE_VERSION=0.3.21 \
+  STEWARD_RELEASE_VERSION=0.3.22 \
     STEWARD_RELEASE_IMAGE_REPOSITORY=registry.example.test/steward \
     STEWARD_RELEASE_CHART_REPOSITORY=oci://registry.example.test/charts/steward \
     STEWARD_RELEASE_CHART_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
