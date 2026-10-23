@@ -14,6 +14,7 @@ ARG FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e66
 ARG TREE_VERSION=2.1.1-2ubuntu3.24.04.2
 ARG TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e
 COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude
+COPY --chmod=0755 build/claude-code-image-state-check.sh /usr/local/libexec/steward/claude-code-image-state-check
 RUN curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
@@ -61,14 +62,7 @@ RUN curl --fail --silent --show-error --location \
 
 USER sandbox
 RUN test "$(/usr/bin/claude --version)" = "2.1.222 (Claude Code)" \
-    && test ! -e "$HOME/.claude.json" \
-    && test ! -e "$HOME/.claude/.credentials.json" \
-    && test ! -e "$HOME/.credentials.json" \
-    && test ! -e "$HOME/.config/claude" \
-    && ! find "$HOME/.claude" -type f -name 'settings*.json' \
-        -exec grep -El '"(apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_SECURITY_TOKEN)"[[:space:]]*:' {} + \
-        | grep -q . \
-    && ! grep -ERq 'sk-ant-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[A-Z0-9]{16}' "$HOME/.claude" \
+    && /usr/local/libexec/steward/claude-code-image-state-check "$HOME" /etc/claude-code/managed-settings.json \
     && rg --version \
     && jq --version \
     && fd --version \

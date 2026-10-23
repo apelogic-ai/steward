@@ -5,6 +5,7 @@ build
 !build/
 build/*
 !build/claude-code-launcher.sh
+!build/claude-code-image-state-check.sh
 charts
 target
 e2e/target

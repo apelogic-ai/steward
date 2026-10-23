@@ -106,14 +106,7 @@ sandbox_exec /usr/bin/claude --version
 sandbox_exec /bin/sh -c "
 set -eu
 test \"\$(id -u)\" -ne 0
-test ! -e \"\$HOME/.claude.json\"
-test ! -e \"\$HOME/.claude/.credentials.json\"
-test ! -e \"\$HOME/.credentials.json\"
-test ! -e \"\$HOME/.config/claude\"
-! find \"\$HOME/.claude\" -type f -name 'settings*.json' \
-  -exec grep -El '\"(apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_SECURITY_TOKEN)\"[[:space:]]*:' {} + \
-  | grep -q .
-! grep -ERq 'sk-ant-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[A-Z0-9]{16}' \"\$HOME/.claude\"
+/usr/local/libexec/steward/claude-code-image-state-check \"\$HOME\" /etc/claude-code/managed-settings.json
 test -x /usr/local/bin/claude
 test \"\$(/usr/bin/claude --version)\" = \"2.1.222 (Claude Code)\"
 

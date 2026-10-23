@@ -1798,6 +1798,11 @@ mod tests {
             .map_err(|error| format!("Docker build context policy is required: {error}"))?;
         let launcher = fs::read_to_string(root().join("build/claude-code-launcher.sh"))
             .map_err(|error| format!("Claude Code fail-closed launcher is required: {error}"))?;
+        let image_state_checker =
+            fs::read_to_string(root().join("build/claude-code-image-state-check.sh"))
+                .map_err(|error| format!("Claude Code image-state checker is required: {error}"))?;
+        let refusal_tests = fs::read_to_string(root().join("scripts/test-claude-code-launcher.sh"))
+            .map_err(|error| format!("Claude Code refusal tests are required: {error}"))?;
         let governed_probe =
             fs::read_to_string(root().join("scripts/claude-code-reference-runtime-e2e.sh"))
                 .map_err(|error| {
@@ -1837,20 +1842,38 @@ mod tests {
             "COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude",
             "build/claude-code-image-state-check.sh",
             "USER sandbox",
-            "test ! -e \"$HOME/.claude.json\"",
-            "test ! -e \"$HOME/.claude/.credentials.json\"",
-            "test ! -e \"$HOME/.credentials.json\"",
-            "test ! -e \"$HOME/.config/claude\"",
-            "settings*.json",
-            "apiKeyHelper",
-            "AWS_ACCESS_KEY_ID",
-            "sk-ant-",
+            "/usr/local/libexec/steward/claude-code-image-state-check \"$HOME\" /etc/claude-code/managed-settings.json",
         ] {
             assert!(
                 container.contains(required),
                 "Claude Code reference runtime must retain {required}"
             );
         }
+        for required in [
+            ".claude.json",
+            ".claude/.credentials.json",
+            ".credentials.json",
+            ".config/claude",
+            "settings*.json",
+            "apiKeyHelper",
+            "ANTHROPIC_AUTH_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "sk-ant-",
+            "settings_status",
+            "credential_status",
+        ] {
+            assert!(
+                image_state_checker.contains(required),
+                "Claude Code image-state checker must retain {required}"
+            );
+        }
+        assert!(
+            !image_state_checker.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("! find") || line.starts_with("! grep")
+            }),
+            "Claude Code image-state checks must not use set-e-immune negated commands"
+        );
         for fixture in [
             "clean-skills",
             "api-key-helper",
@@ -1860,9 +1883,7 @@ mod tests {
             "managed-settings",
         ] {
             assert!(
-                fs::read_to_string(root().join("scripts/test-claude-code-launcher.sh"))
-                    .map_err(|error| format!("Claude Code refusal tests are required: {error}"))?
-                    .contains(fixture),
+                refusal_tests.contains(fixture),
                 "Claude Code image-state tests must cover {fixture}"
             );
         }
@@ -1884,6 +1905,12 @@ mod tests {
                 .lines()
                 .any(|line| line == "!build/claude-code-launcher.sh"),
             "the Docker build context must include the Claude Code launcher"
+        );
+        assert!(
+            dockerignore
+                .lines()
+                .any(|line| line == "!build/claude-code-image-state-check.sh"),
+            "the Docker build context must include the Claude Code image-state checker"
         );
 
         for required in [
@@ -1915,14 +1942,7 @@ mod tests {
             "check_refusal nonessential-traffic-enabled",
             "check_refusal alternate-auth",
             "test \\\"\\$(id -u)\\\" -ne 0",
-            "test ! -e \\\"\\$HOME/.claude.json\\\"",
-            "test ! -e \\\"\\$HOME/.claude/.credentials.json\\\"",
-            "test ! -e \\\"\\$HOME/.credentials.json\\\"",
-            "test ! -e \\\"\\$HOME/.config/claude\\\"",
-            "settings*.json",
-            "apiKeyHelper",
-            "AWS_ACCESS_KEY_ID",
-            "sk-ant-",
+            "/usr/local/libexec/steward/claude-code-image-state-check \\\"\\$HOME\\\" /etc/claude-code/managed-settings.json",
             "rg --version",
             "jq --version",
             "fd --version",
