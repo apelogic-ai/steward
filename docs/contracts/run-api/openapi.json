@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.3.21"
+    "version": "0.3.22"
   },
   "paths": {
     "/admin/api/v1/all-runs": {
