@@ -47,8 +47,10 @@ for chart in ${charts}; do
 
   chart_version="$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*$/\1/p' "${prepared}/Chart.yaml")"
   package="${fixture}/packages/${chart}-${chart_version}.tgz"
+  package_contents="${fixture}/${chart}-package-contents.txt"
+  tar -tzf "${package}" >"${package_contents}"
   for packaged_file in LICENSE THIRD_PARTY_NOTICES.md; do
-    if ! tar -tzf "${package}" | grep -Fxq "${chart}/${packaged_file}"; then
+    if ! grep -Fxq "${chart}/${packaged_file}" "${package_contents}"; then
       echo "${chart} package omitted ${packaged_file}" >&2
       exit 1
     fi
