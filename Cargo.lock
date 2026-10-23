@@ -4104,6 +4104,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-logging"
+version = "0.3.21"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "steward-mint"
 version = "0.3.21"
 dependencies = [
