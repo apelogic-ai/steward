@@ -135,23 +135,39 @@ STEWARD_BUNDLE_RELEASE_VERSION="${release_version}" \
 (cd "${run_dir}" && helm package charts/steward-bundle --destination . \
   --version "${release_version}" --app-version "${release_version}" >/dev/null)
 bundle_archive="${run_dir}/steward-bundle-${release_version}.tgz"
+bundle_values="${run_dir}/steward-bundle-values.yaml"
+helm show values "${bundle_archive}" >"${bundle_values}"
+if [[ "$(awk '
+  $1 == "repository:" && $0 ~ /^    / { print $2; exit }
+' "${bundle_values}")" != "${runtime_repository}" ]]; then
+  echo 'candidate bundle values omitted the release image repository' >&2
+  exit 1
+fi
+for component_digest in \
+  "apiserver apiserver ${api_digest}" \
+  "controller controller ${controller_digest}" \
+  "mint mint ${mint_digest}" \
+  "web web ${web_digest}" \
+  "triggerReceiver trigger-receiver ${trigger_receiver_digest}"; do
+  read -r component suffix digest <<<"${component_digest}"
+  values="$(awk -v component="${component}" '
+    $1 == component ":" && $0 ~ /^    / { active = 1; next }
+    active && $1 == "tag:" { tag = $2 }
+    active && $1 == "digest:" { print tag, $2; exit }
+  ' "${bundle_values}")"
+  if [[ "${values}" != "${release_version}-${suffix} ${digest}" ]]; then
+    echo "candidate bundle values omitted the ${suffix} release image" >&2
+    exit 1
+  fi
+done
 bundle_render="${run_dir}/steward-bundle-rendered.yaml"
 helm template candidate-bundle "${bundle_archive}" --namespace steward-test \
   >"${bundle_render}"
-for component_digest in \
-  "apiserver ${api_digest}" \
-  "controller ${controller_digest}" \
-  "mint ${mint_digest}" \
-  "web ${web_digest}" \
-  "trigger-receiver ${trigger_receiver_digest}"; do
-  read -r component digest <<<"${component_digest}"
-  grep -Fq \
-    "${runtime_repository}:${release_version}-${component}@${digest}" \
-    "${bundle_render}" || {
-      echo "candidate bundle omitted the ${component} release image" >&2
-      exit 1
-    }
-done
+if ! grep -Fq "${runtime_repository}:${release_version}-" "${bundle_render}" \
+  || grep -Fq 'ghcr.io/apelogic-ai/steward:' "${bundle_render}"; then
+  echo 'candidate bundle render omitted active Steward release images' >&2
+  exit 1
+fi
 bundle_push="$(
   helm push "${bundle_archive}" "oci://${registry_address}/charts" --plain-http 2>&1
 )"

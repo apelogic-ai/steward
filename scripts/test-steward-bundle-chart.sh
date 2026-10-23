@@ -62,9 +62,13 @@ STEWARD_BUNDLE_RELEASE_VERSION=9.8.7 \
   STEWARD_BUNDLE_RELEASE_WEB_DIGEST="sha256:$(printf 'd%.0s' {1..64})" \
   STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="sha256:$(printf 'e%.0s' {1..64})" \
   bash "${root}/scripts/prepare-steward-bundle-chart.sh" "${release_prepared}"
+helm package "${release_prepared}" --destination "${fixture}" \
+  --version 9.8.7 --app-version 9.8.7 >/dev/null
+release_values="${fixture}/steward-bundle-release-values.yaml"
+helm show values "${fixture}/steward-bundle-9.8.7.tgz" >"${release_values}"
 if [[ "$(awk '
   $1 == "repository:" && $0 ~ /^    / { print $2; exit }
-' "${release_prepared}/values.yaml")" != registry.example.test/steward ]]; then
+' "${release_values}")" != registry.example.test/steward ]]; then
   echo 'prepared release bundle omitted its release image repository' >&2
   exit 1
 fi
@@ -79,7 +83,7 @@ for component_digest in \
     $1 == component ":" && $0 ~ /^    / { active = 1; next }
     active && $1 == "tag:" { tag = $2 }
     active && $1 == "digest:" { print tag, $2; exit }
-  ' "${release_prepared}/values.yaml")"
+  ' "${release_values}")"
   if [[ "${values}" != "9.8.7-${suffix} sha256:${digest}" ]]; then
     echo "prepared release bundle omitted ${component} release evidence" >&2
     exit 1

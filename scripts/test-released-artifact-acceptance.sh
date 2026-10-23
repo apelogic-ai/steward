@@ -104,6 +104,9 @@ for required in \
   'scripts/prepare-steward-bundle-chart.sh' \
   "STEWARD_BUNDLE_RELEASE_IMAGE_REPOSITORY=\"\${runtime_repository}\"" \
   'for dependency_chart in spire agent-sandbox openshell litellm arc' \
+  "helm show values \"\${bundle_archive}\"" \
+  'candidate bundle values omitted the' \
+  'candidate bundle render omitted active Steward release images' \
   'helm template candidate-bundle' \
   "bash \"\${root}/scripts/steward-bundle-kind-smoke.sh\" \"\${bundle_archive}\"" \
   '--plain-http 2>&1' \
