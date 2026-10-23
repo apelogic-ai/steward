@@ -286,6 +286,113 @@ jobs:
             dist/codex-reference-runtime.spdx.json
           if-no-files-found: error
 
+  publish-claude-code-reference-runtime:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve release version
+        id: version
+        run: printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish Claude Code reference runtime
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: build/claude-code-reference.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime:2.1.222-steward-${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=2.1.222-steward-${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=steward-claude-code-runtime
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=steward-claude-code-reference-runtime
+          cache-to: type=gha,mode=max,scope=steward-claude-code-reference-runtime
+
+      - name: Record Claude Code reference runtime digest
+        run: |
+          mkdir -p dist
+          printf '%s\n' '${{ steps.build.outputs.digest }}' > dist/claude-code-reference-runtime.digest
+
+      - name: Generate Claude Code reference runtime SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime@${{ steps.build.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          output-file: dist/claude-code-reference-runtime.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate Claude Code reference runtime vulnerability report
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime@${{ steps.build.outputs.digest }}
+          trivy-config: security/claude-code-reference-runtime.trivy.yaml
+          format: json
+          output: dist/claude-code-reference-runtime.vulnerabilities.json
+          exit-code: "0"
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Retain Claude Code reference runtime vulnerability report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-claude-code-reference-runtime-vulnerability-report
+          path: dist/claude-code-reference-runtime.vulnerabilities.json
+          if-no-files-found: error
+
+      - name: Enforce critical Claude Code reference runtime vulnerability policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime@${{ steps.build.outputs.digest }}
+          trivy-config: security/claude-code-reference-runtime.trivy.yaml
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Attest Claude Code reference runtime provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload Claude Code reference runtime evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-claude-code-reference-runtime
+          path: |
+            dist/claude-code-reference-runtime.digest
+            dist/claude-code-reference-runtime.spdx.json
+          if-no-files-found: error
+
   publish-provider-profile-bundle:
     needs: validate
     runs-on: ubuntu-latest
@@ -569,13 +676,14 @@ jobs:
           bash scripts/customer-core-install-e2e.sh
 
   release:
-    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, publish-claude-code-reference-runtime, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
         needs.publish-images.result == 'success' &&
         needs.publish-provider-profile-bundle.result == 'success' &&
         needs.publish-codex-reference-runtime.result == 'success' &&
+        needs.publish-claude-code-reference-runtime.result == 'success' &&
         needs.publish-platform-preflight-bundle.result == 'success' &&
         needs.registry-mirror-conformance.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
@@ -636,9 +744,11 @@ jobs:
           test "$version" = "0.3.21"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
+          claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           bridge_digest="$(cat dist/bridge.digest)"
           codex_digest="$(cat dist/codex-reference-runtime.digest)"
+          claude_code_digest="$(cat dist/claude-code-reference-runtime.digest)"
           provider_profile_bundle_asset="steward-runtime-providers-${version}.tar.gz"
           provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
           platform_preflight_bundle_digest="$(cat dist/platform-preflight-bundle.digest)"
@@ -661,6 +771,8 @@ jobs:
             --arg image_repository "$repository" \
             --arg codex_reference "${codex_repository}:0.140.0-steward-${version}" \
             --arg codex_digest "$codex_digest" \
+            --arg claude_code_reference "${claude_code_repository}:2.1.222-steward-${version}" \
+            --arg claude_code_digest "$claude_code_digest" \
             --arg apiserver_digest "$(cat dist/apiserver.digest)" \
             --arg controller_digest "$(cat dist/controller.digest)" \
             --arg mint_digest "$(cat dist/mint.digest)" \
@@ -697,6 +809,13 @@ jobs:
                   version: "0.140.0",
                   reference: $codex_reference,
                   digest: $codex_digest,
+                  platform: "linux/amd64"
+                },
+                claudeCode: {
+                  agentRef: "claude-code@2.1.222",
+                  version: "2.1.222",
+                  reference: $claude_code_reference,
+                  digest: $claude_code_digest,
                   platform: "linux/amd64"
                 }
               },
@@ -794,6 +913,8 @@ jobs:
             printf '| Agent | Platform | Reference | Digest |\n|---|---|---|---|\n'
             printf '| codex@0.140.0 | linux/amd64 | %s:0.140.0-steward-%s | %s |\n' \
               "$codex_repository" "$version" "$codex_digest"
+            printf '| claude-code@2.1.222 | linux/amd64 | %s:2.1.222-steward-%s | %s |\n' \
+              "$claude_code_repository" "$version" "$claude_code_digest"
             printf '\n## Stable bridge provenance inputs\n\n'
             printf 'Bridge image: %s@%s\n\n' "$repository" "$bridge_digest"
             printf 'Bridge signer identity: %s\n\n' "$bridge_signer_identity"
@@ -879,6 +1000,8 @@ jobs:
           done
           docker buildx imagetools inspect \
             "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)"
+          docker buildx imagetools inspect \
+            "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime@$(cat dist/claude-code-reference-runtime.digest)"
           helm pull "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward" \
             --version "${GITHUB_REF_NAME#v}" \
             --destination "$RUNNER_TEMP"
