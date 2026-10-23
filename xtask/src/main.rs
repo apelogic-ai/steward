@@ -5130,7 +5130,6 @@ mod tests {
 
         for refused_probe in [
             "assert_denied_route POST /cli/run/extra",
-            "assert_denied_route POST '/cli/run?escape=1'",
             "assert_denied_route GET /cli/run",
             "assert_denied_route POST /cli/other",
         ] {
@@ -5139,6 +5138,10 @@ mod tests {
                 "G-1 must retain the route escape probe: {refused_probe}"
             );
         }
+        assert!(
+            script.contains("assert_upstream_rejects_query POST '/cli/run?escape=1'"),
+            "G-1 must prove that the endpoint rejects an unexpected query on an allowed route"
+        );
         assert!(
             script.contains("https://docs.rs"),
             "G-1 must retain an alternate-host escape probe"
