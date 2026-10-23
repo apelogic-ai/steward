@@ -1794,6 +1794,8 @@ mod tests {
             .map_err(|error| {
             format!("Claude Code reference runtime build is required: {error}")
         })?;
+        let dockerignore = fs::read_to_string(root().join(".dockerignore"))
+            .map_err(|error| format!("Docker build context policy is required: {error}"))?;
         let launcher = fs::read_to_string(root().join("build/claude-code-launcher.sh"))
             .map_err(|error| format!("Claude Code fail-closed launcher is required: {error}"))?;
         let governed_probe =
@@ -1830,6 +1832,8 @@ mod tests {
             "sha256sum --check --strict",
             "COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude",
             "USER sandbox",
+            "test ! -e \"$HOME/.claude.json\"",
+            "test ! -e \"$HOME/.claude\"",
         ] {
             assert!(
                 container.contains(required),
@@ -1839,14 +1843,22 @@ mod tests {
         for forbidden in [
             "ENV ANTHROPIC_API_KEY",
             "ENV ANTHROPIC_AUTH_TOKEN",
-            ".credentials.json",
-            ".claude.json",
+            "COPY .credentials.json",
+            "ADD .credentials.json",
+            "COPY .claude.json",
+            "ADD .claude.json",
         ] {
             assert!(
                 !container.contains(forbidden),
                 "Claude Code reference image must not persist {forbidden}"
             );
         }
+        assert!(
+            dockerignore
+                .lines()
+                .any(|line| line == "!build/claude-code-launcher.sh"),
+            "the Docker build context must include the Claude Code launcher"
+        );
 
         for required in [
             "ANTHROPIC_BASE_URL",
