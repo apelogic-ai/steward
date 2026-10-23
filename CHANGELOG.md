@@ -9,6 +9,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- The Helm chart can opt the API server, controller, Mint, and Trigger receiver into one JSON
+  object per log line with stable `level`, `component`, `request_id`, and `message` fields by
+  setting `logging.format=json`; plain text remains the default. Both formats replace
+  authorization headers, bearer and secret-shaped tokens, password-bearing database URLs, and
+  email addresses with `[redacted]` without stopping the component. The Next.js web server keeps
+  its existing runtime log format; #621 tracks equivalent structured web logs.
 - Releases now include a `linux/amd64` Claude Code reference runtime for 2.1.222, its immutable digest,
   SBOM, vulnerability report, and provenance. The non-root image includes the same pinned read
   tools as the Codex runtime and uses the existing `claude-code-v1` execution binding. Its launcher

@@ -20,6 +20,7 @@ members = [
     "crates/steward-admission",
     "crates/steward-apiserver",
     "crates/steward-controller",
+    "crates/steward-logging",
     "crates/steward-mint",
     "crates/steward-ports",
     "crates/steward-store",

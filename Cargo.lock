@@ -3933,6 +3933,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "steward-logging",
  "steward-ports",
  "steward-types",
  "tokio",
@@ -3989,6 +3990,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "steward-logging",
  "steward-ports",
  "steward-types",
  "tokio",
@@ -4035,6 +4037,7 @@ dependencies = [
  "steward-adapter-github-artifact",
  "steward-adapter-mcp-gw",
  "steward-admission",
+ "steward-logging",
  "steward-ports",
  "steward-store",
  "steward-types",
@@ -4062,6 +4065,7 @@ dependencies = [
  "steward-adapter-jira",
  "steward-admission",
  "steward-apiserver",
+ "steward-logging",
  "steward-store",
  "steward-types",
  "tokio",
@@ -4078,6 +4082,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "steward-admission",
+ "steward-logging",
  "steward-ports",
  "steward-store",
  "steward-types",
@@ -4096,11 +4101,20 @@ dependencies = [
  "steward-adapter-litellm",
  "steward-adapter-openshell",
  "steward-controller",
+ "steward-logging",
  "steward-ports",
  "steward-store",
  "steward-types",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "steward-logging"
+version = "0.3.21"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4133,6 +4147,7 @@ dependencies = [
  "serde_json",
  "steward-adapter-openshell",
  "steward-adapter-spire",
+ "steward-logging",
  "steward-mint",
  "steward-store",
  "steward-types",
@@ -4159,6 +4174,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "steward-admission",
+ "steward-logging",
  "steward-types",
  "tokio",
  "uuid",
@@ -4182,6 +4198,7 @@ dependencies = [
  "steward-adapter-openshell",
  "steward-admission",
  "steward-apiserver",
+ "steward-logging",
  "steward-ports",
  "steward-store",
  "steward-types",

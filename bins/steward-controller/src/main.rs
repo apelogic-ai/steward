@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,7 +107,18 @@ impl InferencePlane for DeploymentInferencePlane {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    steward_logging::init("steward-controller");
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            steward_logging::error!("Error: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     rustls_crypto_provider::install()?;
     if env::args().nth(1).as_deref() == Some("validate-jira-config") {
         jira_adapter()?;
@@ -327,7 +339,7 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
     let stable_bridge_image = verified_stable_bridge_image_configuration()?;
     let bridge_artifact = verified_connections_bridge_image_configuration()?;
     if let Some(artifact) = bridge_artifact.as_ref() {
-        eprintln!("{}", connections_bridge_startup_log(artifact));
+        steward_logging::info!("{}", connections_bridge_startup_log(artifact));
     }
     let bridge_image = bridge_artifact
         .as_ref()
@@ -724,7 +736,7 @@ fn completed_handshake(result: JoinedHandshake) -> Option<TlsConnection> {
     match result {
         Some(Ok(connection)) => connection,
         Some(Err(error)) => {
-            eprintln!("webhook TLS handshake task failed: {error}");
+            steward_logging::error!("webhook TLS handshake task failed: {error}");
             None
         }
         None => None,
@@ -752,18 +764,18 @@ impl Listener for TlsListener {
                             match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                                 Ok(Ok(stream)) => Some((stream, address)),
                                 Ok(Err(error)) => {
-                                    eprintln!("webhook TLS handshake failed: {error}");
+                                    steward_logging::error!("webhook TLS handshake failed: {error}");
                                     None
                                 }
                                 Err(_) => {
-                                    eprintln!("webhook TLS handshake timed out");
+                                    steward_logging::error!("webhook TLS handshake timed out");
                                     None
                                 }
                             }
                         });
                     }
                     Err(error) => {
-                        eprintln!("webhook listener accept failed: {error}");
+                        steward_logging::error!("webhook listener accept failed: {error}");
                         sleep(Duration::from_secs(1)).await;
                     }
                 },

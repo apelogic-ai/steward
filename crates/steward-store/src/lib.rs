@@ -11956,7 +11956,7 @@ impl PgStore {
                 }
                 Err(error) => {
                     transaction.rollback().await.map_err(database_error)?;
-                    eprintln!(
+                    steward_logging::error!(
                         "personal agent turn context could not be read; turn_id={turn_id}: {error}"
                     );
                     self.fail_unreadable_personal_agent_turn(turn_id).await?;
@@ -16348,7 +16348,7 @@ fn lenient_caller_reference_from_row(
         reference.and_then(|Json(value)| match serde_json::from_value(value) {
             Ok(reference) => Some(reference),
             Err(_) => {
-                eprintln!("ignored invalid persisted Task caller reference");
+                steward_logging::warn!("ignored invalid persisted Task caller reference");
                 None
             }
         }),

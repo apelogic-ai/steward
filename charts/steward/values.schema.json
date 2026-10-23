@@ -6,6 +6,7 @@
     "images",
     "execution",
     "inference",
+    "logging",
     "web",
     "triggerReceiver",
     "secrets",
@@ -44,6 +45,14 @@
       "required": ["mode"],
       "properties": {
         "mode": {"enum": ["stock", "managed"]}
+      }
+    },
+    "logging": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format"],
+      "properties": {
+        "format": {"enum": ["plain", "json"]}
       }
     },
     "images": {

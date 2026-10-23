@@ -494,7 +494,9 @@ impl WorkloadExchangeClient {
                 let cleanup = self.clone();
                 tokio::spawn(async move {
                     if let Err(error) = cleanup.finalize(&base, tokens.as_ref()).await {
-                        eprintln!("timed-out Task finalization ended with a {error:?} failure");
+                        steward_logging::error!(
+                            "timed-out Task finalization ended with a {error:?} failure"
+                        );
                     }
                 });
                 Err(TaskLifecycleError::Retriable)

@@ -3693,6 +3693,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "steward-logging",
  "steward-ports",
  "steward-types",
  "tokio",
@@ -3729,6 +3730,7 @@ dependencies = [
  "steward-adapter-github-artifact",
  "steward-adapter-mcp-gw",
  "steward-admission",
+ "steward-logging",
  "steward-ports",
  "steward-store",
  "steward-types",
@@ -3748,6 +3750,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "steward-admission",
+ "steward-logging",
  "steward-ports",
  "steward-store",
  "steward-types",
@@ -3781,6 +3784,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-logging"
+version = "0.3.21"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "steward-ports"
 version = "0.3.21"
 dependencies = [
@@ -3799,6 +3810,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "steward-admission",
+ "steward-logging",
  "steward-types",
  "uuid",
  "zeroize",

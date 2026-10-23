@@ -880,8 +880,8 @@ pub async fn run_controller_with_planes_config<
         let runtime_controller =
             run_controller_inner(client, sandbox_runtime, inference, Some(authority), config);
         tokio::select! {
-            () = task_controller => eprintln!("task controller exited"),
-            () = runtime_controller => eprintln!("runtime controller exited"),
+            () = task_controller => steward_logging::error!("task controller exited"),
+            () = runtime_controller => steward_logging::error!("runtime controller exited"),
         }
     } else {
         run_controller_inner(client, sandbox_runtime, inference, Some(authority), config).await;
@@ -944,14 +944,14 @@ async fn run_task_controller<R: SandboxTaskRuntime>(
                             });
                         }
                     }
-                    Err(error) => eprintln!("task queue read failed: {error}"),
+                    Err(error) => steward_logging::error!("task queue read failed: {error}"),
                 }
             }
             completed = scheduler.next(), if !scheduler.is_empty() => {
                 if let Some((_, result)) = completed
                     && let Err(error) = result
                 {
-                    eprintln!("task reconcile error: {error}");
+                    steward_logging::error!("task reconcile error: {error}");
                 }
             }
         }
@@ -1148,7 +1148,7 @@ pub async fn run_task_approval_dispatcher<D: DecisionChannel>(authority: PgStore
         {
             Ok(delivered) => !delivered,
             Err(error) => {
-                eprintln!("task approval delivery failed: {error}");
+                steward_logging::error!("task approval delivery failed: {error}");
                 true
             }
         };
@@ -1484,7 +1484,8 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
                 .fail_connection_operation(connection.operation_id, "binding_mismatch", None)
                 .await
                 .map_err(TaskControllerError::Store)?;
-            eprintln!(
+            steward_logging::error!(
+                request_id = task.task_uid,
                 "{}",
                 connection_operation_failure_log_line(connection.operation_id, "binding_mismatch")
             );
@@ -1606,7 +1607,8 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
     }) = &result
     {
         let exit_code = exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string());
-        eprintln!(
+        steward_logging::error!(
+            request_id = task.task_uid,
             "task preparation failed: task_uid={} step={step} category={category} exit_code={exit_code}",
             task.task_uid,
         );
@@ -2383,7 +2385,8 @@ fn classify_runtime_create_status(status_code: Option<u16>) -> RuntimeCreateErro
 }
 
 fn log_runtime_create_rejection(operation_id: impl fmt::Display, status_code: u16) {
-    eprintln!(
+    steward_logging::error!(
+        request_id = operation_id,
         "Task runtime CREATE rejected: operation_id={operation_id} status_class=4xx \
          status_code={status_code} failure_category=runtime_create_admission_rejected"
     );
@@ -3943,7 +3946,7 @@ async fn run_controller_inner<R: SandboxRuntime, I: InferencePlane>(
         .run(reconcile, error_policy, context)
         .for_each(|result| async move {
             match result {
-                Ok(reference) => eprintln!("reconciled {reference:?}"),
+                Ok(reference) => steward_logging::info!("reconciled {reference:?}"),
                 Err(error) => {
                     let should_log = match &error {
                         RuntimeControllerError::ReconcilerFailed(error, _) => {
@@ -3952,7 +3955,7 @@ async fn run_controller_inner<R: SandboxRuntime, I: InferencePlane>(
                         _ => true,
                     };
                     if should_log {
-                        eprintln!("reconcile error: {error}");
+                        steward_logging::error!("reconcile error: {error}");
                     }
                 }
             }
@@ -5240,11 +5243,13 @@ async fn finalize_inference_if_required<I: InferencePlane>(
     {
         Ok(Ok(spend)) => spend,
         Ok(Err(_)) => {
-            eprintln!("final inference spend observation failed; continuing with key revocation");
+            steward_logging::error!(
+                "final inference spend observation failed; continuing with key revocation"
+            );
             None
         }
         Err(_) => {
-            eprintln!(
+            steward_logging::error!(
                 "final inference spend observation timed out; continuing with key revocation"
             );
             None

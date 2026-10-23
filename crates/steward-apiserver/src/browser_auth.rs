@@ -617,7 +617,7 @@ impl BrowserAuthService {
             provider,
             user_tokens: None,
             identities,
-            request_audit_reporter: Arc::new(|line| eprintln!("{line}")),
+            request_audit_reporter: Arc::new(|line| steward_logging::info!("{line}")),
             registry: BrowserSessionRegistry::default(),
             auto_create_users: true,
             config: BrowserAuthConfig {
@@ -678,7 +678,7 @@ impl BrowserAuthService {
             provider,
             user_tokens: None,
             identities,
-            request_audit_reporter: Arc::new(|line| eprintln!("{line}")),
+            request_audit_reporter: Arc::new(|line| steward_logging::info!("{line}")),
             registry: BrowserSessionRegistry::default(),
             auto_create_users: true,
             config: BrowserAuthConfig {
