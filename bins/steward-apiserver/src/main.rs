@@ -2841,7 +2841,7 @@ autoProvisionThreshold:
             std::process::id(),
             NEXT_PREFLIGHT_CONFIG_TEST_ID.fetch_add(1, Ordering::Relaxed),
         )));
-        let bundle = directory.0.join("provider-profile-bundle/v1.2.2");
+        let bundle = directory.0.join("provider-profile-bundle/v1.3.0");
         let installer = bundle.join("bin/steward-provider-profile");
         let output = directory.0.join("rendered");
         fs::create_dir_all(
@@ -2855,9 +2855,9 @@ autoProvisionThreshold:
             r##"#!/bin/sh
 set -eu
 if [ "$1" = "validate" ]; then
-  printf '%s\n' '{"schemaVersion":"steward.provider-profile-result/v1","operation":"validate","status":"valid","bundle":{"id":"steward-runtime-providers","version":"1.2.2"},"profiles":[{"id":"steward-litellm","digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777"},{"id":"steward-mcp-gw","digest":"sha256:8888888888888888888888888888888888888888888888888888888888888888"}]}'
+  printf '%s\n' '{"schemaVersion":"steward.provider-profile-result/v1","operation":"validate","status":"valid","bundle":{"id":"steward-runtime-providers","version":"1.3.0"},"profiles":[{"id":"steward-litellm","digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777"},{"id":"steward-mcp-gw","digest":"sha256:8888888888888888888888888888888888888888888888888888888888888888"}]}'
 else
-  printf '%s\n' '{"result":{"schemaVersion":"steward.provider-profile-result/v1","operation":"render","status":"valid"},"installation":{"schema":"steward.provider-profile-install-state/v1","bundle":{"id":"steward-runtime-providers","version":"1.2.2"},"profiles":{"steward-litellm":{"endpoints":[{"host":"inference.example.test","port":443,"allowed_ips":["192.0.2.0/24"],"access":"read-write"}],"credentials":[{"token_grant":{"audience":"steward-mcp"}}],"binaries":["/usr/bin/curl"]},"steward-mcp-gw":{"endpoints":[{"host":"mcp.example.test","port":443,"allowed_ips":["192.0.2.0/24"],"rules":[{"allow":{"method":"GET","path":"**"}},{"allow":{"method":"HEAD","path":"**"}},{"allow":{"method":"OPTIONS","path":"**"}},{"allow":{"method":"POST","path":"**"}},{"allow":{"method":"PUT","path":"**"}},{"allow":{"method":"PATCH","path":"**"}},{"allow":{"method":"DELETE","path":"**"}}]}],"credentials":[{"token_grant":{"audience":"steward-mcp"}}],"binaries":["/usr/bin/curl","/usr/local/bin/steward-connections-bridge"]}}}}'
+  printf '%s\n' '{"result":{"schemaVersion":"steward.provider-profile-result/v1","operation":"render","status":"valid"},"installation":{"schema":"steward.provider-profile-install-state/v1","bundle":{"id":"steward-runtime-providers","version":"1.3.0"},"profiles":{"steward-litellm":{"endpoints":[{"host":"inference.example.test","port":443,"allowed_ips":["192.0.2.0/24"],"access":"read-write"}],"credentials":[{"token_grant":{"audience":"steward-mcp"}}],"binaries":["/usr/bin/curl"]},"steward-mcp-gw":{"endpoints":[{"host":"mcp.example.test","port":443,"allowed_ips":["192.0.2.0/24"],"rules":[{"allow":{"method":"POST","path":"/mcp"}},{"allow":{"method":"DELETE","path":"/mcp"}},{"allow":{"method":"POST","path":"/cli/run"}},{"allow":{"method":"POST","path":"/cli/jobs"}},{"allow":{"method":"POST","path":"/shell/run"}},{"allow":{"method":"POST","path":"/shell/jobs"}}]}],"credentials":[{"token_grant":{"audience":"steward-mcp"}}],"binaries":["/usr/bin/curl","/usr/local/bin/steward-connections-bridge","/usr/local/bin/mcp-gw-sandbox-helper"]}}}}'
 fi
 "##,
         )
