@@ -125,6 +125,13 @@
                 "defaults": {
                   "type": "object",
                   "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+                },
+                "clusters": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "object",
+                    "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+                  }
                 }
               }
             },
@@ -161,6 +168,24 @@
                 "image": {"$ref": "#/definitions/digestTagImage"},
                 "extraEnvVars": {"type": "array", "maxItems": 0}
               }
+            }
+          }
+        },
+        "spiffe-oidc-discovery-provider": {
+          "type": "object",
+          "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+        },
+        "upstream-spire-agent": {
+          "type": "object",
+          "properties": {"extraEnvVars": {"type": "array", "maxItems": 0}}
+        },
+        "upstream-spiffe-csi-driver": {
+          "type": "object",
+          "properties": {
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "nodeDriverRegistrar": {
+              "type": "object",
+              "properties": {"extraEnvVars": {"type": "array", "maxItems": 0}}
             }
           }
         }

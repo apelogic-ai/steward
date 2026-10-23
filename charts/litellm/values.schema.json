@@ -15,6 +15,7 @@
         "masterkeySecretName": {"$ref": "#/definitions/name"},
         "masterkeySecretKey": {"$ref": "#/definitions/key"},
         "environmentSecrets": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/name"}},
+        "environmentConfigMaps": {"type": "array", "maxItems": 0},
         "envVars": {"type": "object", "maxProperties": 0},
         "extraEnvVars": {"type": "object", "maxProperties": 0},
         "extraResources": {"type": "array", "maxItems": 0},

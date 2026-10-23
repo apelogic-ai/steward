@@ -17,8 +17,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   release publishes each chart as its own OCI artifact alongside Steward and
   lists their immutable coordinates in the release handoff. SPIRE CRDs are
   installed before dependent resources, agent-sandbox wraps its upstream Helm
-  chart, and LiteLLM refuses credential-shaped environment values and database
-  URLs containing passwords; its default workload security contexts satisfy a
+  chart, and the LiteLLM, SPIRE, and Actions Runner Controller wrappers refuse
+  free-form environment inputs. LiteLLM also refuses database URLs containing
+  passwords; its default workload security contexts satisfy a
   restricted Pod Security profile. OpenShell's optional GRPCRoute requires an
   existing Gateway and hostname; streaming timeouts remain configured on the
   Gateway or backend because GRPCRoute has no timeout field. Existing Steward

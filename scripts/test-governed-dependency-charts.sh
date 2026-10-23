@@ -356,7 +356,9 @@ assert_refused litellm "an inline DATABASE_URL environment variable" \
 assert_refused litellm "URL user information in an environment variable" \
   --set-string "litellm.envVars.MODEL_ENDPOINT=${inline_https_url}"
 assert_refused litellm "an inline extra environment variable" \
-  --set-json 'litellm.extraEnvVars=[{"name":"OPENAI_API_KEY","value":"inline"}]'
+  --set-json 'litellm.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline"}]'
+assert_refused litellm "an environment ConfigMap" \
+  --set-string 'litellm.environmentConfigMaps[0]=inline-settings'
 assert_refused litellm "a password-bearing database URL" \
   --set-string "litellm.db.url=${inline_db_url}"
 assert_refused litellm "an inline read-replica database URL" \
@@ -412,12 +414,26 @@ assert_refused spire "a free-form controller environment variable" \
   --set-json 'spire.spire-server.controllerManager.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 assert_refused spire "a free-form external-controller environment variable" \
   --set-json 'spire.spire-server.externalControllerManagers.defaults.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a per-cluster external-controller environment variable" \
+  --set-json 'spire.spire-server.externalControllerManagers.clusters.external.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 assert_refused spire "a free-form agent environment variable" \
   --set-json 'spire.spire-agent.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 assert_refused spire "a free-form CSI environment variable" \
   --set-json 'spire.spiffe-csi-driver.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 assert_refused spire "a free-form CSI registrar environment variable" \
   --set-json 'spire.spiffe-csi-driver.nodeDriverRegistrar.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form OIDC environment variable" \
+  --set spire.spiffe-oidc-discovery-provider.enabled=true \
+  --set-json 'spire.spiffe-oidc-discovery-provider.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form upstream-agent environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json 'spire.upstream-spire-agent.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form upstream CSI environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json 'spire.upstream-spiffe-csi-driver.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form upstream CSI registrar environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json 'spire.upstream-spiffe-csi-driver.nodeDriverRegistrar.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 assert_refused arc "a free-form controller environment variable" \
   --set-json 'arc.env=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 
