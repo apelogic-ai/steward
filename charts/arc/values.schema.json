@@ -19,6 +19,7 @@
             "tag": {"type": "string", "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"}
           }
         },
+        "env": {"type": "array", "maxItems": 0},
         "namespaceOverride": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
       }
     }

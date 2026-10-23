@@ -344,7 +344,10 @@ assert_refused litellm "inline master-key material" \
   --set-string litellm.masterkey=inline-value
 assert_refused litellm "inline credential-shaped environment variable" \
   --set-string litellm.envVars.OPENAI_API_KEY=inline-value
+assert_refused litellm "a free-form environment variable" \
+  --set-string litellm.envVars.LITELLM_MASTER_KEY=inline-value
 inline_material=inline-value
+inline_container='[{"name":"sidecar","image":"registry.example.com/sidecar@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","env":[{"name":"INLINE_SECRET","value":"inline-value"}]}]'
 inline_db_url="$(printf '%s' 'postgresql://' 'alice' ':' "${inline_material}" \
   '@' 'database.example.test/litellm')"
 inline_https_url="$(printf '%s' 'https://' 'alice' ':' "${inline_material}" \
@@ -354,7 +357,19 @@ assert_refused litellm "an inline DATABASE_URL environment variable" \
 assert_refused litellm "URL user information in an environment variable" \
   --set-string "litellm.envVars.MODEL_ENDPOINT=${inline_https_url}"
 assert_refused litellm "an inline extra environment variable" \
-  --set-json 'litellm.extraEnvVars=[{"name":"OPENAI_API_KEY","value":"inline"}]'
+  --set-json 'litellm.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline"}]'
+assert_refused litellm "an environment ConfigMap" \
+  --set-string 'litellm.environmentConfigMaps[0]=inline-settings'
+assert_refused litellm "an extra container with an inline environment variable" \
+  --set-json "litellm.extraContainers=${inline_container}"
+assert_refused litellm "an extra init container with an inline environment variable" \
+  --set-json "litellm.extraInitContainers=${inline_container}"
+assert_refused litellm "a migration sidecar with an inline environment variable" \
+  --set-json "litellm.migrationJob.extraContainers=${inline_container}"
+assert_refused litellm "a migration init container with an inline environment variable" \
+  --set-json "litellm.migrationJob.extraInitContainers=${inline_container}"
+assert_refused litellm "a replacement command that sets an inline environment variable" \
+  --set-json 'litellm.command=["env","INLINE_SECRET=inline-value","litellm"]'
 assert_refused litellm "a password-bearing database URL" \
   --set-string "litellm.db.url=${inline_db_url}"
 assert_refused litellm "an inline read-replica database URL" \
@@ -404,6 +419,53 @@ assert_refused spire "an inline upstream authority Secret" \
   --set-string spire.spire-server.upstreamAuthority.disk.secret.data.key=inline-value
 assert_refused spire "an inline kubeconfig" \
   --set-string spire.spire-server.kubeConfigs.external.kubeConfig=inline-value
+assert_refused spire "a free-form server environment variable" \
+  --set-json 'spire.spire-server.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a server sidecar with an inline environment variable" \
+  --set-json "spire.spire-server.extraContainers=${inline_container}"
+assert_refused spire "a server init container with an inline environment variable" \
+  --set-json "spire.spire-server.initContainers=${inline_container}"
+assert_refused spire "a free-form controller environment variable" \
+  --set-json 'spire.spire-server.controllerManager.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form external-controller environment variable" \
+  --set-json 'spire.spire-server.externalControllerManagers.defaults.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a per-cluster external-controller environment variable" \
+  --set-json 'spire.spire-server.externalControllerManagers.clusters.external.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form agent environment variable" \
+  --set-json 'spire.spire-agent.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "an agent sidecar with an inline environment variable" \
+  --set-json "spire.spire-agent.extraContainers=${inline_container}"
+assert_refused spire "an agent init container with an inline environment variable" \
+  --set-json "spire.spire-agent.initContainers=${inline_container}"
+assert_refused spire "a free-form CSI environment variable" \
+  --set-json 'spire.spiffe-csi-driver.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form CSI registrar environment variable" \
+  --set-json 'spire.spiffe-csi-driver.nodeDriverRegistrar.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a CSI init container with an inline environment variable" \
+  --set-json "spire.spiffe-csi-driver.initContainers=${inline_container}"
+assert_refused spire "a free-form OIDC environment variable" \
+  --set spire.spiffe-oidc-discovery-provider.enabled=true \
+  --set-json 'spire.spiffe-oidc-discovery-provider.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form upstream-agent environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json 'spire.upstream-spire-agent.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "an upstream-agent sidecar with an inline environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json "spire.upstream-spire-agent.extraContainers=${inline_container}"
+assert_refused spire "an upstream-agent init container with an inline environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json "spire.upstream-spire-agent.initContainers=${inline_container}"
+assert_refused spire "a free-form upstream CSI environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json 'spire.upstream-spiffe-csi-driver.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form upstream CSI registrar environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json 'spire.upstream-spiffe-csi-driver.nodeDriverRegistrar.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "an upstream CSI init container with an inline environment variable" \
+  --set spire.upstream.enabled=true \
+  --set-json "spire.upstream-spiffe-csi-driver.initContainers=${inline_container}"
+assert_refused arc "a free-form controller environment variable" \
+  --set-json 'arc.env=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 
 helm template external-sql "${fixture}/charts/spire" \
   --namespace steward-test \

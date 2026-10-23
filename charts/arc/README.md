@@ -13,7 +13,8 @@ operator-owned inputs.
 | Controller namespace | `arc.namespaceOverride` |
 
 The image tag must include an `@sha256:` digest. The chart creates no
-Namespace and accepts no inline registration credential.
+Namespace, accepts no inline registration credential, and disables free-form
+controller environment inputs.
 
 ## Platform requirements
 

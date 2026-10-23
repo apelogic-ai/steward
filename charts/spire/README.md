@@ -24,6 +24,8 @@ remain disabled.
 Every default-render image tag includes an `@sha256:` digest. The wrapper disables upstream
 namespace creation and lifecycle hooks so no unlisted helper image or Namespace
 is introduced.
+Free-form environment inputs are disabled; use chart configuration and
+referenced Secrets instead.
 
 ## Platform requirements
 
