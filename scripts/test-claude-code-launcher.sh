@@ -73,7 +73,11 @@ for endpoint in \
   https://alice@inference.example.test \
   'https://inference.example.test?target=other' \
   'https://inference.example.test#other' \
-  http://inference.example.test:0
+  http://inference.example.test:0 \
+  http://:4000 \
+  https:///v1 \
+  https://inference.example.test:notaport \
+  https://inference.example.test:65536
 do
   check_refusal malformed-base-url \
     ANTHROPIC_BASE_URL="${endpoint}" \
