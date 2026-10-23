@@ -414,8 +414,11 @@ if [[ ! -d "${fixture}/charts/agent-sandbox/.upstream/agent-sandbox" ]]; then
   echo 'agent-sandbox did not wrap the pinned upstream Helm chart' >&2
   exit 1
 fi
-if find "${fixture}/charts/agent-sandbox/templates" -type f -print -quit \
-  2>/dev/null | grep -q .; then
+agent_wrapper_template="$(
+  find "${fixture}/charts/agent-sandbox/templates" -type f -print -quit \
+    2>/dev/null
+)"
+if [[ -n "${agent_wrapper_template}" ]]; then
   echo 'agent-sandbox contains wrapper-owned workload or hook templates' >&2
   exit 1
 fi

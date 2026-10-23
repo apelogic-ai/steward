@@ -89,7 +89,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "ANTHROPIC_CUSTOM_HEADERS; ",
                 "export ANTHROPIC_BASE_URL=\"$inference_endpoint\"; ",
                 "export ANTHROPIC_API_KEY=openshell-token-grant-placeholder; ",
-                "export DISABLE_UPDATES=1; ",
+                "export DISABLE_AUTOUPDATER=1; ",
                 "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; ",
                 "export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1; ",
                 "mkdir -p \"$CLAUDE_CONFIG_DIR\"; ",
@@ -279,6 +279,8 @@ mod tests {
         let shell = &plan.command[2];
         let mcp_config = &plan.command[7];
         assert!(shell.contains("ANTHROPIC_API_KEY=openshell-token-grant-placeholder"));
+        assert!(shell.contains("export DISABLE_AUTOUPDATER=1"));
+        assert!(!shell.contains("DISABLE_UPDATES"));
         assert!(shell.contains("CLAUDE_CONFIG_DIR=\"$config_dir\""));
         assert!(shell.contains("test \"$(id -u)\" -ne 0"));
         for inherited_selector in [
@@ -344,6 +346,8 @@ mod tests {
                 "test \"$CLAUDE_CONFIG_DIR\" = \"$EXPECTED_CLAUDE_CONFIG_DIR\" || exit 92\n",
                 "test \"$ANTHROPIC_BASE_URL\" = http://inference.example.test:4000 || exit 92\n",
                 "test \"$ANTHROPIC_API_KEY\" = openshell-token-grant-placeholder || exit 93\n",
+                "test \"$DISABLE_AUTOUPDATER\" = 1 || exit 94\n",
+                "test -z \"${DISABLE_UPDATES+x}\" || exit 94\n",
                 "if [ \"$1\" = --version ]; then\n",
                 "  printf '%s\\n' '2.1.222 (Claude Code)'\n",
                 "  exit 0\n",

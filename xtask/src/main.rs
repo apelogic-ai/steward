@@ -126,6 +126,7 @@ fn ci() -> TaskResult {
     run("bash", &["scripts/test-check-litellm-image-pins.sh"])?;
     run("bash", &["scripts/test-governed-dependency-charts.sh"])?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
+    run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
     conformance(&["--pinned".to_owned()])
@@ -1785,6 +1786,232 @@ mod tests {
         assert!(
             workspace.len() <= 19,
             "governed sandbox probe workspace must fit OpenShell's 19-character limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_reference_runtime_is_fail_closed_and_released() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/claude-code-reference.Dockerfile"))
+            .map_err(|error| {
+            format!("Claude Code reference runtime build is required: {error}")
+        })?;
+        let dockerignore = fs::read_to_string(root().join(".dockerignore"))
+            .map_err(|error| format!("Docker build context policy is required: {error}"))?;
+        let launcher = fs::read_to_string(root().join("build/claude-code-launcher.sh"))
+            .map_err(|error| format!("Claude Code fail-closed launcher is required: {error}"))?;
+        let image_state_checker =
+            fs::read_to_string(root().join("build/claude-code-image-state-check.sh"))
+                .map_err(|error| format!("Claude Code image-state checker is required: {error}"))?;
+        let refusal_tests = fs::read_to_string(root().join("scripts/test-claude-code-launcher.sh"))
+            .map_err(|error| format!("Claude Code refusal tests are required: {error}"))?;
+        let governed_probe =
+            fs::read_to_string(root().join("scripts/claude-code-reference-runtime-e2e.sh"))
+                .map_err(|error| {
+                    format!("Claude Code governed runtime probe is required: {error}")
+                })?;
+        let ci_workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("CI workflow is required: {error}"))?;
+        let release_workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("release workflow is required: {error}"))?;
+        let classifier = fs::read_to_string(root().join("scripts/ci-change-class.sh"))
+            .map_err(|error| format!("CI classifier is required: {error}"))?;
+        let trivy =
+            fs::read_to_string(root().join("security/claude-code-reference-runtime.trivy.yaml"))
+                .map_err(|error| format!("Claude Code runtime scan policy is required: {error}"))?;
+        let documentation = fs::read_to_string(
+            root().join("docs/installation/claude-code-reference-runtime.md"),
+        )
+        .map_err(|error| format!("Claude Code runtime documentation is required: {error}"))?;
+        let readme = fs::read_to_string(root().join("README.md"))
+            .map_err(|error| format!("public README is required: {error}"))?;
+        let changelog = fs::read_to_string(root().join("CHANGELOG.md"))
+            .map_err(|error| format!("changelog is required: {error}"))?;
+
+        for required in [
+            "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
+            "@anthropic-ai/claude-code@2.1.222",
+            "2.1.222 (Claude Code)",
+            "tar@7.5.22",
+            "/usr/lib/node_modules/npm/node_modules/tar/package.json",
+            "node --print 'require(\"/usr/lib/node_modules/tar/package.json\").version'",
+            "node --print 'require(\"/usr/lib/node_modules/npm/node_modules/tar/package.json\").version'",
+            "RIPGREP_SHA256=c5ae63c7bee915b1cfc9f0bd07c55b4ce7f2bcd1133cba4da56719aac26101a4",
+            "JQ_SHA256=f59183392f84fe67b407b494d8ba6185e9b0e4a106ffcb369490bd20a83fd40e",
+            "FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e6672d",
+            "TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e",
+            "sha256sum --check --strict",
+            "COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude",
+            "build/claude-code-image-state-check.sh",
+            "USER sandbox",
+            "/usr/local/libexec/steward/claude-code-image-state-check \"$HOME\" /etc/claude-code/managed-settings.json",
+        ] {
+            assert!(
+                container.contains(required),
+                "Claude Code reference runtime must retain {required}"
+            );
+        }
+        for required in [
+            ".claude.json",
+            ".claude/.credentials.json",
+            ".credentials.json",
+            ".config/claude",
+            "settings*.json",
+            "apiKeyHelper",
+            "ANTHROPIC_AUTH_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "sk-ant-",
+            "settings_status",
+            "credential_status",
+        ] {
+            assert!(
+                image_state_checker.contains(required),
+                "Claude Code image-state checker must retain {required}"
+            );
+        }
+        assert!(
+            !image_state_checker.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("! find") || line.starts_with("! grep")
+            }),
+            "Claude Code image-state checks must not use set-e-immune negated commands"
+        );
+        for fixture in [
+            "clean-skills",
+            "api-key-helper",
+            "settings-env-credential",
+            "credential-shaped-string",
+            "credentials-file",
+            "managed-settings",
+        ] {
+            assert!(
+                refusal_tests.contains(fixture),
+                "Claude Code image-state tests must cover {fixture}"
+            );
+        }
+        for forbidden in [
+            "ENV ANTHROPIC_API_KEY",
+            "ENV ANTHROPIC_AUTH_TOKEN",
+            "COPY .credentials.json",
+            "ADD .credentials.json",
+            "COPY .claude.json",
+            "ADD .claude.json",
+        ] {
+            assert!(
+                !container.contains(forbidden),
+                "Claude Code reference image must not persist {forbidden}"
+            );
+        }
+        assert!(
+            dockerignore
+                .lines()
+                .any(|line| line == "!build/claude-code-launcher.sh"),
+            "the Docker build context must include the Claude Code launcher"
+        );
+        assert!(
+            dockerignore
+                .lines()
+                .any(|line| line == "!build/claude-code-image-state-check.sh"),
+            "the Docker build context must include the Claude Code image-state checker"
+        );
+
+        for required in [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "openshell-token-grant-placeholder",
+            "DISABLE_AUTOUPDATER",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "exit 125",
+            "exec /usr/bin/claude",
+        ] {
+            assert!(
+                launcher.contains(required),
+                "Claude Code launcher must enforce {required}"
+            );
+        }
+        assert!(
+            !launcher.contains("${DISABLE_UPDATES-}"),
+            "Claude Code launcher must not rely on the unused legacy update flag"
+        );
+
+        for required in [
+            "check_refusal missing-base-url",
+            "check_refusal missing-placeholder",
+            "check_refusal wrong-placeholder",
+            "check_refusal updates-enabled",
+            "check_refusal nonessential-traffic-enabled",
+            "check_refusal alternate-auth",
+            "test \\\"\\$(id -u)\\\" -ne 0",
+            "/usr/local/libexec/steward/claude-code-image-state-check \\\"\\$HOME\\\" /etc/claude-code/managed-settings.json",
+            "rg --version",
+            "jq --version",
+            "fd --version",
+            "tree --version",
+        ] {
+            assert!(
+                governed_probe.contains(required),
+                "Claude Code governed probe must retain {required}"
+            );
+        }
+
+        for required in [
+            "claude-code-reference-runtime:",
+            "release / Claude Code reference runtime",
+            "build/claude-code-reference.Dockerfile",
+            "bash scripts/claude-code-reference-runtime-e2e.sh",
+            "security/claude-code-reference-runtime.trivy.yaml",
+            "CLAUDE_CODE_REFERENCE_RUNTIME: ${{ needs.claude-code-reference-runtime.result }}",
+            "claude-code-reference-runtime=${CLAUDE_CODE_REFERENCE_RUNTIME}",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "Claude Code runtime CI must retain {required}"
+            );
+        }
+        assert!(
+            classifier.contains("claude-code-reference-runtime    run   skip  skip"),
+            "the fail-safe classifier must require the Claude Code runtime lane for full changes"
+        );
+        assert!(trivy.contains("vulnerability:"));
+
+        for required in [
+            "publish-claude-code-reference-runtime:",
+            "ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime:2.1.222-steward-${{ steps.version.outputs.version }}",
+            "provenance: mode=max",
+            "sbom: true",
+            "claude-code-reference-runtime.digest",
+            "release-claude-code-reference-runtime",
+            "claudeCode:",
+            "agentRef: \"claude-code@2.1.222\"",
+            "platform: \"linux/amd64\"",
+        ] {
+            assert!(
+                release_workflow.contains(required),
+                "release workflow must retain {required}"
+            );
+        }
+
+        for required in [
+            "claude-code@2.1.222",
+            "claude-code-v1",
+            "openshell-token-grant-placeholder",
+            "referenceRuntimes.claudeCode",
+            "docker buildx imagetools create",
+        ] {
+            assert!(
+                documentation.contains(required),
+                "Claude Code runtime documentation must include {required}"
+            );
+        }
+        assert!(
+            readme.contains("docs/installation/claude-code-reference-runtime.md"),
+            "public README must link the Claude Code runtime guide"
+        );
+        assert!(
+            changelog.contains("Claude Code reference runtime"),
+            "the Unreleased changelog must name the Claude Code reference runtime"
         );
         Ok(())
     }

@@ -37,8 +37,9 @@ template_definitions "${chart}/templates" >"${work}/wrapper-definitions"
   template_definitions "${chart}/.upstream"
   template_definitions "${work}/dependencies"
 } | sort -u >"${work}/upstream-definitions"
-if comm -12 "${work}/wrapper-definitions" "${work}/upstream-definitions" \
-  | grep -q .; then
+comm -12 "${work}/wrapper-definitions" "${work}/upstream-definitions" \
+  >"${work}/overlapping-definitions"
+if [[ -s "${work}/overlapping-definitions" ]]; then
   echo "${chart_name} wrapper redefines an upstream template name" >&2
   exit 1
 fi

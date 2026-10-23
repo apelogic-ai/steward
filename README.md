@@ -63,6 +63,7 @@ records the limits of this tested matrix.
 | Understand the Task API and worker contract | [Task deployment](config/task/README.md) |
 | Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |
 | Obtain, mirror, or rebuild the supported Codex image | [Codex reference runtime](docs/installation/codex-reference-runtime.md) |
+| Obtain, mirror, or rebuild the supported Claude Code image | [Claude Code reference runtime](docs/installation/claude-code-reference-runtime.md) |
 | The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
 

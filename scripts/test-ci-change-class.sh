@@ -444,17 +444,20 @@ expect_verdict() {
 full_lanes=(
   quality=success quality-reduced=skipped conformance-pinned=success
   openshell-adapter=success governed-connections=success postgres-tls=success
-  browser-e2e=success codex-reference-runtime=success release-candidate=success
+  browser-e2e=success codex-reference-runtime=success
+  claude-code-reference-runtime=success release-candidate=success
 )
 web_lanes=(
   quality=skipped quality-reduced=success conformance-pinned=skipped
   openshell-adapter=skipped governed-connections=skipped postgres-tls=skipped
-  browser-e2e=success codex-reference-runtime=skipped release-candidate=success
+  browser-e2e=success codex-reference-runtime=skipped
+  claude-code-reference-runtime=skipped release-candidate=success
 )
 docs_lanes=(
   quality=skipped quality-reduced=success conformance-pinned=skipped
   openshell-adapter=skipped governed-connections=skipped postgres-tls=skipped
-  browser-e2e=skipped codex-reference-runtime=skipped release-candidate=skipped
+  browser-e2e=skipped codex-reference-runtime=skipped
+  claude-code-reference-runtime=skipped release-candidate=skipped
 )
 
 # Replaces one lane's result in a lane list.
@@ -477,7 +480,8 @@ expect_verdict pass "docs, docs lanes green" docs success "${docs_lanes[@]}"
 
 functional_lanes=(
   quality conformance-pinned openshell-adapter governed-connections
-  postgres-tls browser-e2e codex-reference-runtime release-candidate
+  postgres-tls browser-e2e codex-reference-runtime claude-code-reference-runtime
+  release-candidate
 )
 for lane in "${functional_lanes[@]}"; do
   for result in skipped failure cancelled ""; do
@@ -502,7 +506,7 @@ done
 
 # A lane the class skips must really have been skipped: a failure or a
 # cancellation there is never waved through.
-for lane in quality conformance-pinned openshell-adapter governed-connections postgres-tls codex-reference-runtime; do
+for lane in quality conformance-pinned openshell-adapter governed-connections postgres-tls codex-reference-runtime claude-code-reference-runtime; do
   for result in failure cancelled success; do
     # shellcheck disable=SC2046
     expect_verdict fail "web, ${lane}=${result}" web success \
