@@ -123,6 +123,61 @@ for dependency_chart in spire agent-sandbox openshell litellm arc; do
   fi
 done
 
+bundle_chart="${run_dir}/charts/steward-bundle"
+STEWARD_BUNDLE_RELEASE_VERSION="${release_version}" \
+  STEWARD_BUNDLE_RELEASE_IMAGE_REPOSITORY="${runtime_repository}" \
+  STEWARD_BUNDLE_RELEASE_APISERVER_DIGEST="${api_digest}" \
+  STEWARD_BUNDLE_RELEASE_CONTROLLER_DIGEST="${controller_digest}" \
+  STEWARD_BUNDLE_RELEASE_MINT_DIGEST="${mint_digest}" \
+  STEWARD_BUNDLE_RELEASE_WEB_DIGEST="${web_digest}" \
+  STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="${trigger_receiver_digest}" \
+  bash "${root}/scripts/prepare-steward-bundle-chart.sh" "${bundle_chart}"
+(cd "${run_dir}" && helm package charts/steward-bundle --destination . \
+  --version "${release_version}" --app-version "${release_version}" >/dev/null)
+bundle_archive="${run_dir}/steward-bundle-${release_version}.tgz"
+bundle_values="${run_dir}/steward-bundle-values.yaml"
+helm show values "${bundle_archive}" >"${bundle_values}"
+if [[ "$(awk '
+  $1 == "repository:" && $0 ~ /^    / { print $2; exit }
+' "${bundle_values}")" != "${runtime_repository}" ]]; then
+  echo 'candidate bundle values omitted the release image repository' >&2
+  exit 1
+fi
+for component_digest in \
+  "apiserver apiserver ${api_digest}" \
+  "controller controller ${controller_digest}" \
+  "mint mint ${mint_digest}" \
+  "web web ${web_digest}" \
+  "triggerReceiver trigger-receiver ${trigger_receiver_digest}"; do
+  read -r component suffix digest <<<"${component_digest}"
+  values="$(awk -v component="${component}" '
+    $1 == component ":" && $0 ~ /^    / { active = 1; next }
+    active && $1 == "tag:" { tag = $2 }
+    active && $1 == "digest:" { print tag, $2; exit }
+  ' "${bundle_values}")"
+  if [[ "${values}" != "${release_version}-${suffix} ${digest}" ]]; then
+    echo "candidate bundle values omitted the ${suffix} release image" >&2
+    exit 1
+  fi
+done
+bundle_render="${run_dir}/steward-bundle-rendered.yaml"
+helm template candidate-bundle "${bundle_archive}" --namespace steward-test \
+  >"${bundle_render}"
+if ! grep -Fq "${runtime_repository}:${release_version}-" "${bundle_render}" \
+  || grep -Fq 'ghcr.io/apelogic-ai/steward:' "${bundle_render}"; then
+  echo 'candidate bundle render omitted active Steward release images' >&2
+  exit 1
+fi
+bundle_push="$(
+  helm push "${bundle_archive}" "oci://${registry_address}/charts" --plain-http 2>&1
+)"
+bundle_digest="$(printf '%s\n' "${bundle_push}" | awk '$1 == "Digest:" { print $2 }')"
+if [[ ! "${bundle_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "local steward-bundle chart publication returned invalid digest ${bundle_digest}" >&2
+  exit 1
+fi
+bash "${root}/scripts/steward-bundle-kind-smoke.sh" "${bundle_archive}"
+
 export STEWARD_RELEASE_VERSION="${release_version}"
 export STEWARD_RELEASE_IMAGE_REPOSITORY="${runtime_repository}"
 export STEWARD_RELEASE_IMAGE_PULL_REPOSITORY="${pull_repository}"

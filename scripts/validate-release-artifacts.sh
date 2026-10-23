@@ -113,6 +113,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bash "${root}/scripts/customer-core-install-e2e.sh" \
   --lint-source-chart "${root}/charts/steward"
 bash "${root}/scripts/test-governed-dependency-charts.sh"
+bash "${root}/scripts/test-steward-bundle-chart.sh"
 bash "${root}/scripts/test-validate-release-version.sh"
 bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-released-artifact-acceptance.sh"

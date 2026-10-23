@@ -1,0 +1,75 @@
+{{- $references := list -}}
+{{- if .Values.components.steward.enabled -}}
+{{- if ne .Values.steward.tls.mode "customerSecret" -}}
+{{- fail "The Steward bundle requires steward.tls.mode=customerSecret" -}}
+{{- end -}}
+{{- $references = append $references (dict "path" "steward.secrets.database.name" "name" .Values.steward.secrets.database.name) -}}
+{{- $references = append $references (dict "path" "steward.secrets.managedInferenceDatabase.name" "name" .Values.steward.secrets.managedInferenceDatabase.name) -}}
+{{- $references = append $references (dict "path" "steward.secrets.managedInferenceEncryptionKey.name" "name" .Values.steward.secrets.managedInferenceEncryptionKey.name) -}}
+{{- $references = append $references (dict "path" "steward.secrets.jira.name" "name" .Values.steward.secrets.jira.name) -}}
+{{- $references = append $references (dict "path" "steward.secrets.litellm.name" "name" .Values.steward.secrets.litellm.name) -}}
+{{- $references = append $references (dict "path" "steward.secrets.openshellClient.name" "name" .Values.steward.secrets.openshellClient.name) -}}
+{{- $references = append $references (dict "path" "steward.secrets.mint.name" "name" .Values.steward.secrets.mint.name) -}}
+{{- $references = append $references (dict "path" "steward.tls.api.secretName" "name" .Values.steward.tls.api.secretName) -}}
+{{- $references = append $references (dict "path" "steward.tls.webhook.secretName" "name" .Values.steward.tls.webhook.secretName) -}}
+{{- with .Values.steward.browserAuth.google.clientSecret.name -}}
+{{- $references = append $references (dict "path" "steward.browserAuth.google.clientSecret.name" "name" .) -}}
+{{- end -}}
+{{- with .Values.steward.githubSource.privateKeySecret.name -}}
+{{- $references = append $references (dict "path" "steward.githubSource.privateKeySecret.name" "name" .) -}}
+{{- end -}}
+{{- with .Values.steward.web.ingress.tlsSecretName -}}
+{{- $references = append $references (dict "path" "steward.web.ingress.tlsSecretName" "name" .) -}}
+{{- end -}}
+{{- if and (eq .Values.steward.databaseTls.mode "verify-full") (eq .Values.steward.databaseTls.ca.kind "Secret") -}}
+{{- $references = append $references (dict "path" "steward.databaseTls.ca.name" "name" .Values.steward.databaseTls.ca.name) -}}
+{{- end -}}
+{{- if and (or .Values.steward.execution.enabled .Values.steward.triggerReceiver.enabled) (eq .Values.steward.workloadExchangeTrust.kind "Secret") -}}
+{{- $references = append $references (dict "path" "steward.workloadExchangeTrust.name" "name" .Values.steward.workloadExchangeTrust.name) -}}
+{{- end -}}
+{{- if .Values.steward.triggerReceiver.enabled -}}
+{{- $references = append $references (dict "path" "steward.triggerReceiver.databaseSecret.name" "name" .Values.steward.triggerReceiver.databaseSecret.name) -}}
+{{- if eq .Values.steward.triggerReceiver.taskApi.ca.kind "Secret" -}}
+{{- $references = append $references (dict "path" "steward.triggerReceiver.taskApi.ca.name" "name" .Values.steward.triggerReceiver.taskApi.ca.name) -}}
+{{- end -}}
+{{- range $index, $trigger := .Values.steward.triggerReceiver.triggers -}}
+{{- $references = append $references (dict "path" (printf "steward.triggerReceiver.triggers[%d].signingSecret.name" $index) "name" $trigger.signingSecret.name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.components.spire.enabled -}}
+{{- $spireServer := index .Values.spire.spire "spire-server" -}}
+{{- if dig "dataStore" "sql" "externalSecret" "enabled" false $spireServer -}}
+{{- $references = append $references (dict "path" "spire.spire.spire-server.dataStore.sql.externalSecret.name" "name" (dig "dataStore" "sql" "externalSecret" "name" "" $spireServer)) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.components.openshell.enabled -}}
+{{- $references = append $references (dict "path" "openshell.openshell.server.externalDbSecret" "name" .Values.openshell.openshell.server.externalDbSecret) -}}
+{{- $references = append $references (dict "path" "openshell.openshell.server.tls.certSecretName" "name" .Values.openshell.openshell.server.tls.certSecretName) -}}
+{{- $references = append $references (dict "path" "openshell.openshell.server.tls.clientCaSecretName" "name" .Values.openshell.openshell.server.tls.clientCaSecretName) -}}
+{{- $references = append $references (dict "path" "openshell.openshell.server.tls.clientTlsSecretName" "name" .Values.openshell.openshell.server.tls.clientTlsSecretName) -}}
+{{- $references = append $references (dict "path" "openshell.openshell.server.sandboxJwt.signingSecretName" "name" .Values.openshell.openshell.server.sandboxJwt.signingSecretName) -}}
+{{- end -}}
+{{- if .Values.components.litellm.enabled -}}
+{{- $references = append $references (dict "path" "litellm.litellm.masterkeySecretName" "name" .Values.litellm.litellm.masterkeySecretName) -}}
+{{- range $index, $name := .Values.litellm.litellm.environmentSecrets -}}
+{{- $references = append $references (dict "path" (printf "litellm.litellm.environmentSecrets[%d]" $index) "name" $name) -}}
+{{- end -}}
+{{- $references = append $references (dict "path" "litellm.litellm.db.secret.name" "name" .Values.litellm.litellm.db.secret.name) -}}
+{{- end -}}
+{{- $expected := "" -}}
+{{- range $reference := $references -}}
+{{- if eq $expected "" -}}
+{{- $expected = $reference.name -}}
+{{- else if ne $reference.name $expected -}}
+{{- fail (printf "All enabled charts must use one existing Secret; %s names %s instead of %s" $reference.path $reference.name $expected) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.components.spire.enabled .Values.components.openshell.enabled -}}
+{{- $spireServer := index .Values.spire.spire "spire-server" -}}
+{{- $sandboxIdentity := index $spireServer.controllerManager.identities.clusterSPIFFEIDs "openshell-sandboxes" -}}
+{{- $identityNamespace := index $sandboxIdentity.namespaceSelector.matchLabels "kubernetes.io/metadata.name" -}}
+{{- if ne $identityNamespace .Values.openshell.openshell.server.sandboxNamespace -}}
+{{- fail "SPIRE sandbox identities must select the OpenShell sandbox namespace" -}}
+{{- end -}}
+{{- end -}}

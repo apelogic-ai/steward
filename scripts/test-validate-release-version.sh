@@ -17,11 +17,33 @@ write_fixture() {
   local guide="$4"
   local upgrade="${5:-$4}"
   printf 'apiVersion: v2\nname: steward\nversion: %s\nappVersion: %s\n' "${chart}" "${app}" > "${fixture}/charts/steward/Chart.yaml"
-  for dependency_chart in spire agent-sandbox openshell litellm arc; do
+  for dependency_chart in spire agent-sandbox openshell litellm arc steward-bundle; do
     mkdir -p "${fixture}/charts/${dependency_chart}"
     printf 'apiVersion: v2\nname: %s\nversion: %s\nappVersion: 1.2.3\n' \
       "${dependency_chart}" "${chart}" > "${fixture}/charts/${dependency_chart}/Chart.yaml"
   done
+  {
+    printf 'apiVersion: v2\nname: steward-bundle\nversion: %s\nappVersion: %s\n' \
+      "${chart}" "${app}"
+    printf 'dependencies:\n'
+    for dependency_chart in steward spire agent-sandbox openshell litellm arc; do
+      printf '  - name: %s\n    version: %s\n' "${dependency_chart}" "${chart}"
+    done
+  } > "${fixture}/charts/steward-bundle/Chart.yaml"
+  cat > "${fixture}/charts/steward-bundle/values.yaml" <<EOF
+steward:
+  images:
+    apiserver:
+      tag: ${chart}-apiserver
+    controller:
+      tag: ${chart}-controller
+    mint:
+      tag: ${chart}-mint
+    web:
+      tag: ${chart}-web
+    triggerReceiver:
+      tag: ${chart}-trigger-receiver
+EOF
   printf 'Current installation contract: chart \x60%s\x60.\n' "${readme}" > "${fixture}/README.md"
   printf 'Release contract: chart \x60%s\x60.\n' "${guide}" > "${fixture}/docs/installation/installation-guide.md"
   printf 'Current release contract: chart \x60%s\x60.\n' "${guide}" > "${fixture}/charts/steward/README.md"
@@ -57,6 +79,34 @@ write_fixture 0.1.23 0.1.23 0.1.23 0.1.23
 sed -i.bak 's/version: 0.1.23/version: 0.1.22/' "${fixture}/charts/openshell/Chart.yaml"
 if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
   echo 'mismatched dependency chart version unexpectedly passed' >&2
+  exit 1
+fi
+
+write_fixture 0.1.23 0.1.23 0.1.23 0.1.23
+sed -i.bak 's/0.1.23-controller/0.1.22-controller/' \
+  "${fixture}/charts/steward-bundle/values.yaml"
+if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
+  echo 'mismatched steward-bundle image tag unexpectedly passed' >&2
+  exit 1
+fi
+
+write_fixture 0.1.23 0.1.23 0.1.23 0.1.23
+sed -i.bak 's/0.1.23-apiserver/swap-tag/' \
+  "${fixture}/charts/steward-bundle/values.yaml"
+sed -i.bak 's/0.1.23-controller/0.1.23-apiserver/' \
+  "${fixture}/charts/steward-bundle/values.yaml"
+sed -i.bak 's/swap-tag/0.1.23-controller/' \
+  "${fixture}/charts/steward-bundle/values.yaml"
+if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
+  echo 'swapped steward-bundle image tags unexpectedly passed' >&2
+  exit 1
+fi
+
+write_fixture 0.1.23 0.1.23 0.1.23 0.1.23
+sed -i.bak 's/    version: 0.1.23/    version: 0.1.22/' \
+  "${fixture}/charts/steward-bundle/Chart.yaml"
+if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
+  echo 'mismatched steward-bundle dependency version unexpectedly passed' >&2
   exit 1
 fi
 
