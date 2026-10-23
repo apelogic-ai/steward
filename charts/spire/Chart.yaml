@@ -9,9 +9,6 @@ home: https://github.com/apelogic-ai/steward
 sources:
   - https://github.com/spiffe/helm-charts-hardened
 dependencies:
-  - name: spire-crds
-    repository: https://spiffe.github.io/helm-charts-hardened/
-    version: 0.5.0
   - name: spire
     alias: spire
     repository: https://spiffe.github.io/helm-charts-hardened/
@@ -19,4 +16,6 @@ dependencies:
 annotations:
   artifacthub.io/license: Apache-2.0
   steward.apelogic.ai/upstream-spire-chart: https://spiffe.github.io/helm-charts-hardened/spire-0.29.0.tgz
-  steward.apelogic.ai/upstream-spire-crds-chart: https://spiffe.github.io/helm-charts-hardened/spire-crds-0.5.0.tgz
+  steward.apelogic.ai/upstream-spire-crds-repository: https://spiffe.github.io/helm-charts-hardened/
+  steward.apelogic.ai/upstream-spire-crds-version: 0.5.0
+  steward.apelogic.ai/upstream-spire-crds-sha256: 5979c6607bc7b62c798a9cd28cf3b1861db8439cd6f069384abfc62f89bf6bca

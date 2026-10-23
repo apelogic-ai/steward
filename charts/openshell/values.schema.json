@@ -58,33 +58,18 @@
     "route": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "parentRefs", "hostname", "timeouts"],
+      "required": ["enabled", "parentRefs", "hostname"],
       "properties": {
         "enabled": {"type": "boolean"},
         "parentRefs": {"type": "array", "items": {"type": "object"}},
-        "hostname": {"type": "string"},
-        "timeouts": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["request", "backendRequest"],
-          "properties": {
-            "request": {"type": "string"},
-            "backendRequest": {"type": "string"}
-          }
-        }
+        "hostname": {"type": "string"}
       },
       "allOf": [{
         "if": {"properties": {"enabled": {"const": true}}},
         "then": {
           "properties": {
             "parentRefs": {"minItems": 1},
-            "hostname": {"minLength": 1},
-            "timeouts": {
-              "properties": {
-                "request": {"pattern": "^[0-9]+(ms|s|m|h)$"},
-                "backendRequest": {"pattern": "^[0-9]+(ms|s|m|h)$"}
-              }
-            }
+            "hostname": {"minLength": 1}
           }
         }
       }]

@@ -33,6 +33,3 @@ route:
   enabled: false
   parentRefs: []
   hostname: ""
-  timeouts:
-    request: ""
-    backendRequest: ""

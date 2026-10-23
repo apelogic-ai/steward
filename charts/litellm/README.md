@@ -16,9 +16,10 @@ is copied into this wrapper.
 | Shared Gateway route | `route.parentRefs`, `route.hostname`, `route.timeouts.*` |
 
 The image tag must include an `@sha256:` digest. Inline master keys, the
-bundled database, generated proxy configuration, and multiple Secret names are
-refused. The existing configuration must contain the model routes and provider
-environment lookups needed by the installation.
+bundled database, generated proxy configuration, credential-shaped inline
+environment variables, password-bearing database URLs, and multiple Secret
+names are refused. The existing configuration must contain the model routes
+and provider environment lookups needed by the installation.
 
 ## Platform requirements
 

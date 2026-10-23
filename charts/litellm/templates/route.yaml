@@ -1,6 +1,11 @@
 {{- if hasKey .Values.litellm "masterkey" -}}
 {{- fail "inline LiteLLM master-key values are not supported" -}}
 {{- end -}}
+{{- range $name, $_ := .Values.litellm.envVars -}}
+{{- if regexMatch "(?i)(api[_-]?key|token|secret|password|credential)" $name -}}
+{{- fail "inline LiteLLM credential environment variables are not supported" -}}
+{{- end -}}
+{{- end -}}
 {{- $secret := .Values.litellm.masterkeySecretName -}}
 {{- if ne .Values.litellm.db.secret.name $secret -}}
 {{- fail "LiteLLM secret references must name one existing Secret" -}}

@@ -14,7 +14,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   dependencies where available, create no Namespace, accept existing Secret
   references instead of inline secret material, pin every rendered image by
   digest, and document cluster-wide permissions and Pod Security needs. The
-  release publishes each chart as its own OCI artifact alongside Steward.
+  release publishes each chart as its own OCI artifact alongside Steward and
+  lists their immutable coordinates in the release handoff. SPIRE CRDs are
+  installed before dependent resources, agent-sandbox wraps its upstream Helm
+  chart, and LiteLLM refuses credential-shaped environment values and database
+  URLs containing passwords. OpenShell's optional GRPCRoute requires an
+  existing Gateway and hostname; streaming timeouts remain configured on the
+  Gateway or backend because GRPCRoute has no timeout field. Existing Steward
+  chart SBOM and vulnerability asset names remain available.
 
 ## [0.3.21] - 2026-10-22
 

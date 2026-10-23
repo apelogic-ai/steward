@@ -517,6 +517,12 @@ jobs:
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
 
+      - name: Preserve Steward chart release asset names
+        if: matrix.chart == 'steward'
+        run: |
+          cp "dist/helm-chart-steward.spdx.json" dist/helm-chart.spdx.json
+          cp "dist/helm-chart-steward.vulnerabilities.json" dist/helm-chart.vulnerabilities.json
+
       - name: Retain complete chart vulnerability report
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -691,6 +697,12 @@ jobs:
             --arg commit "$GITHUB_SHA" \
             --arg chart_reference "oci://${chart}:${version}" \
             --arg chart_digest "$(cat dist/helm-chart.digest)" \
+            --arg dependency_chart_repository "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts" \
+            --arg spire_chart_digest "$(cat dist/helm-chart-spire.digest)" \
+            --arg agent_sandbox_chart_digest "$(cat dist/helm-chart-agent-sandbox.digest)" \
+            --arg openshell_chart_digest "$(cat dist/helm-chart-openshell.digest)" \
+            --arg litellm_chart_digest "$(cat dist/helm-chart-litellm.digest)" \
+            --arg arc_chart_digest "$(cat dist/helm-chart-arc.digest)" \
             --arg image_repository "$repository" \
             --arg codex_reference "${codex_repository}:0.140.0-steward-${version}" \
             --arg codex_digest "$codex_digest" \
@@ -715,6 +727,16 @@ jobs:
               chart: {
                 reference: $chart_reference,
                 digest: $chart_digest
+              },
+              dependencyCharts: {
+                spire: {
+                  reference: ($dependency_chart_repository + "/spire:" + $version),
+                  digest: $spire_chart_digest
+                },
+                "agent-sandbox": {reference: ($dependency_chart_repository + "/agent-sandbox:" + $version), digest: $agent_sandbox_chart_digest},
+                openshell: {reference: ($dependency_chart_repository + "/openshell:" + $version), digest: $openshell_chart_digest},
+                litellm: {reference: ($dependency_chart_repository + "/litellm:" + $version), digest: $litellm_chart_digest},
+                arc: {reference: ($dependency_chart_repository + "/arc:" + $version), digest: $arc_chart_digest}
               },
               images: {
                 apiserver: {reference: ($image_repository + ":" + $version + "-apiserver"), digest: $apiserver_digest},

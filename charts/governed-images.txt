@@ -10,5 +10,4 @@ ghcr.io/spiffe/spire-agent:1.15.2@sha256:1d042e4040466686e0ee46f74981ff2167c86ad
 ghcr.io/spiffe/spire-controller-manager:0.6.6@sha256:3f70cfa140a829e4ef456763e72b461b0fb491900efb89c4b34b6a10be1c2d7a
 ghcr.io/spiffe/spire-server:1.15.2@sha256:aa74ef1be86bc8e0684007d84a4d9859d294384d842c30425048d73429f3216e
 registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0@sha256:e99cac42f10cac69cab09a91e59f982c9d525b2933a5f5b7dfd52dae09340aa2
-registry.k8s.io/kubectl:v1.32.1@sha256:6ae337221866ae69380cfa08e2b38fa113fd5044cfb5b7a7662f5b0028be23b6
 registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0@sha256:11f199f6bec47403b03cb49c79a41f445884b213b382582a60710b8c6fdc316a

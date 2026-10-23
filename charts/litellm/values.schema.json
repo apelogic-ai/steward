@@ -8,19 +8,25 @@
     "litellm": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["image", "masterkeySecretName", "masterkeySecretKey", "environmentSecrets", "proxyConfigMap", "db", "redis", "ingress"],
+      "required": ["image", "masterkeySecretName", "masterkeySecretKey", "environmentSecrets", "proxyConfigMap", "db", "redis", "ingress", "envVars", "extraEnvVars"],
       "not": {"required": ["masterkey"]},
       "properties": {
         "image": {"$ref": "#/definitions/digestTagImage"},
         "masterkeySecretName": {"$ref": "#/definitions/name"},
         "masterkeySecretKey": {"$ref": "#/definitions/key"},
         "environmentSecrets": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/name"}},
+        "envVars": {
+          "type": "object",
+          "propertyNames": {"not": {"pattern": "(?i)(api[_-]?key|token|secret|password|credential)"}}
+        },
+        "extraEnvVars": {"type": "object", "maxProperties": 0},
         "db": {
           "type": "object",
-          "required": ["useExisting", "deployStandalone", "secret"],
+          "required": ["useExisting", "deployStandalone", "url", "secret"],
           "properties": {
             "useExisting": {"const": true},
             "deployStandalone": {"const": false},
+            "url": {"const": "postgresql\u003a//$(DATABASE_USERNAME)\u003a$(DATABASE_PASSWORD)\u0040$(DATABASE_HOST)/$(DATABASE_NAME)"},
             "secret": {
               "type": "object",
               "required": ["name", "usernameKey", "passwordKey"],

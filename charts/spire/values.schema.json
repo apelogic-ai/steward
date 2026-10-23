@@ -2,10 +2,9 @@
   "$schema": "https://json-schema.org/draft-07/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["spire", "spire-crds"],
+  "required": ["spire"],
   "properties": {
     "global": {"type": "object"},
-    "spire-crds": {"type": "object", "additionalProperties": true},
     "spire": {
       "type": "object",
       "additionalProperties": true,
@@ -19,7 +18,17 @@
               "properties": {
                 "namespaces": {
                   "type": "object",
-                  "properties": {"create": {"const": false}}
+                  "properties": {
+                    "create": {"const": false},
+                    "system": {
+                      "type": "object",
+                      "properties": {"create": {"const": false}}
+                    },
+                    "server": {
+                      "type": "object",
+                      "properties": {"create": {"const": false}}
+                    }
+                  }
                 }
               }
             }
@@ -39,7 +48,20 @@
             }
           }
         },
-        "spire-agent": {"type": "object", "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}},
+        "spire-agent": {
+          "type": "object",
+          "properties": {
+            "image": {"$ref": "#/definitions/digestTagImage"},
+            "fsGroupFix": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            },
+            "socketAlternate": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            }
+          }
+        },
         "spiffe-csi-driver": {
           "type": "object",
           "properties": {

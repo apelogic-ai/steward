@@ -47,15 +47,25 @@ for chart in spire agent-sandbox openshell litellm arc; do
   cp "${root}/THIRD_PARTY_NOTICES.md" "${output}/${chart}/THIRD_PARTY_NOTICES.md"
 done
 
-agent_manifest="${work}/agent-sandbox-v0.5.0.yaml"
+agent_archive="${work}/agent-sandbox-v0.5.0.tar.gz"
 curl -fsSL \
-  https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.0/manifest.yaml \
-  -o "${agent_manifest}"
+  https://api.github.com/repos/kubernetes-sigs/agent-sandbox/tarball/v0.5.0 \
+  -o "${agent_archive}"
 verify_hash \
-  "${agent_manifest}" \
-  ccfe3649de8b33f0ee0ec635e2c7b40e1c468ad9fde6aac7c7379501327d9c4c
+  "${agent_archive}" \
+  4d6cb9e67b171d8faccfde017479733b9c1c62ad517dfdff70ec619f9ed2ff75
+mkdir -p "${work}/agent-sandbox-source" \
+  "${output}/agent-sandbox/.upstream"
+tar -xzf "${agent_archive}" -C "${work}/agent-sandbox-source"
+agent_chart="$(find "${work}/agent-sandbox-source" -mindepth 2 \
+  -maxdepth 2 -type d -name helm -print -quit)"
+if [[ -z "${agent_chart}" ]]; then
+  echo 'agent-sandbox source archive omitted helm/' >&2
+  exit 1
+fi
+cp -R "${agent_chart}" "${output}/agent-sandbox/.upstream/agent-sandbox"
 python3 "${root}/scripts/prepare-agent-sandbox-chart.py" \
-  "${agent_manifest}" "${output}/agent-sandbox"
+  "${output}/agent-sandbox/.upstream/agent-sandbox"
 
 litellm_archive="${work}/litellm-v1.106.2.tar.gz"
 curl -fsSL \
@@ -69,6 +79,8 @@ tar -xzf "${litellm_archive}" -C "${work}/litellm-source"
 cp -R \
   "${work}/litellm-source/litellm-1.106.2/helm/litellm-helm" \
   "${output}/litellm/.upstream/litellm-helm"
+find "${output}/litellm/.upstream/litellm-helm/templates/tests" \
+  -depth -delete
 
 export HELM_CACHE_HOME="${work}/helm/cache"
 export HELM_CONFIG_HOME="${work}/helm/config"
@@ -77,9 +89,30 @@ helm dependency update "${output}/spire" >/dev/null
 verify_hash \
   "${output}/spire/charts/spire-0.29.0.tgz" \
   b73205c87c5edfdaa5dcb6d6de16685950e02a5b8f843cdc6e101d127ef7a7be
+
+helm pull spire-crds \
+  --repo https://spiffe.github.io/helm-charts-hardened/ \
+  --version 0.5.0 --destination "${work}"
+spire_crds_archive="${work}/spire-crds-0.5.0.tgz"
 verify_hash \
-  "${output}/spire/charts/spire-crds-0.5.0.tgz" \
+  "${spire_crds_archive}" \
   5979c6607bc7b62c798a9cd28cf3b1861db8439cd6f069384abfc62f89bf6bca
+mkdir -p "${work}/spire-crds-source" "${work}/rendered-spire-crds"
+tar -xzf "${spire_crds_archive}" -C "${work}/spire-crds-source"
+bash "${root}/scripts/render-spire-crds.sh" \
+  "${work}/spire-crds-source/spire-crds" "${work}/rendered-spire-crds"
+for crd in \
+  spire.spiffe.io_clusterfederatedtrustdomains.yaml \
+  spire.spiffe.io_clusterspiffeids.yaml \
+  spire.spiffe.io_clusterstaticentries.yaml; do
+  if ! cmp -s "${root}/charts/spire/crds/${crd}" \
+    "${work}/rendered-spire-crds/${crd}"; then
+    echo "vendored SPIRE CRD differs from spire-crds 0.5.0: ${crd}" >&2
+    exit 1
+  fi
+done
+
+helm dependency update "${output}/agent-sandbox" >/dev/null
 
 openshell_update="$(helm dependency update "${output}/openshell" 2>&1)"
 grep -Fq \

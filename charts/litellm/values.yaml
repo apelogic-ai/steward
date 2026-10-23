@@ -7,6 +7,8 @@ litellm:
   masterkeySecretKey: litellm-master-key
   environmentSecrets:
     - governed-execution
+  envVars: {}
+  extraEnvVars: {}
   proxyConfigMap:
     create: false
     name: litellm-config
@@ -16,6 +18,7 @@ litellm:
     deployStandalone: false
     endpoint: postgresql.steward-test.svc.cluster.local
     database: litellm
+    url: "postgresql\u003a//$(DATABASE_USERNAME)\u003a$(DATABASE_PASSWORD)\u0040$(DATABASE_HOST)/$(DATABASE_NAME)"
     secret:
       name: governed-execution
       usernameKey: litellm-database-username

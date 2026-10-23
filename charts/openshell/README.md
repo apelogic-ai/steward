@@ -13,7 +13,7 @@ depend on it.
 | Supervisor image | `openshell.supervisor.image.repository`, `openshell.supervisor.image.tag` |
 | Default sandbox image | `openshell.server.sandboxImage` |
 | Existing Secret | `openshell.server.externalDbSecret`, `openshell.server.tls.*`, `openshell.server.sandboxJwt.signingSecretName` |
-| Shared Gateway route | `route.parentRefs`, `route.hostname`, `route.timeouts.*` |
+| Shared Gateway route | `route.parentRefs`, `route.hostname` |
 
 Tags without an `@sha256:` digest are refused. Every Secret reference must
 name the same existing Secret. Its fixed upstream keys are `uri`, `tls.crt`,
@@ -28,5 +28,6 @@ RBAC used to manage sandbox workloads. The sandbox namespace must allow the
 privileged runtime and Linux capabilities required by the selected OpenShell
 profile; keep unrelated workloads out of that namespace.
 
-The route is off by default. Enabling it requires an existing Gateway, an
-exact hostname, and request plus backend-request timeouts.
+The route is off by default. Enabling it requires an existing Gateway and an
+exact hostname. Gateway API GRPCRoute does not define request timeouts; gRPC
+streaming timeouts remain the responsibility of the Gateway or backend.

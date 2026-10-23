@@ -1,5 +1,3 @@
-spire-crds: {}
-
 spire:
   global:
     spire:
@@ -53,6 +51,12 @@ spire:
   spire-agent:
     image:
       tag: 1.15.2@sha256:1d042e4040466686e0ee46f74981ff2167c86adfadca19b3835946f4d6047536
+    fsGroupFix:
+      image:
+        tag: latest@sha256:90041f375e30f41aa7e0390075d8a69dc61900771d52fa98d63ee5d03d866a58
+    socketAlternate:
+      image:
+        tag: latest@sha256:90041f375e30f41aa7e0390075d8a69dc61900771d52fa98d63ee5d03d866a58
   spiffe-csi-driver:
     image:
       tag: 0.2.7@sha256:9dfe4f0caff096164fd921aa7f15319804df2fc0325f1d90bc793ef3256ab1cd

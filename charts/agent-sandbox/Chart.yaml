@@ -8,7 +8,12 @@ kubeVersion: ">=1.32.0-0"
 home: https://github.com/apelogic-ai/steward
 sources:
   - https://github.com/kubernetes-sigs/agent-sandbox
+dependencies:
+  - name: agent-sandbox
+    alias: agentSandbox
+    repository: file://.upstream/agent-sandbox
+    version: 0.1.0
 annotations:
   artifacthub.io/license: Apache-2.0
-  steward.apelogic.ai/upstream-manifest: https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.0/manifest.yaml
-  steward.apelogic.ai/upstream-manifest-sha256: ccfe3649de8b33f0ee0ec635e2c7b40e1c468ad9fde6aac7c7379501327d9c4c
+  steward.apelogic.ai/upstream-source: https://api.github.com/repos/kubernetes-sigs/agent-sandbox/tarball/v0.5.0
+  steward.apelogic.ai/upstream-source-sha256: 4d6cb9e67b171d8faccfde017479733b9c1c62ad517dfdff70ec619f9ed2ff75
