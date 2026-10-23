@@ -12,7 +12,24 @@ components:
   arc:
     enabled: false
 
-spire: {}
+spire:
+  spire:
+    spire-server:
+      controllerManager:
+        identities:
+          clusterSPIFFEIDs:
+            test-keys:
+              enabled: false
+            spike-bootstrap:
+              enabled: false
+            spike-keeper:
+              enabled: false
+            spike-nexus:
+              enabled: false
+            spike-pilot:
+              enabled: false
+            oidc-discovery-provider:
+              enabled: false
 agentSandbox: {}
 openshell: {}
 litellm: {}

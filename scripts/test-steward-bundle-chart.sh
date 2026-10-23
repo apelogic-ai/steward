@@ -111,6 +111,19 @@ if ! grep -Fxq 'kind: CustomResourceDefinition' "${fixture}/default.yaml" \
   echo 'steward-bundle default render omitted required CRDs or SPIRE identities' >&2
   exit 1
 fi
+rendered_spiffe_ids="$(awk '
+  /^kind: ClusterSPIFFEID$/ { identity = 1; next }
+  identity && /^  name:/ { print $2; identity = 0 }
+' "${fixture}/default.yaml" | sort)"
+expected_spiffe_ids="$(printf '%s\n' \
+  steward-test-bundle-default \
+  steward-test-bundle-openshell-sandboxes)"
+if [[ "${rendered_spiffe_ids}" != "${expected_spiffe_ids}" ]]; then
+  echo 'steward-bundle default render included an unexpected SPIRE identity' >&2
+  diff -u <(printf '%s\n' "${expected_spiffe_ids}") \
+    <(printf '%s\n' "${rendered_spiffe_ids}") >&2 || true
+  exit 1
+fi
 if ! awk '
   /^kind:/ {
     if ($2 == "CustomResourceDefinition" && saw_object) exit 1
@@ -183,6 +196,30 @@ assert_refused() {
   fi
 }
 
+assert_secret_mismatch_refused() {
+  local path="$1"
+  shift
+  local expected='All enabled charts must use one existing Secret' output=""
+  if [[ "${path}" == openshell.openshell.* ]]; then
+    expected='OpenShell secret references must name one existing Secret'
+  elif [[ "${path}" == litellm.litellm.environmentSecrets* ]]; then
+    expected='LiteLLM environment secret references must name the existing Secret'
+  elif [[ "${path}" == litellm.litellm.* ]]; then
+    expected='LiteLLM secret references must name one existing Secret'
+  fi
+  if output="$(helm template refused "${prepared}" --namespace steward-test \
+    --show-only templates/validate.yaml --skip-schema-validation \
+    "$@" --set-string "${path}=other-secret" 2>&1)"; then
+    echo "steward-bundle accepted a mismatched Secret at ${path}" >&2
+    exit 1
+  fi
+  if ! grep -Fq "${expected}" <<<"${output}"; then
+    echo "steward-bundle refused a mismatched Secret at ${path} for an unexpected reason" >&2
+    printf '%s\n' "${output}" >&2
+    exit 1
+  fi
+}
+
 assert_refused 'an inline LiteLLM master key' 'Must not validate the schema (not)' \
   --set-string litellm.litellm.masterkey=not-a-real-secret
 assert_refused 'an incomplete LiteLLM route' 'parentRefs' \
@@ -214,6 +251,106 @@ assert_refused 'a different SPIRE database Secret' \
   --set spire.spire.spire-server.dataStore.sql.externalSecret.enabled=true \
   --set-string spire.spire.spire-server.dataStore.sql.externalSecret.name=other-secret \
   --set-string spire.spire.spire-server.dataStore.sql.externalSecret.key=database-password
+
+secret_mismatch_paths=(
+  steward.secrets.database.name
+  steward.secrets.managedInferenceDatabase.name
+  steward.secrets.managedInferenceEncryptionKey.name
+  steward.secrets.jira.name
+  steward.secrets.litellm.name
+  steward.secrets.openshellClient.name
+  steward.secrets.mint.name
+  steward.tls.api.secretName
+  steward.tls.webhook.secretName
+  steward.databaseTls.ca.name
+  steward.workloadExchangeTrust.name
+  steward.triggerReceiver.taskApi.ca.name
+  steward.browserAuth.google.clientSecret.name
+  steward.githubSource.privateKeySecret.name
+  steward.web.ingress.tlsSecretName
+  steward.triggerReceiver.databaseSecret.name
+  'steward.triggerReceiver.triggers[0].signingSecret.name'
+  spire.spire.spire-server.dataStore.sql.externalSecret.name
+  openshell.openshell.server.externalDbSecret
+  openshell.openshell.server.tls.certSecretName
+  openshell.openshell.server.tls.clientCaSecretName
+  openshell.openshell.server.tls.clientTlsSecretName
+  openshell.openshell.server.sandboxJwt.signingSecretName
+  litellm.litellm.masterkeySecretName
+  'litellm.litellm.environmentSecrets[0]'
+  litellm.litellm.db.secret.name
+)
+trigger_prerequisites=(
+  --set steward.triggerReceiver.enabled=true
+  --set-string 'steward.triggerReceiver.triggers[0].id=PROJ-123'
+  --set 'steward.triggerReceiver.triggers[0].enabled=true'
+  --set-string 'steward.triggerReceiver.triggers[0].source=jira'
+  --set-string 'steward.triggerReceiver.triggers[0].workflow=workflow@1'
+  --set-string 'steward.triggerReceiver.triggers[0].service=service'
+  --set-string 'steward.triggerReceiver.triggers[0].ownerUserId=usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  --set-string 'steward.triggerReceiver.triggers[0].envelopeDigest=steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  --set-string 'steward.triggerReceiver.triggers[0].signingSecret.name=governed-execution'
+  --set-string 'steward.triggerReceiver.triggers[0].signingSecret.key=webhook-signing-key'
+  --set 'steward.triggerReceiver.triggers[0].concurrencyLimit=1'
+  --set 'steward.triggerReceiver.triggers[0].cooldownSeconds=0'
+  --set-string 'steward.triggerReceiver.triggers[0].ignoredAccountIds[0]=account-1'
+)
+for path in "${secret_mismatch_paths[@]}"; do
+  prerequisites=()
+  case "${path}" in
+    steward.databaseTls.ca.name)
+      prerequisites+=(
+        --set-string steward.databaseTls.mode=verify-full
+        --set-string steward.databaseTls.ca.kind=Secret
+        --set-string steward.databaseTls.ca.key=ca.crt
+      )
+      ;;
+    steward.workloadExchangeTrust.name)
+      prerequisites+=(
+        "${trigger_prerequisites[@]}"
+        --set-string steward.workloadExchangeTrust.kind=Secret
+        --set-string steward.workloadExchangeTrust.caCertificate=ca.crt
+      )
+      ;;
+    steward.triggerReceiver.taskApi.ca.name)
+      prerequisites+=(
+        "${trigger_prerequisites[@]}"
+        --set-string steward.triggerReceiver.taskApi.ca.kind=Secret
+        --set-string steward.triggerReceiver.taskApi.ca.key=ca.crt
+      )
+      ;;
+    steward.triggerReceiver.databaseSecret.name|steward.triggerReceiver.triggers*)
+      prerequisites+=("${trigger_prerequisites[@]}")
+      ;;
+    spire.spire.spire-server.dataStore.sql.externalSecret.name)
+      prerequisites+=(
+        --set-string spire.spire.spire-server.dataStore.sql.databaseType=postgres
+        --set spire.spire.spire-server.dataStore.sql.externalSecret.enabled=true
+        --set-string spire.spire.spire-server.dataStore.sql.externalSecret.key=database-password
+      )
+      ;;
+  esac
+  assert_secret_mismatch_refused "${path}" "${prerequisites[@]}"
+  template_path="${path}"
+  case "${path}" in
+    'steward.triggerReceiver.triggers[0].signingSecret.name')
+      template_path='steward.triggerReceiver.triggers[%d].signingSecret.name'
+      ;;
+    'litellm.litellm.environmentSecrets[0]')
+      template_path='litellm.litellm.environmentSecrets[%d]'
+      ;;
+  esac
+  grep -Fq "\"${template_path}\"" \
+    "${root}/charts/steward-bundle/templates/validate.yaml" || {
+    echo "steward-bundle validation omitted Secret path ${path}" >&2
+    exit 1
+  }
+done
+
+assert_refused 'Steward certificate creation in the bundle' \
+  'The Steward bundle requires steward.tls.mode=customerSecret' \
+  --set-string steward.tls.mode=certManager \
+  --set-string steward.tls.issuerRef.name=example-issuer
 assert_refused 'different OpenShell sandbox identity namespaces' \
   'SPIRE sandbox identities must select the OpenShell sandbox namespace' \
   --set-string "spire.spire.spire-server.controllerManager.identities.clusterSPIFFEIDs.openshell-sandboxes.namespaceSelector.matchLabels.kubernetes\\.io/metadata\\.name=other-sandboxes"
@@ -260,6 +397,9 @@ for mapping in \
   'steward.secrets.mint.name' \
   'steward.tls.api.secretName' \
   'steward.tls.webhook.secretName' \
+  'steward.databaseTls.ca.name' \
+  'steward.workloadExchangeTrust.name' \
+  'steward.triggerReceiver.taskApi.ca.name' \
   'steward.browserAuth.google.clientSecret.name' \
   'steward.githubSource.privateKeySecret.name' \
   'steward.web.ingress.tlsSecretName' \
@@ -267,9 +407,39 @@ for mapping in \
   'steward.triggerReceiver.triggers[].signingSecret.name' \
   'spire.spire.spire-server.dataStore.sql.externalSecret.name' \
   'openshell.openshell.server.externalDbSecret' \
-  'litellm.litellm.masterkeySecretName'; do
+  'openshell.openshell.server.tls.certSecretName' \
+  'openshell.openshell.server.tls.clientCaSecretName' \
+  'openshell.openshell.server.tls.clientTlsSecretName' \
+  'openshell.openshell.server.sandboxJwt.signingSecretName' \
+  'litellm.litellm.masterkeySecretName' \
+  'litellm.litellm.environmentSecrets[]' \
+  'litellm.litellm.db.secret.name'; do
   grep -Fq "\`${mapping}\`" "${root}/charts/steward-bundle/README.md" || {
     echo "steward-bundle README omitted Secret mapping ${mapping}" >&2
+    exit 1
+  }
+done
+
+for mapping in \
+  'spire.spire.global.spire.namespaces.system.name' \
+  'spire.spire.global.spire.namespaces.server.name' \
+  'agentSandbox.agentSandbox.namespace.name' \
+  'openshell.openshell.server.sandboxNamespace' \
+  'arc.arc.namespaceOverride'; do
+  grep -Fq "\`${mapping}\`" "${root}/charts/steward-bundle/README.md" || {
+    echo "steward-bundle README omitted namespace mapping ${mapping}" >&2
+    exit 1
+  }
+done
+
+for prerequisite in \
+  'master_key: os.environ/PROXY_MASTER_KEY' \
+  'steward.tls.mode=customerSecret' \
+  'both server and' \
+  'client use' \
+  'Ed25519 key'; do
+  grep -Fq "${prerequisite}" "${root}/charts/steward-bundle/README.md" || {
+    echo "steward-bundle README omitted prerequisite: ${prerequisite}" >&2
     exit 1
   }
 done

@@ -1,5 +1,8 @@
 {{- $references := list -}}
 {{- if .Values.components.steward.enabled -}}
+{{- if ne .Values.steward.tls.mode "customerSecret" -}}
+{{- fail "The Steward bundle requires steward.tls.mode=customerSecret" -}}
+{{- end -}}
 {{- $references = append $references (dict "path" "steward.secrets.database.name" "name" .Values.steward.secrets.database.name) -}}
 {{- $references = append $references (dict "path" "steward.secrets.managedInferenceDatabase.name" "name" .Values.steward.secrets.managedInferenceDatabase.name) -}}
 {{- $references = append $references (dict "path" "steward.secrets.managedInferenceEncryptionKey.name" "name" .Values.steward.secrets.managedInferenceEncryptionKey.name) -}}

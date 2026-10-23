@@ -7,9 +7,21 @@ default when an installation manages those dependencies separately.
 The chart enables Steward, SPIRE, agent-sandbox, OpenShell, and LiteLLM by
 default. Actions Runner Controller is available but disabled by default. Set
 `components.<name>.enabled` to select each chart independently. The bundle
-creates no Namespace; create the release namespace plus `spire-system`,
-`spire-server`, `agent-sandbox-system`, `openshell-sandboxes`, and any enabled
-ARC namespace before installation.
+creates no Namespace. Create each namespace needed by the enabled components:
+
+| Purpose | Bundle value path |
+|---|---|
+| Helm release | the namespace passed to `helm install --namespace` |
+| SPIRE system | `spire.spire.global.spire.namespaces.system.name` |
+| SPIRE server | `spire.spire.global.spire.namespaces.server.name` |
+| agent-sandbox controller | `agentSandbox.agentSandbox.namespace.name` |
+| OpenShell sandboxes | `openshell.openshell.server.sandboxNamespace` |
+| Actions Runner Controller | `arc.arc.namespaceOverride` |
+
+Before installing, provision separate PostgreSQL databases for Steward,
+LiteLLM, and OpenShell. Also create the ConfigMap named by
+`litellm.litellm.proxyConfigMap.name`. Its configured key must contain the
+LiteLLM configuration, including `master_key: os.environ/PROXY_MASTER_KEY`.
 
 ## Existing Secret
 
@@ -56,6 +68,12 @@ Before starting Steward, replace
 certificate stored in that Secret. The non-secret default exists only so the
 chart can be rendered and installed before platform-owned certificates are
 available; workloads are not ready until the matching certificate is present.
+The bundle accepts only `steward.tls.mode=customerSecret`: generated
+certificates could overwrite keys in the shared Secret. The one `tls.crt` and
+`tls.key` pair serves the Steward API and webhook plus the OpenShell server and
+client. Its certificate must cover every service name and permit both server and
+client use. The OpenShell sandbox JWT signing key in the same Secret must be an
+Ed25519 key.
 
 ## Image values
 
