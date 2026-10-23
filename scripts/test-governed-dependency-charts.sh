@@ -4,14 +4,14 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'find "${fixture}" -depth -delete 2>/dev/null || true' EXIT INT TERM
+printf '%s\n' 'apiVersion: v1' 'kind: Config' >"${fixture}/kubeconfig"
+export KUBECONFIG="${fixture}/kubeconfig"
 
 charts="spire agent-sandbox openshell litellm arc"
-for tool in curl jq kubectl; do
-  command -v "${tool}" >/dev/null || {
-    echo "missing governed chart test tool: ${tool}" >&2
-    exit 2
-  }
-done
+command -v curl >/dev/null || {
+  echo 'missing governed chart test tool: curl' >&2
+  exit 2
+}
 for chart in ${charts}; do
   for file in Chart.yaml README.md values.schema.json values.yaml; do
     if [[ ! -f "${root}/charts/${chart}/${file}" ]]; then
@@ -369,20 +369,16 @@ for chart in openshell litellm; do
       echo 'Gateway API v1.3.0 GRPCRoute CRD checksum mismatch' >&2
       exit 1
     }
-    kubectl create --dry-run=client --validate=false \
-      -f "${gateway_crd}" -o json >"${fixture}/gateway-grpc-route-crd.json"
-    kubectl create --dry-run=client --validate=false \
-      -f "${fixture}/${chart}-route.yaml" -o json \
-      >"${fixture}/${chart}-route.json"
-    jq -e '
-      .spec.versions[]
-      | select(.name == "v1")
-      | .schema.openAPIV3Schema.properties.spec.properties.rules.items.properties
-      | has("timeouts")
-      | not
-    ' "${fixture}/gateway-grpc-route-crd.json" >/dev/null
-    if jq -e 'select(.kind == "GRPCRoute") | .spec.rules[] | has("timeouts")' \
-      "${fixture}/${chart}-route.json" >/dev/null; then
+    if grep -Eq '^[[:space:]]+timeouts:' "${gateway_crd}"; then
+      echo 'Pinned GRPCRoute schema unexpectedly includes timeouts' >&2
+      exit 1
+    fi
+    if awk '
+      /^---$/ { in_route = 0 }
+      /^kind:[[:space:]]+GRPCRoute[[:space:]]*$/ { in_route = 1; next }
+      in_route && /^[[:space:]]+timeouts:[[:space:]]*/ { found = 1 }
+      END { exit found ? 0 : 1 }
+    ' "${fixture}/${chart}-route.yaml"; then
       echo 'OpenShell rendered a field absent from the pinned GRPCRoute schema' >&2
       exit 1
     fi
