@@ -90,12 +90,26 @@ if [[ ! "${chart_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-governed_charts="${run_dir}/governed-charts"
+governed_charts="${run_dir}/charts"
 bash "${root}/scripts/prepare-governed-dependency-charts.sh" "${governed_charts}"
 for dependency_chart in spire agent-sandbox openshell litellm arc; do
-  helm package "${governed_charts}/${dependency_chart}" \
-    --destination "${run_dir}" \
-    --version "${release_version}" >/dev/null
+  case "${dependency_chart}" in
+    spire)
+      (cd "${run_dir}" && helm package charts/spire --destination . --version "${release_version}" >/dev/null)
+      ;;
+    agent-sandbox)
+      (cd "${run_dir}" && helm package charts/agent-sandbox --destination . --version "${release_version}" >/dev/null)
+      ;;
+    openshell)
+      (cd "${run_dir}" && helm package charts/openshell --destination . --version "${release_version}" >/dev/null)
+      ;;
+    litellm)
+      (cd "${run_dir}" && helm package charts/litellm --destination . --version "${release_version}" >/dev/null)
+      ;;
+    arc)
+      (cd "${run_dir}" && helm package charts/arc --destination . --version "${release_version}" >/dev/null)
+      ;;
+  esac
   dependency_push="$(
     helm push "${run_dir}/${dependency_chart}-${release_version}.tgz" \
       "oci://${registry_address}/charts" --plain-http 2>&1

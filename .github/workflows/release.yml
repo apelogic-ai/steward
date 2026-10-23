@@ -460,17 +460,31 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           chart='${{ matrix.chart }}'
-          chart_directory="charts/$chart"
           if [[ "$chart" != steward ]]; then
-            bash scripts/prepare-governed-dependency-charts.sh "$RUNNER_TEMP/governed-charts"
-            chart_directory="$RUNNER_TEMP/governed-charts/$chart"
+            mkdir -p "$RUNNER_TEMP/release"
+            bash scripts/prepare-governed-dependency-charts.sh "$RUNNER_TEMP/release/charts"
           fi
           mkdir -p dist "$RUNNER_TEMP/chart-scan/$chart"
-          if [[ "$chart" == steward ]]; then
-            helm package "$chart_directory" --destination dist --version "$version" --app-version "$version"
-          else
-            helm package "$chart_directory" --destination dist --version "$version"
-          fi
+          case "$chart" in
+            steward)
+              helm package charts/steward --destination dist --version "$version" --app-version "$version"
+              ;;
+            spire)
+              (cd "$RUNNER_TEMP/release" && helm package charts/spire --destination "$GITHUB_WORKSPACE/dist" --version "$version")
+              ;;
+            agent-sandbox)
+              (cd "$RUNNER_TEMP/release" && helm package charts/agent-sandbox --destination "$GITHUB_WORKSPACE/dist" --version "$version")
+              ;;
+            openshell)
+              (cd "$RUNNER_TEMP/release" && helm package charts/openshell --destination "$GITHUB_WORKSPACE/dist" --version "$version")
+              ;;
+            litellm)
+              (cd "$RUNNER_TEMP/release" && helm package charts/litellm --destination "$GITHUB_WORKSPACE/dist" --version "$version")
+              ;;
+            arc)
+              (cd "$RUNNER_TEMP/release" && helm package charts/arc --destination "$GITHUB_WORKSPACE/dist" --version "$version")
+              ;;
+          esac
           tar -xzf "dist/$chart-$version.tgz" -C "$RUNNER_TEMP/chart-scan/$chart"
           push_output="$(helm push "dist/$chart-$version.tgz" 'oci://ghcr.io/${{ github.repository_owner }}/charts')"
           printf '%s\n' "$push_output"

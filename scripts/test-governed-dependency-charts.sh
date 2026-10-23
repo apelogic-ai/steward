@@ -27,7 +27,23 @@ for chart in ${charts}; do
   helm template "test-${chart}" "${prepared}" \
     --namespace steward-test \
     --skip-tests >"${rendered}"
-  helm package "${prepared}" --destination "${fixture}/packages" >/dev/null
+  case "${chart}" in
+    spire)
+      (cd "${fixture}" && helm package charts/spire --destination packages >/dev/null)
+      ;;
+    agent-sandbox)
+      (cd "${fixture}" && helm package charts/agent-sandbox --destination packages >/dev/null)
+      ;;
+    openshell)
+      (cd "${fixture}" && helm package charts/openshell --destination packages >/dev/null)
+      ;;
+    litellm)
+      (cd "${fixture}" && helm package charts/litellm --destination packages >/dev/null)
+      ;;
+    arc)
+      (cd "${fixture}" && helm package charts/arc --destination packages >/dev/null)
+      ;;
+  esac
 
   chart_version="$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*$/\1/p' "${prepared}/Chart.yaml")"
   package="${fixture}/packages/${chart}-${chart_version}.tgz"
