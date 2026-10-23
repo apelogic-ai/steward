@@ -26,7 +26,8 @@ done
 template_definitions() {
   local directory="$1"
   [[ -d "${directory}" ]] || return 0
-  rg --no-filename -o '\{\{[- ]*define[[:space:]]+"[^"]+"' \
+  rg --hidden --no-ignore --no-filename -o \
+    '\{\{[- ]*define[[:space:]]+"[^"]+"' \
     "${directory}" 2>/dev/null \
     | sed -E 's/.*define[[:space:]]+"([^"]+)".*/\1/' \
     | sort -u || true
@@ -37,12 +38,13 @@ template_definitions "${chart}/templates" >"${work}/wrapper-definitions"
   template_definitions "${chart}/.upstream"
   template_definitions "${work}/dependencies"
 } | sort -u >"${work}/upstream-definitions"
-comm -12 "${work}/wrapper-definitions" "${work}/upstream-definitions" \
-  >"${work}/overlapping-definitions"
-if [[ -s "${work}/overlapping-definitions" ]]; then
-  echo "${chart_name} wrapper redefines an upstream template name" >&2
-  exit 1
-fi
+while IFS= read -r definition; do
+  [[ -n "${definition}" ]] || continue
+  if grep -Fxq -- "${definition}" "${work}/upstream-definitions"; then
+    echo "${chart_name} wrapper redefines an upstream template name" >&2
+    exit 1
+  fi
+done <"${work}/wrapper-definitions"
 
 rendered="${work}/rendered.yaml"
 helm template wrapper-check "${chart}" --namespace steward-test >"${rendered}"

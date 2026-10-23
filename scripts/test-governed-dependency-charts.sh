@@ -115,12 +115,11 @@ grep -Fq "${database_url}" "${fixture}/litellm.yaml"
 # They must not copy or override upstream workloads.
 check_wrapper_boundary() {
   local chart_directory="$1"
-  bash "${root}/scripts/check-governed-chart-wrapper.sh" \
-    "${chart_directory}" >/dev/null 2>&1
+  bash "${root}/scripts/check-governed-chart-wrapper.sh" "${chart_directory}"
 }
 
 for chart in ${charts}; do
-  if ! check_wrapper_boundary "${fixture}/charts/${chart}"; then
+  if ! check_wrapper_boundary "${fixture}/charts/${chart}" >/dev/null 2>&1; then
     echo "${chart} contains a wrapper-owned upstream workload template" >&2
     exit 1
   fi
@@ -130,8 +129,16 @@ mkdir -p "${fixture}/mutations"
 cp -R "${fixture}/charts/litellm" "${fixture}/mutations/litellm-helper"
 printf '%s\n' '{{- define "litellm.fullname" -}}hijacked{{- end -}}' \
   >>"${fixture}/mutations/litellm-helper/templates/_helpers.tpl"
-if check_wrapper_boundary "${fixture}/mutations/litellm-helper"; then
+helper_guard_output=""
+if helper_guard_output="$(
+  check_wrapper_boundary "${fixture}/mutations/litellm-helper" 2>&1
+)"; then
   echo 'wrapper guard accepted an upstream helper override' >&2
+  exit 1
+fi
+if ! grep -Fq 'litellm wrapper redefines an upstream template name' \
+  <<<"${helper_guard_output}"; then
+  echo 'wrapper guard rejected the helper override for an unexpected reason' >&2
   exit 1
 fi
 
@@ -157,8 +164,15 @@ for chart in openshell agent-sandbox; do
     '        - name: injected' \
     '          image: registry.example.test/injected@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
     >"${mutation}/templates/extra-route.yaml"
-  if check_wrapper_boundary "${mutation}"; then
+  workload_guard_output=""
+  if workload_guard_output="$(check_wrapper_boundary "${mutation}" 2>&1)"; then
     echo "wrapper guard accepted an injected ${chart} Deployment" >&2
+    exit 1
+  fi
+  if ! grep -Fq \
+    "${chart}/templates/ wrapper rendered forbidden kind Deployment" \
+    <<<"${workload_guard_output}"; then
+    echo "wrapper guard rejected the injected ${chart} Deployment for an unexpected reason" >&2
     exit 1
   fi
 done
