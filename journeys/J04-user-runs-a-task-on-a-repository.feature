@@ -1,4 +1,4 @@
-# Source: user journey J4. UI text aligned with the 0.3.20 release candidate.
+# Source: user journey J4. UI text aligned with the 0.3.21 release candidate.
 # This journey is about the repository integration, so it is switched on.
 @needs-github
 Feature: J4 - User runs a Task on a repository

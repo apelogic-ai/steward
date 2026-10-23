@@ -1,6 +1,6 @@
 # Calling Steward from Jira webhook Triggers
 
-Status: **Current implementation for the upcoming Steward v0.3.20 release; optional run links require #551**
+Status: **Current Steward v0.3.21 contract**
 
 A Jira webhook Trigger starts one governed Workflow when a signed Jira event
 matches deployment-owned settings. The receiver is a separate, optional service.
@@ -138,11 +138,11 @@ back to Jira. These HTTP responses are the complete webhook acknowledgement.
 
 ## Optional issue link in run views
 
-After #551 is included in the deployed release, set
-`config.apiserver.jiraBaseUrl` to the HTTPS Jira site URL if run views should
-link back to the issue. An optional Jira context path is allowed. When the
-value is absent, the run shows a Jira Trigger label without a link when that
-label fits the caller-reference limit; otherwise the reference is omitted.
+Set `config.apiserver.jiraBaseUrl` to the HTTPS Jira site URL if run views
+should link back to the issue. An optional Jira context path is allowed. When
+the value is absent, the run shows a Jira Trigger label without a link when
+that label fits the caller-reference limit; otherwise the reference is
+omitted.
 
 A bounded issue key that does not match the expected Jira key form or project
 is display metadata only: delivery continues, and the receiver falls back to a

@@ -2,7 +2,7 @@ apiVersion: v2
 name: arc
 description: Pinned Actions Runner Controller dependency for Steward installations
 type: application
-version: 0.3.20
+version: 0.3.21
 appVersion: 0.15.0
 kubeVersion: ">=1.32.0-0"
 home: https://github.com/apelogic-ai/steward
