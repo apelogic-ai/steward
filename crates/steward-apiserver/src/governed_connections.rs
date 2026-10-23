@@ -444,7 +444,7 @@ impl DirectConnectionStatusReader {
             )
             .await
             .unwrap_or_else(|_| {
-                eprintln!(
+                steward_logging::error!(
                     "best-effort GitHub connection identity association failed: category=store_timeout"
                 );
                 None
@@ -612,7 +612,7 @@ impl DirectConnectionStatusReader {
                 Some(false)
             }
             Err(error) => {
-                eprintln!(
+                steward_logging::error!(
                     "best-effort GitHub connection identity association failed: category={}",
                     connection_association_failure_category(&error)
                 );
@@ -736,14 +736,14 @@ impl<B> GovernedConnectionsBroker<B> {
         orchestration_mode: TaskOrchestrationMode,
     ) -> Self {
         if let Some(warning) = connections_startup_warning(orchestration_mode) {
-            eprintln!("{warning}");
+            steward_logging::warn!("{warning}");
         }
         Self {
             store,
             config,
             binding: PhantomData,
             orchestration_mode,
-            failure_reporter: Arc::new(|line| eprintln!("{line}")),
+            failure_reporter: Arc::new(|line| steward_logging::error!("{line}")),
         }
     }
 
@@ -1330,8 +1330,8 @@ impl ConnectionOperationReconciler {
     pub fn new(store: PgStore) -> Self {
         Self {
             store,
-            failure_reporter: Arc::new(|line| eprintln!("{line}")),
-            latency_reporter: Arc::new(|line| eprintln!("{line}")),
+            failure_reporter: Arc::new(|line| steward_logging::error!("{line}")),
+            latency_reporter: Arc::new(|line| steward_logging::info!("{line}")),
         }
     }
 
@@ -1368,7 +1368,7 @@ impl ConnectionOperationReconciler {
     pub async fn run(self) {
         loop {
             if let Err(error) = self.reconcile_once().await {
-                eprintln!("connection operation reconcile failed: {error}");
+                steward_logging::error!("connection operation reconcile failed: {error}");
             }
             tokio::time::sleep(StdDuration::from_secs(1)).await;
         }
@@ -1461,7 +1461,8 @@ impl ConnectionOperationReconciler {
                     )
                     .await?
                 {
-                    eprintln!(
+                    steward_logging::error!(
+                        request_id = operation.operation_id,
                         "connection operation cleanup stalled: operation_id={}",
                         operation.operation_id
                     );

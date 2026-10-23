@@ -228,12 +228,12 @@ helm_template \
   --set-string logging.format=json \
   --set-string tls.webhook.caBundlePem=public-test-ca > "${component_rendered}"
 if [[ "$(grep -cF 'name: STEWARD_LOG_FORMAT, value: "json"' "${component_rendered}")" != 4 ]]; then
-  echo 'JSON logging must configure every Rust service component' >&2
+  echo 'JSON logging must configure every supported service component' >&2
   exit 1
 fi
 web_deployment="$(awk '/^metadata: \{ name: steward-web \}/ { found = 1 } found { print } found && /^---$/ { exit }' "${component_rendered}")"
 if grep -Fq 'STEWARD_LOG_FORMAT' <<< "${web_deployment}"; then
-  echo 'the web server must not claim support for the Rust component log contract' >&2
+  echo 'the web server must not claim support for the component log contract' >&2
   exit 1
 fi
 

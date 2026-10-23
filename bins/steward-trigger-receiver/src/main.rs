@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
+use std::process::ExitCode;
 use steward_adapter_openshell::WorkloadExchangeTransport;
 use steward_store::PgStore;
 use steward_trigger_receiver::client::{
@@ -194,7 +195,18 @@ fn runtime_settings() -> Result<RuntimeSettings, Box<dyn std::error::Error>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
+    steward_logging::init("steward-trigger-receiver");
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            steward_logging::error!("Error: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     rustls_crypto_provider::install()?;
     let settings = runtime_settings()?;
     let config = ReceiverConfig::from_json(

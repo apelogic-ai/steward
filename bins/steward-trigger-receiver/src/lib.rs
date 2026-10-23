@@ -652,7 +652,9 @@ impl Receiver {
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = completion.await {
-                        eprintln!("accepted Task lifecycle ended with a {error:?} failure");
+                        steward_logging::error!(
+                            "accepted Task lifecycle ended with a {error:?} failure"
+                        );
                     }
                 });
                 Ok(WebhookResult::Accepted)
