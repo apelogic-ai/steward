@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- Updated the web runtime to Next.js 16.4.1 while retaining Sharp 0.35.5, resolving two critical
+  unauthenticated code-execution vulnerabilities in the deployed web image.
 - Pinned the latest-upstream LiteLLM conformance image to a reviewed immutable digest. CI now
   refuses mutable LiteLLM images in scripts, workflows, Compose files, and chart values.
 - Updated certificate verification and the bundled web trust roots to reject certificates chained
