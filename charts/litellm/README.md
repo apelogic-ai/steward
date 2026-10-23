@@ -22,6 +22,8 @@ bundled database, generated proxy configuration, credential-shaped inline
 environment variables, password-bearing database URLs, and multiple Secret
 names are refused. The existing configuration must contain the model routes
 and provider environment lookups needed by the installation.
+Free-form environment inputs are disabled; use the existing Secret and proxy
+ConfigMap instead.
 
 ## Platform requirements
 

@@ -114,12 +114,25 @@
             "kubeConfigs": {"type": "object", "maxProperties": 0},
             "controllerManager": {
               "type": "object",
-              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+              "properties": {
+                "image": {"$ref": "#/definitions/digestTagImage"},
+                "extraEnv": {"type": "array", "maxItems": 0}
+              }
+            },
+            "externalControllerManagers": {
+              "type": "object",
+              "properties": {
+                "defaults": {
+                  "type": "object",
+                  "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+                }
+              }
             },
             "chown": {
               "type": "object",
               "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
-            }
+            },
+            "extraEnv": {"type": "array", "maxItems": 0}
           }
         },
         "spire-agent": {
@@ -133,14 +146,22 @@
             "socketAlternate": {
               "type": "object",
               "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
-            }
+            },
+            "extraEnvVars": {"type": "array", "maxItems": 0}
           }
         },
         "spiffe-csi-driver": {
           "type": "object",
           "properties": {
             "image": {"$ref": "#/definitions/digestTagImage"},
-            "nodeDriverRegistrar": {"type": "object", "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}}
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "nodeDriverRegistrar": {
+              "type": "object",
+              "properties": {
+                "image": {"$ref": "#/definitions/digestTagImage"},
+                "extraEnvVars": {"type": "array", "maxItems": 0}
+              }
+            }
           }
         }
       }

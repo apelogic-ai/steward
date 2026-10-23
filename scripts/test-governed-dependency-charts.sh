@@ -344,6 +344,8 @@ assert_refused litellm "inline master-key material" \
   --set-string litellm.masterkey=inline-value
 assert_refused litellm "inline credential-shaped environment variable" \
   --set-string litellm.envVars.OPENAI_API_KEY=inline-value
+assert_refused litellm "a free-form environment variable" \
+  --set-string litellm.envVars.LITELLM_MASTER_KEY=inline-value
 inline_material=inline-value
 inline_db_url="$(printf '%s' 'postgresql://' 'alice' ':' "${inline_material}" \
   '@' 'database.example.test/litellm')"
@@ -404,6 +406,20 @@ assert_refused spire "an inline upstream authority Secret" \
   --set-string spire.spire-server.upstreamAuthority.disk.secret.data.key=inline-value
 assert_refused spire "an inline kubeconfig" \
   --set-string spire.spire-server.kubeConfigs.external.kubeConfig=inline-value
+assert_refused spire "a free-form server environment variable" \
+  --set-json 'spire.spire-server.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form controller environment variable" \
+  --set-json 'spire.spire-server.controllerManager.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form external-controller environment variable" \
+  --set-json 'spire.spire-server.externalControllerManagers.defaults.extraEnv=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form agent environment variable" \
+  --set-json 'spire.spire-agent.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form CSI environment variable" \
+  --set-json 'spire.spiffe-csi-driver.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused spire "a free-form CSI registrar environment variable" \
+  --set-json 'spire.spiffe-csi-driver.nodeDriverRegistrar.extraEnvVars=[{"name":"INLINE_SECRET","value":"inline-value"}]'
+assert_refused arc "a free-form controller environment variable" \
+  --set-json 'arc.env=[{"name":"INLINE_SECRET","value":"inline-value"}]'
 
 helm template external-sql "${fixture}/charts/spire" \
   --namespace steward-test \
