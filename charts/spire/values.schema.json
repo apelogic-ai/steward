@@ -38,6 +38,80 @@
           "type": "object",
           "properties": {
             "image": {"$ref": "#/definitions/digestTagImage"},
+            "dataStore": {
+              "type": "object",
+              "properties": {
+                "sql": {
+                  "type": "object",
+                  "properties": {
+                    "password": {"const": ""},
+                    "readOnly": {
+                      "type": "object",
+                      "properties": {"password": {"const": ""}}
+                    }
+                  },
+                  "allOf": [{
+                    "if": {
+                      "required": ["databaseType"],
+                      "properties": {"databaseType": {"not": {"const": "sqlite3"}}}
+                    },
+                    "then": {
+                      "required": ["externalSecret"],
+                      "properties": {
+                        "externalSecret": {
+                          "type": "object",
+                          "required": ["enabled"],
+                          "properties": {"enabled": {"const": true}}
+                        }
+                      }
+                    }
+                  }]
+                }
+              }
+            },
+            "secrets": {
+              "type": "object",
+              "properties": {
+                "aws": {
+                  "type": "object",
+                  "properties": {
+                    "accessKeyID": {"const": ""},
+                    "secretAccessKey": {"const": ""}
+                  }
+                },
+                "gcp": {
+                  "type": "object",
+                  "properties": {"applicationCredentials": {"const": ""}}
+                }
+              }
+            },
+            "keyManager": {
+              "type": "object",
+              "properties": {
+                "awsKMS": {
+                  "type": "object",
+                  "properties": {
+                    "accessKeyID": {"const": ""},
+                    "secretAccessKey": {"const": ""}
+                  }
+                }
+              }
+            },
+            "upstreamAuthority": {
+              "type": "object",
+              "properties": {
+                "disk": {
+                  "type": "object",
+                  "properties": {
+                    "secret": {
+                      "type": "object",
+                      "properties": {"create": {"const": false}}
+                    }
+                  }
+                }
+              }
+            },
+            "kubeConfigs": {"type": "object", "maxProperties": 0},
             "controllerManager": {
               "type": "object",
               "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}

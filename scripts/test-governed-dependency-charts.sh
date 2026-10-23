@@ -31,6 +31,20 @@ require_fixed() {
   fi
 }
 
+require_fixed_count() {
+  local expected="$1" minimum="$2" path="$3" description="$4" actual
+  actual="$(
+    awk -v expected="${expected}" '
+      index($0, expected) { count += 1 }
+      END { print count + 0 }
+    ' "${path}"
+  )"
+  if ((actual < minimum)); then
+    echo "governed chart assertion failed: ${description}" >&2
+    exit 1
+  fi
+}
+
 require_regex() {
   local expected="$1" path="$2" description="$3"
   if ! grep -Eq -- "${expected}" "${path}"; then
@@ -178,6 +192,22 @@ if ! grep -Fq 'litellm wrapper redefines an upstream template name' \
   exit 1
 fi
 
+cp -R "${fixture}/charts/litellm" "${fixture}/mutations/litellm-block"
+printf '%s\n' '{{- block "litellm.fullname" . -}}hijacked{{- end -}}' \
+  >>"${fixture}/mutations/litellm-block/templates/_helpers.tpl"
+block_guard_output=""
+if block_guard_output="$(
+  check_wrapper_boundary "${fixture}/mutations/litellm-block" 2>&1
+)"; then
+  echo 'wrapper guard accepted an upstream helper block override' >&2
+  exit 1
+fi
+if ! grep -Fq 'litellm wrapper redefines an upstream template name' \
+  <<<"${block_guard_output}"; then
+  echo 'wrapper guard rejected the helper block override for an unexpected reason' >&2
+  exit 1
+fi
+
 mkdir -p "${fixture}/without-rg"
 printf '%s\n' '#!/bin/sh' 'exit 127' >"${fixture}/without-rg/rg"
 chmod +x "${fixture}/without-rg/rg"
@@ -314,10 +344,28 @@ assert_refused litellm "inline master-key material" \
   --set-string litellm.masterkey=inline-value
 assert_refused litellm "inline credential-shaped environment variable" \
   --set-string litellm.envVars.OPENAI_API_KEY=inline-value
-inline_db_url="$(printf '%s' 'postgresql://' 'alice' ':' 'inline-value' \
+inline_material=inline-value
+inline_db_url="$(printf '%s' 'postgresql://' 'alice' ':' "${inline_material}" \
   '@' 'database.example.test/litellm')"
+inline_https_url="$(printf '%s' 'https://' 'alice' ':' "${inline_material}" \
+  '@' 'gateway.example.test/v1')"
+assert_refused litellm "an inline DATABASE_URL environment variable" \
+  --set-string "litellm.envVars.DATABASE_URL=${inline_db_url}"
+assert_refused litellm "URL user information in an environment variable" \
+  --set-string "litellm.envVars.MODEL_ENDPOINT=${inline_https_url}"
+assert_refused litellm "an inline extra environment variable" \
+  --set-json 'litellm.extraEnvVars=[{"name":"OPENAI_API_KEY","value":"inline"}]'
 assert_refused litellm "a password-bearing database URL" \
   --set-string "litellm.db.url=${inline_db_url}"
+assert_refused litellm "an inline read-replica database URL" \
+  --set-string "litellm.db.readReplicaUrl=${inline_db_url}"
+assert_refused litellm "the bundled Redis chart with an inline password" \
+  --set litellm.redis.enabled=true \
+  --set-string "litellm.redis.auth.password=${inline_material}"
+assert_refused litellm "an extra Secret resource" \
+  --set-json 'litellm.extraResources=[{"apiVersion":"v1","kind":"Secret","metadata":{"name":"inline"},"stringData":{"key":"inline"}}]'
+assert_refused litellm "an extra Namespace resource" \
+  --set-json 'litellm.extraResources=[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"extra"}}]'
 if helm template refused-secret-mismatch "${fixture}/charts/litellm" \
   --namespace steward-test \
   --set-string litellm.masterkeySecretName=secret-a \
@@ -335,6 +383,35 @@ if helm template refused-openshell-secret-mismatch "${fixture}/charts/openshell"
 fi
 assert_refused openshell "a mismatched sandbox JWT Secret name" \
   --set-string openshell.server.sandboxJwt.signingSecretName=other-secret
+assert_refused spire "a SQL datastore without an external Secret" \
+  --set-string spire.spire-server.dataStore.sql.databaseType=postgres
+assert_refused spire "an inline SQL datastore password" \
+  --set-string "spire.spire-server.dataStore.sql.password=${inline_material}"
+assert_refused spire "an inline read-only SQL datastore password" \
+  --set-string "spire.spire-server.dataStore.sql.readOnly.password=${inline_material}"
+assert_refused spire "an inline cloud access-key ID" \
+  --set-string spire.spire-server.secrets.aws.accessKeyID=inline-value
+assert_refused spire "an inline cloud secret-access key" \
+  --set-string spire.spire-server.secrets.aws.secretAccessKey=inline-value
+assert_refused spire "an inline KMS access-key ID" \
+  --set-string spire.spire-server.keyManager.awsKMS.accessKeyID=inline-value
+assert_refused spire "an inline KMS secret-access key" \
+  --set-string spire.spire-server.keyManager.awsKMS.secretAccessKey=inline-value
+assert_refused spire "inline application credentials" \
+  --set-string spire.spire-server.secrets.gcp.applicationCredentials=inline-value
+assert_refused spire "an inline upstream authority Secret" \
+  --set spire.spire-server.upstreamAuthority.disk.secret.create=true \
+  --set-string spire.spire-server.upstreamAuthority.disk.secret.data.key=inline-value
+assert_refused spire "an inline kubeconfig" \
+  --set-string spire.spire-server.kubeConfigs.external.kubeConfig=inline-value
+
+helm template external-sql "${fixture}/charts/spire" \
+  --namespace steward-test \
+  --set-string spire.spire-server.dataStore.sql.databaseType=postgres \
+  --set spire.spire-server.dataStore.sql.externalSecret.enabled=true \
+  --set-string spire.spire-server.dataStore.sql.externalSecret.name=governed-execution \
+  --set-string spire.spire-server.dataStore.sql.externalSecret.key=spire-database-password \
+  >/dev/null
 
 # Mutable image inputs must fail at chart validation for every wrapper.
 mutable_image_cases='openshell openshell.image.tag
@@ -491,6 +568,13 @@ for chart in openshell litellm; do
     "${fixture}/${chart}-route.yaml" \
     "${chart} did not render the enabled shared-Gateway route"
 
+  if [[ "${chart}" == litellm ]]; then
+    require_fixed 'request: "30s"' "${fixture}/${chart}-route.yaml" \
+      'LiteLLM route omitted its request timeout'
+    require_fixed 'backendRequest: "20s"' "${fixture}/${chart}-route.yaml" \
+      'LiteLLM route omitted its backend-request timeout'
+  fi
+
   if [[ "${chart}" == openshell ]]; then
     if ! PATH="${fixture}/without-curl:${PATH}" \
       validate_openshell_route_schema "${fixture}/${chart}-route.yaml"; then
@@ -542,6 +626,38 @@ for chart in openshell litellm; do
       exit 1
     fi
   done
+done
+
+helm template fullname-override "${fixture}/charts/litellm" \
+  --namespace steward-test \
+  --set-string litellm.fullnameOverride=llm \
+  --set route.enabled=true \
+  --set-string route.parentRefs[0].name=shared-gateway \
+  --set-string route.hostname=litellm.example.test \
+  --set-string route.timeouts.request=30s \
+  --set-string route.timeouts.backendRequest=20s \
+  >"${fixture}/litellm-fullname-override.yaml"
+if ! awk '
+  /^kind:[[:space:]]+HTTPRoute$/ { in_route = 1; next }
+  in_route && /^    - backendRefs:[[:space:]]*$/ { in_backends = 1; next }
+  in_backends && /^        - name:[[:space:]]+llm[[:space:]]*$/ { found = 1 }
+  END { exit !found }
+' "${fixture}/litellm-fullname-override.yaml"; then
+  echo 'LiteLLM route did not honor the upstream fullname override' >&2
+  exit 1
+fi
+
+for field in \
+  'runAsNonRoot: true' \
+  'runAsUser: 65534' \
+  'runAsGroup: 65534' \
+  'fsGroup: 65534' \
+  'type: RuntimeDefault' \
+  'allowPrivilegeEscalation: false' \
+  'drop:' \
+  '- ALL'; do
+  require_fixed_count "${field}" 2 "${fixture}/litellm.yaml" \
+    "LiteLLM workload renders omitted restricted Pod Security field: ${field}"
 done
 
 # Components which do not live in the release namespace use explicit values.

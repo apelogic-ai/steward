@@ -48,6 +48,10 @@ spire:
     chown:
       image:
         tag: 1.37.0-uclibc@sha256:31b72538c3019a20336b04c4cebcd47c36511d0b45aa76666804c2845055bbd3
+    upstreamAuthority:
+      disk:
+        secret:
+          create: false
   spire-agent:
     image:
       tag: 1.15.2@sha256:1d042e4040466686e0ee46f74981ff2167c86adfadca19b3835946f4d6047536
