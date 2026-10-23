@@ -1,4 +1,4 @@
-# Source: user journey J1. UI text checked against the 0.3.20 release candidate.
+# Source: user journey J1. UI text checked against the 0.3.21 release candidate.
 # "member" stands for the role that should use the template.
 # "I" is one person who is an administrator and also holds that role.
 Feature: J1 - Administrator sets up a new installation

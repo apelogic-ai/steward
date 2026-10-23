@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-10-22
+
+Steward v0.3.21 adds owner-scoped personal agents with durable conversations, resumable updates,
+and bounded execution through configured coding agents and Envelopes. Installations can also
+accept carefully scoped user access tokens from configured issuers and advertise reviewed
+Kubernetes command and remote-shell grants.
+
+The Helm chart can use independently promoted component repositories and tags, render public
+trust material, and configure optional HTTPRoute timeouts. Security maintenance pins the
+latest-upstream LiteLLM image to an immutable digest and refreshes the bundled web trust roots.
+
 ### Security
 
 - Updated the web runtime to Next.js 16.4.1 while retaining Sharp 0.35.5, resolving two critical
@@ -62,6 +73,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Task-start attempts, unexpected restarts, retained conversation turns, leases, status checks,
   total monitoring time, and every content size. A resumable event stream sends durable status and
   final-reply updates, with heartbeat and no-buffering headers for the browser edge path.
+
+### Upgrade and rollback
+
+- Apply additive migrations 0074 and 0075 before starting v0.3.21. Migration 0074 adds the
+  owner-scoped personal-agent, turn, message, and event tables. Migration 0075 bounds retries for
+  interrupted turns. Neither migration rewrites historical rows. Deploy the chart and all
+  component images as one release unit.
+- Existing chart values retain their prior rendering unless an operator enables a new option. To
+  use user access tokens, configure the exact issuer, audience, frontend clients, token age, and
+  identity claims. Governed Kubernetes commands and remote shell require MCP-GW v0.7.0 or later
+  plus a trusted provisioner that binds the machine to the Run runtime ID.
+- Before rolling back to v0.3.20, stop new personal-agent messages and let active turns finish.
+  Remove v0.3.21-only chart values before installing the older chart, and restore externally
+  managed public ConfigMaps if the v0.3.21 chart created them. Migrations 0074 and 0075 may remain;
+  v0.3.20 ignores those tables. User access-token sign-in, personal agents, and the new command
+  grants are unavailable after rollback.
 
 ## [0.3.20] - 2026-10-18
 
@@ -1521,7 +1548,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.20...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.21...HEAD
+[0.3.21]: https://github.com/apelogic-ai/steward/compare/v0.3.20...v0.3.21
 [0.3.20]: https://github.com/apelogic-ai/steward/compare/v0.3.19...v0.3.20
 [0.3.19]: https://github.com/apelogic-ai/steward/compare/v0.3.18...v0.3.19
 [0.3.18]: https://github.com/apelogic-ai/steward/compare/v0.3.17...v0.3.18
