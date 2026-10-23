@@ -21,7 +21,7 @@ remain disabled.
 | System and server namespaces | `spire.global.spire.namespaces.system.name`, `spire.global.spire.namespaces.server.name` |
 | Trust domain and cluster | `spire.global.spire.trustDomain`, `spire.global.spire.clusterName` |
 
-Every image tag includes an `@sha256:` digest. The wrapper disables upstream
+Every default-render image tag includes an `@sha256:` digest. The wrapper disables upstream
 namespace creation and lifecycle hooks so no unlisted helper image or Namespace
 is introduced.
 

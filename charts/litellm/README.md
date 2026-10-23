@@ -15,7 +15,9 @@ is copied into this wrapper.
 | Existing configuration | `litellm.proxyConfigMap.name`, `litellm.proxyConfigMap.key` |
 | Shared Gateway route | `route.parentRefs`, `route.hostname`, `route.timeouts.*` |
 
-The image tag must include an `@sha256:` digest. Inline master keys, the
+The default proxy and migration image tag includes an `@sha256:` digest.
+Optional upstream extras are disabled by default and are outside this wrapper's
+immutable default image set. Inline master keys, the
 bundled database, generated proxy configuration, credential-shaped inline
 environment variables, password-bearing database URLs, and multiple Secret
 names are refused. The existing configuration must contain the model routes

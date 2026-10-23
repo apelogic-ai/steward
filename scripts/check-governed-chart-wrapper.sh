@@ -29,7 +29,7 @@ template_definitions() {
   find "${directory}" -type f \
     \( -name '*.tpl' -o -name '*.yaml' -o -name '*.yml' \) \
     -exec sed -nE \
-    's/.*\{\{[- ]*define[[:space:]]+"([^"]+)".*/\1/p' {} + \
+    's/.*\{\{[- ]*(define|block)[[:space:]]+"([^"]+)".*/\2/p' {} + \
     | sort -u
 }
 

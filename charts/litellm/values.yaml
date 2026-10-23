@@ -9,6 +9,19 @@ litellm:
     - governed-execution
   envVars: {}
   extraEnvVars: {}
+  extraResources: []
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
   proxyConfigMap:
     create: false
     name: litellm-config
@@ -19,6 +32,7 @@ litellm:
     endpoint: postgresql.steward-test.svc.cluster.local
     database: litellm
     url: "postgresql\u003a//$(DATABASE_USERNAME)\u003a$(DATABASE_PASSWORD)\u0040$(DATABASE_HOST)/$(DATABASE_NAME)"
+    readReplicaUrl: ""
     secret:
       name: governed-execution
       usernameKey: litellm-database-username
