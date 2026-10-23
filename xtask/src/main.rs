@@ -5105,6 +5105,48 @@ mod tests {
     }
 
     #[test]
+    fn g1_exercises_exact_governed_routes_and_refuses_escapes() -> Result<(), String> {
+        let script_path = root().join("scripts/g1-upstream-conformance-inside.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+
+        for (method, path) in [
+            ("POST", "/mcp"),
+            ("DELETE", "/mcp"),
+            ("POST", "/cli/run"),
+            ("POST", "/cli/jobs"),
+            ("POST", "/shell/run"),
+            ("POST", "/shell/jobs"),
+        ] {
+            assert!(
+                script.contains(&format!("method: {method}\n              path: {path}")),
+                "G-1 must configure the exact {method} {path} route"
+            );
+            assert!(
+                script.contains(&format!("assert_allowed_route {method} {path}")),
+                "G-1 must prove that the exact {method} {path} route reaches the controlled upstream"
+            );
+        }
+
+        for refused_probe in [
+            "assert_denied_route POST /cli/run/extra",
+            "assert_denied_route POST '/cli/run?escape=1'",
+            "assert_denied_route GET /cli/run",
+            "assert_denied_route POST /cli/other",
+        ] {
+            assert!(
+                script.contains(refused_probe),
+                "G-1 must retain the route escape probe: {refused_probe}"
+            );
+        }
+        assert!(
+            script.contains("https://docs.rs"),
+            "G-1 must retain an alternate-host escape probe"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn migration_diff_accepts_a_divergent_base() -> Result<(), String> {
         let repository = TestRepository::create()?;
         git(&repository.path, &["init", "--initial-branch=main"])?;
