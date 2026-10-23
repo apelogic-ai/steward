@@ -403,6 +403,12 @@ mod tests {
 
     #[test]
     fn sensitive_values_are_redacted_without_dropping_the_event() -> Result<(), String> {
+        let password_url = [
+            "database postgresql://alice:",
+            "password-fixture",
+            "@db.example.test/steward failed",
+        ]
+        .concat();
         let cases = [
             (
                 "Authorization: Bearer auth-fixture-value",
@@ -420,10 +426,7 @@ mod tests {
                 "assertion eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl",
                 "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl",
             ),
-            (
-                "database postgresql://alice:password-fixture@db.example.test/steward failed",
-                "password-fixture",
-            ),
+            (password_url.as_str(), "password-fixture"),
             ("user alice@example.com was rejected", "alice@example.com"),
             ("api_key=key-fixture-value", "key-fixture-value"),
         ];
