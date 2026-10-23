@@ -48,8 +48,15 @@ RUN curl --fail --silent --show-error --location \
     && rm /tmp/ripgrep.deb /tmp/libonig5.deb \
         /tmp/libjq1.deb /tmp/jq.deb /tmp/fd-find.deb /tmp/tree.deb \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
-    && npm install --global --ignore-scripts=false @anthropic-ai/claude-code@2.1.222 \
+    && npm install --global --ignore-scripts=false @anthropic-ai/claude-code@2.1.222 tar@7.5.22 \
+    && npm pack --silent tar@7.5.22 --pack-destination /tmp \
+    && rm -rf /usr/lib/node_modules/npm/node_modules/tar \
+    && mkdir -p /usr/lib/node_modules/npm/node_modules/tar \
+    && tar --extract --gzip --file /tmp/tar-7.5.22.tgz --strip-components=1 --directory /usr/lib/node_modules/npm/node_modules/tar \
+    && rm /tmp/tar-7.5.22.tgz \
     && test -x /usr/bin/claude \
+    && test "$(node --print 'require("/usr/lib/node_modules/tar/package.json").version')" = "7.5.22" \
+    && test "$(node --print 'require("/usr/lib/node_modules/npm/node_modules/tar/package.json").version')" = "7.5.22" \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin apt-get purge --yes --auto-remove linux-libc-dev
 
 USER sandbox
