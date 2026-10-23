@@ -142,6 +142,23 @@ if ! grep -Fq 'litellm wrapper redefines an upstream template name' \
   exit 1
 fi
 
+mkdir -p "${fixture}/without-rg"
+printf '%s\n' '#!/bin/sh' 'exit 127' >"${fixture}/without-rg/rg"
+chmod +x "${fixture}/without-rg/rg"
+helper_guard_without_rg=""
+if helper_guard_without_rg="$(
+  PATH="${fixture}/without-rg:${PATH}" \
+    check_wrapper_boundary "${fixture}/mutations/litellm-helper" 2>&1
+)"; then
+  echo 'wrapper guard accepted an upstream helper override without ripgrep' >&2
+  exit 1
+fi
+if ! grep -Fq 'litellm wrapper redefines an upstream template name' \
+  <<<"${helper_guard_without_rg}"; then
+  echo 'wrapper guard without ripgrep failed for an unexpected reason' >&2
+  exit 1
+fi
+
 for chart in openshell agent-sandbox; do
   mutation="${fixture}/mutations/${chart}-deployment"
   cp -R "${fixture}/charts/${chart}" "${mutation}"

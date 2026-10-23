@@ -26,11 +26,11 @@ done
 template_definitions() {
   local directory="$1"
   [[ -d "${directory}" ]] || return 0
-  rg --hidden --no-ignore --no-filename -o \
-    '\{\{[- ]*define[[:space:]]+"[^"]+"' \
-    "${directory}" 2>/dev/null \
-    | sed -E 's/.*define[[:space:]]+"([^"]+)".*/\1/' \
-    | sort -u || true
+  find "${directory}" -type f \
+    \( -name '*.tpl' -o -name '*.yaml' -o -name '*.yml' \) \
+    -exec sed -nE \
+    's/.*\{\{[- ]*define[[:space:]]+"([^"]+)".*/\1/p' {} + \
+    | sort -u
 }
 
 template_definitions "${chart}/templates" >"${work}/wrapper-definitions"
