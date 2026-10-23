@@ -31,6 +31,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   exits 125 before startup when those settings are missing or changed. Operators must mirror the
   new `referenceRuntimes.claudeCode` artifact and use its digest in the binding before activation.
 
+### Security
+
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness).
+
 ## [0.3.21] - 2026-10-22
 
 Steward v0.3.21 adds owner-scoped personal agents with durable conversations, resumable updates,
