@@ -112,22 +112,25 @@ test \"\$(readlink /usr/local/bin/remote-shell)\" = mcp-gw-sandbox-helper
 
 # Both helpers must fail closed with exit code 125 when a usable edge grant is
 # unavailable. The only token visible to the sandbox is the substitution marker.
-for command in \
-  "kubectl get pods" \
-  "remote-shell machine.test -- uname -a"
-do
+check_helper_refusal() {
+  expected=\$1
+  shift
   set +e
   output=\$(env \
     MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder \
     MCP_GW_CLI_URL=http://127.0.0.1:1/cli/run \
     MCP_GW_SHELL_URL=http://127.0.0.1:1/shell/run \
-    /bin/sh -c \"\$command\" 2>&1)
+    \"\$@\" 2>&1)
   status=\$?
   set -e
   test \"\$status\" -eq 125
-  test \"\$output\" = \"Sandbox helper request failed\"
+  last_line=\$(printf '%s\\n' \"\$output\" | tail -n 1)
+  test \"\$last_line\" = \"\$expected\"
   case \"\$output\" in
     *openshell-token-grant-placeholder*) exit 1 ;;
   esac
-done
+}
+check_helper_refusal \"CLI request failed\" kubectl get pods
+check_helper_refusal \"Remote shell request failed\" \
+  remote-shell machine.test -- uname -a
 "
