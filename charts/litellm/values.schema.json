@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["litellm", "route"],
+  "properties": {
+    "global": {"type": "object"},
+    "litellm": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["image", "masterkeySecretName", "masterkeySecretKey", "environmentSecrets", "proxyConfigMap", "db", "redis", "ingress", "envVars", "extraEnvVars", "extraResources"],
+      "not": {"required": ["masterkey"]},
+      "properties": {
+        "image": {"$ref": "#/definitions/digestTagImage"},
+        "masterkeySecretName": {"$ref": "#/definitions/name"},
+        "masterkeySecretKey": {"$ref": "#/definitions/key"},
+        "environmentSecrets": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/name"}},
+        "environmentConfigMaps": {"type": "array", "maxItems": 0},
+        "envVars": {"type": "object", "maxProperties": 0},
+        "extraEnvVars": {"type": "object", "maxProperties": 0},
+        "extraContainers": {"type": "array", "maxItems": 0},
+        "extraInitContainers": {"type": "array", "maxItems": 0},
+        "command": {"type": "object", "maxProperties": 0},
+        "migrationJob": {
+          "type": "object",
+          "properties": {
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "extraInitContainers": {"type": "array", "maxItems": 0}
+          }
+        },
+        "extraResources": {"type": "array", "maxItems": 0},
+        "redis": {
+          "type": "object",
+          "properties": {
+            "enabled": {"const": false},
+            "auth": {
+              "type": "object",
+              "properties": {"password": {"const": ""}}
+            }
+          }
+        },
+        "db": {
+          "type": "object",
+          "required": ["useExisting", "deployStandalone", "url", "secret"],
+          "properties": {
+            "useExisting": {"const": true},
+            "deployStandalone": {"const": false},
+            "url": {"const": "postgresql\u003a//$(DATABASE_USERNAME)\u003a$(DATABASE_PASSWORD)\u0040$(DATABASE_HOST)/$(DATABASE_NAME)"},
+            "readReplicaUrl": {"const": ""},
+            "secret": {
+              "type": "object",
+              "required": ["name", "usernameKey", "passwordKey"],
+              "properties": {
+                "name": {"$ref": "#/definitions/name"},
+                "usernameKey": {"$ref": "#/definitions/key"},
+                "passwordKey": {"$ref": "#/definitions/key"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "route": {"$ref": "#/definitions/route"}
+  },
+  "definitions": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+    "key": {"type": "string", "minLength": 1, "maxLength": 253},
+    "digestTagImage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "parentRefs", "hostname", "timeouts"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "parentRefs": {"type": "array", "items": {"type": "object"}},
+        "hostname": {"type": "string"},
+        "timeouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["request", "backendRequest"],
+          "properties": {"request": {"type": "string"}, "backendRequest": {"type": "string"}}
+        }
+      },
+      "allOf": [{
+        "if": {"properties": {"enabled": {"const": true}}},
+        "then": {
+          "properties": {
+            "parentRefs": {"minItems": 1},
+            "hostname": {"minLength": 1},
+            "timeouts": {
+              "properties": {
+                "request": {"pattern": "^[0-9]+(ms|s|m|h)$"},
+                "backendRequest": {"pattern": "^[0-9]+(ms|s|m|h)$"}
+              }
+            }
+          }
+        }
+      }]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: openshell
+description: Pinned OpenShell runtime dependency for governed Steward installations
+type: application
+version: 0.3.22
+appVersion: 0.0.98
+kubeVersion: ">=1.32.0-0"
+home: https://github.com/apelogic-ai/steward
+sources:
+  - https://github.com/NVIDIA/OpenShell
+dependencies:
+  - name: helm-chart
+    alias: openshell
+    repository: oci://ghcr.io/nvidia/openshell
+    version: 0.0.98
+annotations:
+  artifacthub.io/license: Apache-2.0
+  steward.apelogic.ai/upstream-chart: oci://ghcr.io/nvidia/openshell/helm-chart:0.0.98
+  steward.apelogic.ai/upstream-chart-digest: sha256:891b09f7d60e9341af2bb545b3d1a4a6c39870f6f48a77d8bddca3f443c6a9e6

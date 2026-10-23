@@ -11,7 +11,14 @@ for required in \
   'released-artifact-acceptance:' \
   'needs: [publish-images, publish-chart]' \
   'needs.released-artifact-acceptance.result' \
-  'bash scripts/customer-core-install-e2e.sh'
+  'bash scripts/customer-core-install-e2e.sh' \
+  'chart: [steward, spire, agent-sandbox, openshell, litellm, arc]' \
+  'scripts/prepare-governed-dependency-charts.sh' \
+  "dist/helm-chart-\$dependency_chart.digest" \
+  'dependencyCharts: {' \
+  '"agent-sandbox": {reference:' \
+  'cp "dist/helm-chart-steward.spdx.json" dist/helm-chart.spdx.json' \
+  'cp "dist/helm-chart-steward.vulnerabilities.json" dist/helm-chart.vulnerabilities.json'
 do
   grep -Fq "${required}" "${workflow}" || {
     echo "release workflow omitted ${required}" >&2
@@ -81,6 +88,8 @@ for required in \
   'steward-trigger-receiver:release-validation' \
   'docker push' \
   'helm push' \
+  'scripts/prepare-governed-dependency-charts.sh' \
+  'for dependency_chart in spire agent-sandbox openshell litellm arc' \
   '--plain-http 2>&1' \
   "bash \"\${root}/scripts/customer-core-install-e2e.sh\""
 do

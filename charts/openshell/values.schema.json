@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["openshell", "route"],
+  "properties": {
+    "global": {"type": "object"},
+    "openshell": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["image", "supervisor", "server", "pkiInitJob", "certManager", "grpcRoute"],
+      "properties": {
+        "image": {"$ref": "#/definitions/digestTagImage"},
+        "supervisor": {
+          "type": "object",
+          "required": ["image"],
+          "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+        },
+        "server": {
+          "type": "object",
+          "required": ["sandboxNamespace", "sandboxImage", "externalDbSecret", "tls", "sandboxJwt"],
+          "properties": {
+            "sandboxNamespace": {"$ref": "#/definitions/name"},
+            "sandboxImage": {"$ref": "#/definitions/immutableImage"},
+            "externalDbSecret": {"$ref": "#/definitions/name"},
+            "tls": {
+              "type": "object",
+              "required": ["certSecretName", "clientCaSecretName", "clientTlsSecretName"],
+              "properties": {
+                "certSecretName": {"$ref": "#/definitions/name"},
+                "clientCaSecretName": {"$ref": "#/definitions/name"},
+                "clientTlsSecretName": {"$ref": "#/definitions/name"}
+              }
+            },
+            "sandboxJwt": {
+              "type": "object",
+              "required": ["signingSecretName"],
+              "properties": {"signingSecretName": {"$ref": "#/definitions/name"}}
+            }
+          }
+        }
+      }
+    },
+    "route": {"$ref": "#/definitions/route"}
+  },
+  "definitions": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+    "digestTagImage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "immutableImage": {"type": "string", "pattern": "^[^[:space:]@]+@sha256:[0-9a-f]{64}$"},
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "parentRefs", "hostname"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "parentRefs": {"type": "array", "items": {"type": "object"}},
+        "hostname": {"type": "string"}
+      },
+      "allOf": [{
+        "if": {"properties": {"enabled": {"const": true}}},
+        "then": {
+          "properties": {
+            "parentRefs": {"minItems": 1},
+            "hostname": {"minLength": 1}
+          }
+        }
+      }]
+    }
+  }
+}
