@@ -1870,7 +1870,7 @@ mod tests {
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_API_KEY",
             "openshell-token-grant-placeholder",
-            "DISABLE_UPDATES",
+            "DISABLE_AUTOUPDATER",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -1882,6 +1882,10 @@ mod tests {
                 "Claude Code launcher must enforce {required}"
             );
         }
+        assert!(
+            !launcher.contains("${DISABLE_UPDATES-}"),
+            "Claude Code launcher must not rely on the unused legacy update flag"
+        );
 
         for required in [
             "check_refusal missing-base-url",
@@ -1890,11 +1894,11 @@ mod tests {
             "check_refusal updates-enabled",
             "check_refusal nonessential-traffic-enabled",
             "check_refusal alternate-auth",
-            "test \"$(id -u)\" -ne 0",
-            "test ! -e \"$HOME/.claude.json\"",
-            "test ! -e \"$HOME/.claude/.credentials.json\"",
-            "test ! -e \"$HOME/.credentials.json\"",
-            "test ! -e \"$HOME/.config/claude\"",
+            "test \\\"\\$(id -u)\\\" -ne 0",
+            "test ! -e \\\"\\$HOME/.claude.json\\\"",
+            "test ! -e \\\"\\$HOME/.claude/.credentials.json\\\"",
+            "test ! -e \\\"\\$HOME/.credentials.json\\\"",
+            "test ! -e \\\"\\$HOME/.config/claude\\\"",
             "settings*.json",
             "apiKeyHelper",
             "AWS_ACCESS_KEY_ID",

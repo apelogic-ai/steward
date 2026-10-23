@@ -40,32 +40,32 @@ check_refusal() {
 common=(
   ANTHROPIC_BASE_URL=https://inference.example.test
   ANTHROPIC_API_KEY=openshell-token-grant-placeholder
-  DISABLE_UPDATES=1
+  DISABLE_AUTOUPDATER=1
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 )
 
 check_refusal missing-base-url \
   ANTHROPIC_API_KEY=openshell-token-grant-placeholder \
-  DISABLE_UPDATES=1 \
+  DISABLE_AUTOUPDATER=1 \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 check_refusal missing-placeholder \
   ANTHROPIC_BASE_URL=https://inference.example.test \
-  DISABLE_UPDATES=1 \
+  DISABLE_AUTOUPDATER=1 \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 check_refusal wrong-placeholder \
   ANTHROPIC_BASE_URL=https://inference.example.test \
   ANTHROPIC_API_KEY=not-the-edge-placeholder \
-  DISABLE_UPDATES=1 \
+  DISABLE_AUTOUPDATER=1 \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 check_refusal updates-enabled \
   ANTHROPIC_BASE_URL=https://inference.example.test \
   ANTHROPIC_API_KEY=openshell-token-grant-placeholder \
-  DISABLE_UPDATES=0 \
+  DISABLE_AUTOUPDATER=0 \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 check_refusal nonessential-traffic-enabled \
   ANTHROPIC_BASE_URL=https://inference.example.test \
   ANTHROPIC_API_KEY=openshell-token-grant-placeholder \
-  DISABLE_UPDATES=1 \
+  DISABLE_AUTOUPDATER=1 \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0
 
 for endpoint in \
@@ -82,9 +82,15 @@ do
   check_refusal malformed-base-url \
     ANTHROPIC_BASE_URL="${endpoint}" \
     ANTHROPIC_API_KEY=openshell-token-grant-placeholder \
-    DISABLE_UPDATES=1 \
+    DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 done
+
+check_refusal legacy-update-flag \
+  ANTHROPIC_BASE_URL=https://inference.example.test \
+  ANTHROPIC_API_KEY=openshell-token-grant-placeholder \
+  DISABLE_UPDATES=1 \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 for variable in \
   ANTHROPIC_AUTH_TOKEN \
