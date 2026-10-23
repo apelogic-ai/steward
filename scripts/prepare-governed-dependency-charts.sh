@@ -48,7 +48,7 @@ for chart in spire agent-sandbox openshell litellm arc; do
 done
 
 agent_archive="${work}/agent-sandbox-v0.5.0.tar.gz"
-curl -fsSL \
+curl --fail --location --silent --show-error \
   https://api.github.com/repos/kubernetes-sigs/agent-sandbox/tarball/v0.5.0 \
   -o "${agent_archive}"
 verify_hash \
@@ -68,7 +68,7 @@ python3 "${root}/scripts/prepare-agent-sandbox-chart.py" \
   "${output}/agent-sandbox/.upstream/agent-sandbox"
 
 litellm_archive="${work}/litellm-v1.106.2.tar.gz"
-curl -fsSL \
+curl --fail --location --silent --show-error \
   https://github.com/BerriAI/litellm/archive/refs/tags/v1.106.2.tar.gz \
   -o "${litellm_archive}"
 verify_hash \

@@ -12,6 +12,31 @@ command -v curl >/dev/null || {
   echo 'missing governed chart test tool: curl' >&2
   exit 2
 }
+
+require_fixed() {
+  local expected="$1" path="$2" description="$3"
+  if ! grep -Fq -- "${expected}" "${path}"; then
+    echo "governed chart assertion failed: ${description}" >&2
+    exit 1
+  fi
+}
+
+require_regex() {
+  local expected="$1" path="$2" description="$3"
+  if ! grep -Eq -- "${expected}" "${path}"; then
+    echo "governed chart assertion failed: ${description}" >&2
+    exit 1
+  fi
+}
+
+require_file() {
+  local path="$1" description="$2"
+  if [[ ! -f "${path}" ]]; then
+    echo "governed chart assertion failed: ${description}" >&2
+    exit 1
+  fi
+}
+
 for chart in ${charts}; do
   for file in Chart.yaml README.md values.schema.json values.yaml; do
     if [[ ! -f "${root}/charts/${chart}/${file}" ]]; then
@@ -109,7 +134,8 @@ database_host="$(printf '$%s' '(DATABASE_HOST)')"
 database_name="$(printf '$%s' '(DATABASE_NAME)')"
 database_url="postgresql://${database_user}"
 database_url+=":${database_auth}@${database_host}/${database_name}"
-grep -Fq "${database_url}" "${fixture}/litellm.yaml"
+require_fixed "${database_url}" "${fixture}/litellm.yaml" \
+  'LiteLLM did not render its Secret-backed database URL'
 
 # Upstream-backed wrappers may own integration resources and validation only.
 # They must not copy or override upstream workloads.
@@ -200,40 +226,54 @@ litellm_pin="$(
   sed -nE 's/^LATEST_IMAGE="([^"]+)"$/\1/p' \
     "${root}/scripts/g4-upstream-conformance"
 )"
-grep -Fq "${litellm_pin##*@}" "${root}/charts/litellm/values.yaml"
-grep -Fq 'appVersion: 1.106.2' "${root}/charts/litellm/Chart.yaml"
+require_fixed "${litellm_pin##*@}" "${root}/charts/litellm/values.yaml" \
+  'LiteLLM values do not match the conformance image digest'
+require_fixed 'appVersion: 1.106.2' "${root}/charts/litellm/Chart.yaml" \
+  'LiteLLM appVersion does not match the pinned upstream release'
 
 # The OpenShell application version is already a released install contract.
 openshell_version="$(
   sed -nE 's/^OPEN_SHELL_RELEASE="v([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' \
     "${root}/scripts/openshell-adapter-e2e.sh"
 )"
-grep -Eq "^[[:space:]]*appVersion:[[:space:]]*\"?${openshell_version}\"?$" \
-  "${root}/charts/openshell/Chart.yaml"
-grep -Eq "^[[:space:]]+version:[[:space:]]*\"?${openshell_version}\"?$" \
-  "${root}/charts/openshell/Chart.yaml"
+require_regex \
+  "^[[:space:]]*appVersion:[[:space:]]*\"?${openshell_version}\"?$" \
+  "${root}/charts/openshell/Chart.yaml" \
+  'OpenShell appVersion does not match the adapter pin'
+require_regex \
+  "^[[:space:]]+version:[[:space:]]*\"?${openshell_version}\"?$" \
+  "${root}/charts/openshell/Chart.yaml" \
+  'OpenShell dependency version does not match the adapter pin'
 
 agent_sandbox_version="$(
   sed -nE 's/^pinned_agent_sandbox = "v([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' \
     "${root}/conformance/register.toml"
 )"
-grep -Fq "appVersion: ${agent_sandbox_version}" \
-  "${root}/charts/agent-sandbox/Chart.yaml"
+require_fixed "appVersion: ${agent_sandbox_version}" \
+  "${root}/charts/agent-sandbox/Chart.yaml" \
+  'agent-sandbox appVersion does not match the conformance pin'
 spire_version="$(
   sed -nE 's/^pinned_spire = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' \
     "${root}/conformance/register.toml"
 )"
-grep -Fq "appVersion: ${spire_version}" "${root}/charts/spire/Chart.yaml"
-grep -Fq -- '--version 0.29.0' "${root}/scripts/openshell-testbed.sh"
-grep -Fq -- '--version 0.5.0' "${root}/scripts/openshell-testbed.sh"
-grep -Fq "SPIRE | \`spire\` chart 0.29.0, \`spire-crds\` chart 0.5.0" \
-  "${root}/docs/installation/installation-guide.md"
+require_fixed "appVersion: ${spire_version}" \
+  "${root}/charts/spire/Chart.yaml" \
+  'SPIRE appVersion does not match the conformance pin'
+require_fixed '--version 0.29.0' "${root}/scripts/openshell-testbed.sh" \
+  'OpenShell testbed does not match the wrapped SPIRE chart version'
+require_fixed '--version 0.5.0' "${root}/scripts/openshell-testbed.sh" \
+  'OpenShell testbed does not match the vendored SPIRE CRD version'
+spire_doc_pin="SPIRE | \`spire\` chart 0.29.0, \`spire-crds\` chart 0.5.0"
+require_fixed "${spire_doc_pin}" \
+  "${root}/docs/installation/installation-guide.md" \
+  'installation guide does not record the wrapped SPIRE chart versions'
 base_sandbox_image="$(
   sed -nE 's/^pinned_base_sandbox_image = "([^"]+)"$/\1/p' \
     "${root}/conformance/register.toml"
 )"
-grep -Fq "sandboxImage: ${base_sandbox_image}" \
-  "${root}/charts/openshell/values.yaml"
+require_fixed "sandboxImage: ${base_sandbox_image}" \
+  "${root}/charts/openshell/values.yaml" \
+  'OpenShell sandbox image does not match the conformance pin'
 if grep -Eq '^[[:space:]]+- name: spire-crds$' \
   "${root}/charts/spire/Chart.yaml"; then
   echo 'spire still depends on the late-rendered upstream CRD chart' >&2
@@ -437,8 +477,9 @@ for chart in openshell litellm; do
   helm template complete-route "${fixture}/charts/${chart}" \
     --namespace steward-test "${complete_route[@]}" \
     >"${fixture}/${chart}-route.yaml"
-  grep -Eq '^kind:[[:space:]]+(GRPC|HTTP)Route$' \
-    "${fixture}/${chart}-route.yaml"
+  require_regex '^kind:[[:space:]]+(GRPC|HTTP)Route$' \
+    "${fixture}/${chart}-route.yaml" \
+    "${chart} did not render the enabled shared-Gateway route"
 
   if [[ "${chart}" == openshell ]]; then
     if ! PATH="${fixture}/without-curl:${PATH}" \
@@ -498,7 +539,9 @@ helm template namespace-test "${fixture}/charts/agent-sandbox" \
   --namespace steward-test \
   --set-string agentSandbox.namespace.name=sandbox-system-test \
   >"${fixture}/agent-sandbox-namespace.yaml"
-grep -Fq 'namespace: sandbox-system-test' "${fixture}/agent-sandbox-namespace.yaml"
+require_fixed 'namespace: sandbox-system-test' \
+  "${fixture}/agent-sandbox-namespace.yaml" \
+  'agent-sandbox did not use its configured namespace'
 if grep -Fq 'namespace: agent-sandbox-system' "${fixture}/agent-sandbox-namespace.yaml"; then
   echo 'agent-sandbox ignored agentSandbox.namespace.name' >&2
   exit 1
@@ -508,20 +551,25 @@ if grep -Eq 'app.kubernetes.io/version:[[:space:]].*@sha256:' \
   echo 'agent-sandbox rendered an image digest into a Kubernetes label' >&2
   exit 1
 fi
-grep -Eq 'app.kubernetes.io/version:[[:space:]]+"v0.5.0"$' \
-  "${fixture}/agent-sandbox-namespace.yaml"
+require_regex 'app.kubernetes.io/version:[[:space:]]+"v0.5.0"$' \
+  "${fixture}/agent-sandbox-namespace.yaml" \
+  'agent-sandbox did not retain its release version label'
 helm template namespace-test "${fixture}/charts/arc" \
   --namespace steward-test \
   --set-string arc.namespaceOverride=arc-system-test \
   >"${fixture}/arc-namespace.yaml"
-grep -Fq 'namespace: arc-system-test' "${fixture}/arc-namespace.yaml"
+require_fixed 'namespace: arc-system-test' \
+  "${fixture}/arc-namespace.yaml" \
+  'ARC did not use its configured namespace'
 helm template namespace-test "${fixture}/charts/spire" \
   --namespace steward-test \
   --set-string spire.global.spire.namespaces.system.name=spire-system-test \
   --set-string spire.global.spire.namespaces.server.name=spire-server-test \
   >"${fixture}/spire-namespace.yaml"
-grep -Fq 'namespace: spire-system-test' "${fixture}/spire-namespace.yaml"
-grep -Fq 'namespace: spire-server-test' "${fixture}/spire-namespace.yaml"
+require_fixed 'namespace: spire-system-test' "${fixture}/spire-namespace.yaml" \
+  'SPIRE agent resources did not use the configured system namespace'
+require_fixed 'namespace: spire-server-test' "${fixture}/spire-namespace.yaml" \
+  'SPIRE server resources did not use the configured server namespace'
 
 if [[ ! -d "${fixture}/charts/agent-sandbox/.upstream/agent-sandbox" ]]; then
   echo 'agent-sandbox did not wrap the pinned upstream Helm chart' >&2
@@ -540,7 +588,9 @@ for crd in \
   extensions.agents.x-k8s.io_sandboxclaims.yaml \
   extensions.agents.x-k8s.io_sandboxtemplates.yaml \
   extensions.agents.x-k8s.io_sandboxwarmpools.yaml; do
-  test -f "${fixture}/charts/agent-sandbox/.upstream/agent-sandbox/crds/${crd}"
+  require_file \
+    "${fixture}/charts/agent-sandbox/.upstream/agent-sandbox/crds/${crd}" \
+    "agent-sandbox upstream chart omitted CRD ${crd}"
 done
 
 # Every dependency chart must remain renderable as a nested dependency without
