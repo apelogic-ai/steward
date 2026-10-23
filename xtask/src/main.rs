@@ -1835,6 +1835,7 @@ mod tests {
             "TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e",
             "sha256sum --check --strict",
             "COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude",
+            "build/claude-code-image-state-check.sh",
             "USER sandbox",
             "test ! -e \"$HOME/.claude.json\"",
             "test ! -e \"$HOME/.claude/.credentials.json\"",
@@ -1848,6 +1849,21 @@ mod tests {
             assert!(
                 container.contains(required),
                 "Claude Code reference runtime must retain {required}"
+            );
+        }
+        for fixture in [
+            "clean-skills",
+            "api-key-helper",
+            "settings-env-credential",
+            "credential-shaped-string",
+            "credentials-file",
+            "managed-settings",
+        ] {
+            assert!(
+                fs::read_to_string(root().join("scripts/test-claude-code-launcher.sh"))
+                    .map_err(|error| format!("Claude Code refusal tests are required: {error}"))?
+                    .contains(fixture),
+                "Claude Code image-state tests must cover {fixture}"
             );
         }
         for forbidden in [

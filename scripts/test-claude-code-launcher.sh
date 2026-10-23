@@ -3,11 +3,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 launcher="${ROOT}/build/claude-code-launcher.sh"
+image_state_checker="${ROOT}/build/claude-code-image-state-check.sh"
 temporary_directory="$(mktemp -d)"
 trap 'find "${temporary_directory}" -depth -delete' EXIT INT TERM
 
 if [[ ! -x "${launcher}" ]]; then
   echo "Claude Code fail-closed launcher is missing or not executable" >&2
+  exit 1
+fi
+if [[ ! -x "${image_state_checker}" ]]; then
+  echo "Claude Code image-state checker is missing or not executable" >&2
   exit 1
 fi
 
@@ -105,3 +110,54 @@ for variable in \
 do
   check_refusal alternate-auth "${common[@]}" "${variable}=untrusted"
 done
+
+fixture_root="${temporary_directory}/image-state"
+mkdir -p "${fixture_root}"
+
+new_fixture() {
+  local name="$1"
+  fixture_home="${fixture_root}/${name}/home"
+  fixture_managed_settings="${fixture_root}/${name}/managed-settings.json"
+  mkdir -p "${fixture_home}/.claude/skills"
+}
+
+check_image_state_refusal() {
+  local name="$1"
+  local output status
+  set +e
+  output="$("${image_state_checker}" "${fixture_home}" "${fixture_managed_settings}" 2>&1)"
+  status=$?
+  set -e
+  if [[ "${status}" == 0 ]]; then
+    echo "${name}: expected image-state refusal" >&2
+    exit 1
+  fi
+  if [[ "${output}" != "Claude Code image state check failed" ]]; then
+    echo "${name}: image-state checker did not return its generic refusal" >&2
+    exit 1
+  fi
+}
+
+new_fixture clean-skills
+printf '%s\n' 'public runtime skill' >"${fixture_home}/.claude/skills/README.md"
+"${image_state_checker}" "${fixture_home}" "${fixture_managed_settings}"
+
+new_fixture api-key-helper
+printf '%s\n' '{"apiKeyHelper":"/bin/false"}' >"${fixture_home}/.claude/settings.local.json"
+check_image_state_refusal api-key-helper
+
+new_fixture settings-env-credential
+printf '%s\n' '{"env":{"ANTHROPIC_AUTH_TOKEN":"untrusted"}}' >"${fixture_home}/.claude/settings.json"
+check_image_state_refusal settings-env-credential
+
+new_fixture credential-shaped-string
+printf 'sk-ant-%s\n' 'aaaaaaaaaaaaaaaaaaaa' >"${fixture_home}/.claude/note.txt"
+check_image_state_refusal credential-shaped-string
+
+new_fixture credentials-file
+printf '%s\n' '{}' >"${fixture_home}/.claude/.credentials.json"
+check_image_state_refusal credentials-file
+
+new_fixture managed-settings
+printf '%s\n' '{}' >"${fixture_managed_settings}"
+check_image_state_refusal managed-settings
