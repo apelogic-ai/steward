@@ -339,6 +339,93 @@ for namespace_create_path in \
 done
 
 # Routes are accepted only with the complete shared-Gateway contract.
+validate_openshell_route_schema() {
+  local rendered_route="$1"
+  local scope field invalid=0 saw_rule=0
+
+  # Compact property snapshot from Gateway API v1.3.0's GRPCRoute CRD:
+  # https://github.com/kubernetes-sigs/gateway-api/blob/v1.3.0/config/crd/standard/gateway.networking.k8s.io_grpcroutes.yaml
+  # Source CRD SHA-256:
+  # 5867279c3cfd77377fe7e9255b22751f17592242b9b5e7485c74b13b268d13c5
+  local spec_fields='hostnames parentRefs rules'
+  local rule_fields='backendRefs filters matches'
+
+  grep -Fxq 'apiVersion: gateway.networking.k8s.io/v1' \
+    "${rendered_route}" || {
+    echo 'OpenShell route does not use the pinned Gateway API version' >&2
+    return 1
+  }
+  grep -Fxq 'kind: GRPCRoute' "${rendered_route}" || {
+    echo 'OpenShell route is not a GRPCRoute' >&2
+    return 1
+  }
+
+  while read -r scope field; do
+    case "${scope}" in
+      spec)
+        if [[ " ${spec_fields} " != *" ${field} "* ]]; then
+          echo "OpenShell GRPCRoute spec field is absent from Gateway API v1.3.0: ${field}" >&2
+          invalid=1
+        fi
+        ;;
+      rule)
+        saw_rule=1
+        if [[ " ${rule_fields} " != *" ${field} "* ]]; then
+          echo "OpenShell GRPCRoute rule field is absent from Gateway API v1.3.0: ${field}" >&2
+          invalid=1
+        fi
+        ;;
+    esac
+  done < <(
+    awk '
+      /^---$/ {
+        in_route = 0
+        in_spec = 0
+        in_rules = 0
+      }
+      /^kind:[[:space:]]+GRPCRoute[[:space:]]*$/ {
+        in_route = 1
+        next
+      }
+      in_route && /^spec:[[:space:]]*$/ {
+        in_spec = 1
+        next
+      }
+      in_spec && /^  [A-Za-z][A-Za-z0-9]*:[[:space:]]*/ {
+        field = $0
+        sub(/^  /, "", field)
+        sub(/:.*/, "", field)
+        print "spec", field
+        in_rules = (field == "rules")
+        next
+      }
+      in_rules && /^    - [A-Za-z][A-Za-z0-9]*:[[:space:]]*/ {
+        field = $0
+        sub(/^    - /, "", field)
+        sub(/:.*/, "", field)
+        print "rule", field
+        next
+      }
+      in_rules && /^      [A-Za-z][A-Za-z0-9]*:[[:space:]]*/ {
+        field = $0
+        sub(/^      /, "", field)
+        sub(/:.*/, "", field)
+        print "rule", field
+      }
+    ' "${rendered_route}"
+  )
+
+  if ((saw_rule == 0)); then
+    echo 'OpenShell GRPCRoute has no rule to validate' >&2
+    return 1
+  fi
+  ((invalid == 0))
+}
+
+mkdir -p "${fixture}/without-curl"
+printf '%s\n' '#!/bin/sh' 'exit 97' >"${fixture}/without-curl/curl"
+chmod +x "${fixture}/without-curl/curl"
+
 for chart in openshell litellm; do
   complete_route=(--set route.enabled=true
     --set-string route.parentRefs[0].name=shared-gateway
@@ -354,32 +441,31 @@ for chart in openshell litellm; do
     "${fixture}/${chart}-route.yaml"
 
   if [[ "${chart}" == openshell ]]; then
-    gateway_crd="${fixture}/gateway-api-v1.3.0-grpcroutes.yaml"
-    curl -fsSL \
-      https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/v1.3.0/config/crd/standard/gateway.networking.k8s.io_grpcroutes.yaml \
-      -o "${gateway_crd}"
-    gateway_crd_sha="$({
-      if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "${gateway_crd}"
-      else
-        shasum -a 256 "${gateway_crd}"
-      fi
-    } | awk '{print $1}')"
-    [[ "${gateway_crd_sha}" == 5867279c3cfd77377fe7e9255b22751f17592242b9b5e7485c74b13b268d13c5 ]] || {
-      echo 'Gateway API v1.3.0 GRPCRoute CRD checksum mismatch' >&2
-      exit 1
-    }
-    if grep -Eq '^[[:space:]]+timeouts:' "${gateway_crd}"; then
-      echo 'Pinned GRPCRoute schema unexpectedly includes timeouts' >&2
+    if ! PATH="${fixture}/without-curl:${PATH}" \
+      validate_openshell_route_schema "${fixture}/${chart}-route.yaml"; then
+      echo 'OpenShell route did not pass offline schema validation' >&2
       exit 1
     fi
-    if awk '
-      /^---$/ { in_route = 0 }
-      /^kind:[[:space:]]+GRPCRoute[[:space:]]*$/ { in_route = 1; next }
-      in_route && /^[[:space:]]+timeouts:[[:space:]]*/ { found = 1 }
-      END { exit found ? 0 : 1 }
-    ' "${fixture}/${chart}-route.yaml"; then
-      echo 'OpenShell rendered a field absent from the pinned GRPCRoute schema' >&2
+    awk '
+      { print }
+      /^  rules:[[:space:]]*$/ {
+        print "    - timeouts:"
+        print "        request: 30s"
+      }
+    ' "${fixture}/${chart}-route.yaml" \
+      >"${fixture}/${chart}-route-unknown-field.yaml"
+    route_schema_output=""
+    if route_schema_output="$(
+      validate_openshell_route_schema \
+        "${fixture}/${chart}-route-unknown-field.yaml" 2>&1
+    )"; then
+      echo 'OpenShell route schema accepted the unsupported timeouts field' >&2
+      exit 1
+    fi
+    if ! grep -Fq \
+      'OpenShell GRPCRoute rule field is absent from Gateway API v1.3.0: timeouts' \
+      <<<"${route_schema_output}"; then
+      echo 'OpenShell route schema refused the mutation for an unexpected reason' >&2
       exit 1
     fi
   fi
