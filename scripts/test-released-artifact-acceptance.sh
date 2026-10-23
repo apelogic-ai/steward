@@ -4,17 +4,29 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="${root}/.github/workflows/release.yml"
 ci_workflow="${root}/.github/workflows/ci.yml"
+release_validator="${root}/scripts/validate-release-artifacts.sh"
 harness="${root}/scripts/customer-core-install-e2e.sh"
 candidate_harness="${root}/scripts/release-candidate-acceptance.sh"
 
 for required in \
   'released-artifact-acceptance:' \
+  'needs: [validate, publish-images]' \
   'needs: [publish-images, publish-chart]' \
   'needs.released-artifact-acceptance.result' \
   'bash scripts/customer-core-install-e2e.sh' \
-  'chart: [steward, spire, agent-sandbox, openshell, litellm, arc]' \
+  'chart: [steward, steward-bundle, spire, agent-sandbox, openshell, litellm, arc]' \
   'scripts/prepare-governed-dependency-charts.sh' \
+  'scripts/prepare-steward-bundle-chart.sh' \
+  'Download released image digests for bundle' \
+  "name: release-image-\${{ matrix.component }}" \
+  'pattern: release-image-*' \
+  'STEWARD_BUNDLE_RELEASE_APISERVER_DIGEST' \
+  'Install released bundle in a clean cluster' \
+  'STEWARD_RELEASE_BUNDLE_CHART_REPOSITORY' \
+  "scripts/steward-bundle-kind-smoke.sh \"\${bundle_archive}\"" \
   "dist/helm-chart-\$dependency_chart.digest" \
+  'dist/helm-chart-steward-bundle.digest' \
+  'bundleChart: {' \
   'dependencyCharts: {' \
   '"agent-sandbox": {reference:' \
   'cp "dist/helm-chart-steward.spdx.json" dist/helm-chart.spdx.json' \
@@ -89,7 +101,11 @@ for required in \
   'docker push' \
   'helm push' \
   'scripts/prepare-governed-dependency-charts.sh' \
+  'scripts/prepare-steward-bundle-chart.sh' \
+  "STEWARD_BUNDLE_RELEASE_IMAGE_REPOSITORY=\"\${runtime_repository}\"" \
   'for dependency_chart in spire agent-sandbox openshell litellm arc' \
+  'helm template candidate-bundle' \
+  "bash \"\${root}/scripts/steward-bundle-kind-smoke.sh\" \"\${bundle_archive}\"" \
   '--plain-http 2>&1' \
   "bash \"\${root}/scripts/customer-core-install-e2e.sh\""
 do
@@ -111,5 +127,11 @@ do
     exit 1
   }
 done
+
+grep -Fq "bash \"\${root}/scripts/test-steward-bundle-chart.sh\"" \
+  "${release_validator}" || {
+  echo 'release validation omitted the steward-bundle chart contract' >&2
+  exit 1
+}
 
 echo 'released-artifact acceptance contract passed'
