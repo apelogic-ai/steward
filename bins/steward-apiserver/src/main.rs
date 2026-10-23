@@ -2850,6 +2850,18 @@ autoProvisionThreshold:
                 .ok_or_else(|| "installer has no parent".to_owned())?,
         )
         .map_err(|error| format!("create preflight fixture: {error}"))?;
+        fs::create_dir_all(bundle.join("profiles"))
+            .map_err(|error| format!("create preflight profile fixture: {error}"))?;
+        fs::copy(
+            root.join("config/provider-profile-bundle/v1.3.0/bundle.json"),
+            bundle.join("bundle.json"),
+        )
+        .map_err(|error| format!("copy preflight bundle fixture: {error}"))?;
+        fs::write(
+            bundle.join("profiles/steward-mcp-gw.json"),
+            r#"{"network":{"allowedRoutes":[{"method":"POST","path":"/mcp"},{"method":"DELETE","path":"/mcp"},{"method":"POST","path":"/cli/run"},{"method":"POST","path":"/cli/jobs"},{"method":"POST","path":"/shell/run"},{"method":"POST","path":"/shell/jobs"}]},"runtime":{"requiredBinaries":["/usr/bin/curl","/usr/local/bin/steward-connections-bridge","/usr/local/bin/mcp-gw-sandbox-helper"]}}"#,
+        )
+        .map_err(|error| format!("write preflight profile fixture: {error}"))?;
         fs::write(
             &installer,
             r##"#!/bin/sh
