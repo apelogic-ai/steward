@@ -1277,7 +1277,12 @@ impl TaskProcessLogSink for ControllerTaskProcessLogSink {
         stream: TaskProcessStream,
         message: &[u8],
     ) {
-        eprintln!("{}", task_process_log_record(context, stream, message));
+        steward_logging::emit_with_stream(
+            steward_logging::LogLevel::Info,
+            &context.runtime_uid,
+            stream.as_str(),
+            format_args!("{}", task_process_log_record(context, stream, message)),
+        );
     }
 }
 
@@ -1300,7 +1305,7 @@ fn task_process_log_record(
 #[cfg(feature = "runtime")]
 fn escaped_task_log_value(value: &[u8]) -> String {
     fn append_valid_utf8(output: &mut String, value: &str) {
-        for character in value.chars() {
+        for character in steward_logging::redact_text(value).chars() {
             match character {
                 '\\' => output.push_str("\\\\"),
                 '"' => output.push_str("\\\""),
@@ -2975,18 +2980,18 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     self.observe_task(attempt_id, request).await
                 }
                 Ok(_) => {
-                    eprintln!(
-                        "openshell_task_launch_failed runtime_uid=\"{}\" category=launcher_unconfirmed",
-                        escaped_task_log_value(request.runtime.0.as_bytes())
+                    steward_logging::error!(
+                        request_id = request.runtime.0,
+                        "openshell_task_launch_failed category=launcher_unconfirmed"
                     );
                     Err(PortError::Failed {
                         reason: "OpenShell task launch could not be confirmed".to_owned(),
                     })
                 }
                 Err(error) => {
-                    eprintln!(
-                        "openshell_task_launch_failed runtime_uid=\"{}\" category=transport",
-                        escaped_task_log_value(request.runtime.0.as_bytes())
+                    steward_logging::error!(
+                        request_id = request.runtime.0,
+                        "openshell_task_launch_failed category=transport"
                     );
                     Err(error)
                 }

@@ -68,6 +68,8 @@ struct JsonLogEvent<'a> {
     level: &'static str,
     component: &'a str,
     request_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<&'a str>,
     message: &'a str,
 }
 
@@ -100,6 +102,15 @@ pub fn init(component: &'static str) {
 }
 
 pub fn emit(level: LogLevel, request_id: Option<&str>, message: fmt::Arguments<'_>) {
+    emit_event(level, request_id, None, message);
+}
+
+fn emit_event(
+    level: LogLevel,
+    request_id: Option<&str>,
+    stream: Option<&str>,
+    message: fmt::Arguments<'_>,
+) {
     let fallback = ProcessLogConfig {
         format: LogFormat::Plain,
         component: "steward",
@@ -107,12 +118,13 @@ pub fn emit(level: LogLevel, request_id: Option<&str>, message: fmt::Arguments<'
     let config = PROCESS_LOG_CONFIG.get().copied().unwrap_or(fallback);
     let message = message.to_string();
     let mut stderr = io::stderr().lock();
-    let _ = write_event(
+    let _ = write_event_with_stream(
         &mut stderr,
         config.format,
         level,
         config.component,
         request_id,
+        stream,
         &message,
     );
 }
@@ -124,6 +136,17 @@ pub fn emit_with_request_id(
 ) {
     let request_id = request_id.to_string();
     emit(level, Some(&request_id), message);
+}
+
+/// Emits a process event with its task output stream as a structured field.
+pub fn emit_with_stream(
+    level: LogLevel,
+    request_id: &impl fmt::Display,
+    stream: &str,
+    message: fmt::Arguments<'_>,
+) {
+    let request_id = request_id.to_string();
+    emit_event(level, Some(&request_id), Some(stream), message);
 }
 
 #[macro_export]
@@ -164,8 +187,20 @@ pub fn render_event(
     request_id: Option<&str>,
     message: &str,
 ) -> String {
+    render_event_with_stream(format, level, component, request_id, None, message)
+}
+
+pub fn render_event_with_stream(
+    format: LogFormat,
+    level: LogLevel,
+    component: &str,
+    request_id: Option<&str>,
+    stream: Option<&str>,
+    message: &str,
+) -> String {
     let message = redact(message);
     let request_id = request_id.map(redact);
+    let stream = stream.map(redact);
     match format {
         LogFormat::Plain => message,
         LogFormat::Json => {
@@ -173,6 +208,7 @@ pub fn render_event(
                 level: level.as_str(),
                 component,
                 request_id: request_id.as_deref(),
+                stream: stream.as_deref(),
                 message: &message,
             };
             serde_json::to_string(&event).unwrap_or_else(|_| {
@@ -190,25 +226,65 @@ pub fn write_event(
     request_id: Option<&str>,
     message: &str,
 ) -> io::Result<()> {
-    writer.write_all(render_event(format, level, component, request_id, message).as_bytes())?;
+    write_event_with_stream(writer, format, level, component, request_id, None, message)
+}
+
+fn write_event_with_stream(
+    writer: &mut impl Write,
+    format: LogFormat,
+    level: LogLevel,
+    component: &str,
+    request_id: Option<&str>,
+    stream: Option<&str>,
+    message: &str,
+) -> io::Result<()> {
+    writer.write_all(
+        render_event_with_stream(format, level, component, request_id, stream, message).as_bytes(),
+    )?;
     writer.write_all(b"\n")
+}
+
+/// Removes credential-shaped values from text before it reaches a log sink.
+pub fn redact_text(message: &str) -> String {
+    redact(message)
+}
+
+#[derive(Clone, Copy)]
+enum PendingSensitiveField {
+    Authorization,
+    Value,
 }
 
 fn redact(message: &str) -> String {
     let mut output = String::with_capacity(message.len());
     let mut redact_following = 0_u8;
+    let mut pending_field = None;
     for piece in message.split_inclusive(char::is_whitespace) {
         let token = piece.trim_end_matches(char::is_whitespace);
         let whitespace = &piece[token.len()..];
         let (replacement, following) = if redact_following > 0 {
             redact_following -= 1;
             (Some(REDACTED), 0)
+        } else if let Some(field) = pending_field {
+            if is_field_separator(token) {
+                (None, 0)
+            } else {
+                pending_field = None;
+                let following = u8::from(
+                    matches!(field, PendingSensitiveField::Authorization)
+                        && is_authorization_scheme(token),
+                );
+                (Some(REDACTED), following)
+            }
         } else if let Some(following) = sensitive_field(token) {
             (Some(REDACTED), following)
-        } else if token_is_bearer(token) {
-            (Some(REDACTED), 1)
+        } else if let Some(field) = standalone_sensitive_field(token) {
+            pending_field = Some(field);
+            (None, 0)
+        } else if let Some(following) = bearer_value(token) {
+            (Some(REDACTED), following)
         } else if contains_secret_key(token)
-            || is_jwt(token)
+            || contains_jwt(token)
             || is_password_url(token)
             || is_email(token)
         {
@@ -229,72 +305,123 @@ fn sensitive_field(token: &str) -> Option<u8> {
     let field = normalized[..separator]
         .trim_matches(['"', '\'', '}', ']', ')'])
         .to_ascii_lowercase();
-    let sensitive = matches!(
-        field.as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "token"
-            | "access_token"
-            | "access-token"
-            | "api_key"
-            | "api-key"
-            | "key"
-            | "secret"
-            | "password"
-            | "client_secret"
-            | "client-secret"
-            | "private_key"
-            | "private-key"
-            | "database_url"
-            | "database-url"
-    );
-    if !sensitive {
-        return None;
-    }
-    let value =
-        normalized[separator + 1..].trim_matches(['"', '\'', '{', '}', '[', ']', '(', ')', ',']);
+    let field_kind = classify_sensitive_field(&field)?;
+    let value = normalized[separator + 1..]
+        .trim_matches(['"', '\'', '\\', '{', '}', '[', ']', '(', ')', ',', ';']);
     if value.is_empty() {
-        Some(if field.contains("authorization") {
-            2
-        } else {
-            1
-        })
+        Some(
+            if matches!(field_kind, PendingSensitiveField::Authorization) {
+                2
+            } else {
+                1
+            },
+        )
+    } else if matches!(field_kind, PendingSensitiveField::Authorization)
+        && is_authorization_scheme(value)
+    {
+        Some(1)
     } else {
         Some(0)
     }
 }
 
-fn token_is_bearer(token: &str) -> bool {
-    token
-        .trim_matches(|character: char| !character.is_ascii_alphanumeric())
-        .eq_ignore_ascii_case("bearer")
+fn standalone_sensitive_field(token: &str) -> Option<PendingSensitiveField> {
+    let field = token
+        .trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+        })
+        .to_ascii_lowercase();
+    classify_sensitive_field(&field)
+}
+
+fn classify_sensitive_field(field: &str) -> Option<PendingSensitiveField> {
+    match field {
+        "authorization" | "proxy-authorization" => Some(PendingSensitiveField::Authorization),
+        "token" | "access_token" | "access-token" | "api_key" | "api-key" | "x-api-key"
+        | "x_api_key" | "key" | "secret" | "password" | "client_secret" | "client-secret"
+        | "private_key" | "private-key" | "database_url" | "database-url" | "id_token"
+        | "id-token" | "jwt" | "assertion" => Some(PendingSensitiveField::Value),
+        _ => None,
+    }
+}
+
+fn is_field_separator(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b':' | b'=' | b'"' | b'\'' | b'\\'))
+}
+
+fn is_authorization_scheme(token: &str) -> bool {
+    matches!(
+        token.trim_matches(|character: char| !character.is_ascii_alphanumeric()),
+        value if value.eq_ignore_ascii_case("bearer") || value.eq_ignore_ascii_case("basic")
+    )
+}
+
+fn bearer_value(token: &str) -> Option<u8> {
+    let normalized = token
+        .trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, ':' | '=')
+        })
+        .to_ascii_lowercase();
+    if normalized == "bearer" {
+        Some(1)
+    } else if normalized
+        .strip_prefix("bearer:")
+        .or_else(|| normalized.strip_prefix("bearer="))
+        .is_some_and(|value| !value.is_empty())
+    {
+        Some(0)
+    } else {
+        None
+    }
 }
 
 fn contains_secret_key(token: &str) -> bool {
     let normalized = token
         .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .to_ascii_lowercase();
-    normalized
-        .find("sk-")
-        .is_some_and(|index| normalized.len().saturating_sub(index) >= 8)
+    normalized.starts_with("sk-") && normalized.len() >= 8
 }
 
-fn is_jwt(token: &str) -> bool {
-    let normalized = token.trim_matches(|character: char| {
-        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '.')
-    });
-    let mut segments = normalized.split('.');
-    let valid_segment = |segment: &str| {
-        segment.len() >= 8
-            && segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    };
-    matches!(
-        (segments.next(), segments.next(), segments.next(), segments.next()),
-        (Some(first), Some(second), Some(third), None)
-            if valid_segment(first) && valid_segment(second) && valid_segment(third)
-    )
+fn contains_jwt(token: &str) -> bool {
+    fn segment_end(bytes: &[u8], mut index: usize) -> usize {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            index += 1;
+        }
+        index
+    }
+
+    let bytes = token.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        {
+            index += 1;
+        }
+        let first_start = index;
+        let first_end = segment_end(bytes, first_start);
+        if first_end.saturating_sub(first_start) >= 8 && bytes.get(first_end) == Some(&b'.') {
+            let second_start = first_end + 1;
+            let second_end = segment_end(bytes, second_start);
+            if second_end.saturating_sub(second_start) >= 8 && bytes.get(second_end) == Some(&b'.')
+            {
+                let third_start = second_end + 1;
+                let third_end = segment_end(bytes, third_start);
+                if third_end.saturating_sub(third_start) >= 8 {
+                    return true;
+                }
+            }
+        }
+        index = first_end.saturating_add(1);
+    }
+    false
 }
 
 fn is_password_url(token: &str) -> bool {
@@ -334,7 +461,9 @@ fn is_email(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvalidLogFormat, LogFormat, LogLevel, render_event, write_event};
+    use super::{
+        InvalidLogFormat, LogFormat, LogLevel, render_event, render_event_with_stream, write_event,
+    };
 
     fn assert_redacted_in_both_formats(message: &str, forbidden: &str) -> Result<(), String> {
         for format in [LogFormat::Plain, LogFormat::Json] {
@@ -415,6 +544,24 @@ mod tests {
             serde_json::from_str(&rendered).map_err(|error| error.to_string())?;
         if value.get("request_id") != Some(&serde_json::Value::Null) {
             return Err("an absent request id must be JSON null".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_output_stream_is_a_structured_json_field() -> Result<(), String> {
+        let rendered = render_event_with_stream(
+            LogFormat::Json,
+            LogLevel::Info,
+            "steward-controller",
+            Some("runtime-123"),
+            Some("stdout"),
+            "task output",
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&rendered).map_err(|error| error.to_string())?;
+        if value.get("stream").and_then(serde_json::Value::as_str) != Some("stdout") {
+            return Err(format!("task output stream is not structured: {value}"));
         }
         Ok(())
     }
@@ -509,10 +656,8 @@ mod tests {
 
     #[test]
     fn spaced_password_value_is_redacted_in_both_formats() -> Result<(), String> {
-        assert_redacted_in_both_formats(
-            "password = password-field-fixture",
-            "password-field-fixture",
-        )
+        let message = ["password", " = ", "password-field-fixture"].concat();
+        assert_redacted_in_both_formats(&message, "password-field-fixture")
     }
 
     #[test]

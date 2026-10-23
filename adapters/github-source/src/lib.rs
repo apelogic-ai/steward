@@ -642,7 +642,7 @@ impl GitHubSourceAdapter {
             Err(error) if error.is_timeout() => "timed out".to_owned(),
             Err(_) => "request failed".to_owned(),
         };
-        eprintln!("github source: metadata token revocation failed: {failure}");
+        steward_logging::warn!("github source: metadata token revocation failed: {failure}");
     }
 
     async fn describe_repository(
