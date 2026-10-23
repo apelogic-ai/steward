@@ -18,6 +18,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Releases now include a `linux/amd64` Claude Code reference runtime for 2.1.222, its immutable digest,
+  SBOM, vulnerability report, and provenance. The non-root image includes the same pinned read
+  tools as the Codex runtime and uses the existing `claude-code-v1` execution binding. Its launcher
+  accepts only the deployment-provided Anthropic-compatible LiteLLM URL and OpenShell placeholder,
+  disables updates and nonessential traffic, removes alternate Claude authentication paths, and
+  exits 125 before startup when those settings are missing or changed. Operators must mirror the
+  new `referenceRuntimes.claudeCode` artifact and use its digest in the binding before activation.
 - Installations can advertise governed `kubectl` read, write, and destructive classes plus remote
   shell in the deployment capability catalogue. Envelope requests and templates select those exact
   grants through the existing API-backed editor, Task admission allows any exact subset, and the

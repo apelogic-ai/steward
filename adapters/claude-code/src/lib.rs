@@ -89,7 +89,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "ANTHROPIC_CUSTOM_HEADERS; ",
                 "export ANTHROPIC_BASE_URL=\"$inference_endpoint\"; ",
                 "export ANTHROPIC_API_KEY=openshell-token-grant-placeholder; ",
-                "export DISABLE_UPDATES=1; ",
+                "export DISABLE_AUTOUPDATER=1; ",
                 "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; ",
                 "export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1; ",
                 "mkdir -p \"$CLAUDE_CONFIG_DIR\"; ",

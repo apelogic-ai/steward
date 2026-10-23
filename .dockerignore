@@ -2,6 +2,9 @@
 .steward-run
 .worktrees
 build
+!build/
+build/*
+!build/claude-code-launcher.sh
 charts
 target
 e2e/target

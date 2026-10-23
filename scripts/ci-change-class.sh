@@ -51,6 +51,7 @@ governed-connections       run   skip  skip
 postgres-tls               run   skip  skip
 browser-e2e                run   run   skip
 codex-reference-runtime    run   skip  skip
+claude-code-reference-runtime    run   skip  skip
 release-candidate          run   run   skip
 '
 
