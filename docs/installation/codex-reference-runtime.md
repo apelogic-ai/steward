@@ -68,9 +68,11 @@ Use `steward-runtime-providers@1.3.0` with an image containing the helper. Its
 MCP-GW profile preserves exact `POST /mcp` and `DELETE /mcp` access for the
 existing tool transport and adds exactly `POST /cli/run`, `POST /cli/jobs`,
 `POST /shell/run`, and `POST /shell/jobs` on the configured gateway host.
-Wildcard paths, query variants, other hosts, and all other methods remain
-blocked. The same Task and Envelope API grants drive native UI submissions;
-the UI does not create a separate command or sign-in path.
+Prefix and sibling paths, other hosts, and all other methods remain blocked.
+The route policy matches the HTTP method and URL path; query input is handled
+by the endpoint without broadening that route. The same Task and Envelope API
+grants drive native UI submissions; the UI does not create a separate command
+or sign-in path.
 
 Example agent commands are:
 
