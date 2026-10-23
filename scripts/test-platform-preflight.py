@@ -48,6 +48,42 @@ class PlatformPreflightTests(unittest.TestCase):
     ) -> None:
         installer = self.profile_bundle / "bin" / "steward-provider-profile"
         installer.parent.mkdir(parents=True, exist_ok=True)
+        mcp_binaries = ["/usr/bin/curl"]
+        if include_bridge_binary:
+            mcp_binaries.append("/usr/local/bin/steward-connections-bridge")
+        if exact_routes:
+            mcp_binaries.append("/usr/local/bin/mcp-gw-sandbox-helper")
+            network = {
+                "allowedRoutes": [
+                    {"method": "POST", "path": "/mcp"},
+                    {"method": "DELETE", "path": "/mcp"},
+                    {"method": "POST", "path": "/cli/run"},
+                    {"method": "POST", "path": "/cli/jobs"},
+                    {"method": "POST", "path": "/shell/run"},
+                    {"method": "POST", "path": "/shell/jobs"},
+                ]
+            }
+        else:
+            methods = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"]
+            if include_delete:
+                methods.append("DELETE")
+            network = {"allowedMethods": methods}
+        (self.profile_bundle / "profiles").mkdir(parents=True, exist_ok=True)
+        (self.profile_bundle / "bundle.json").write_text(
+            json.dumps(
+                {"bundle": {"id": "steward-runtime-providers", "version": bundle_version}}
+            ),
+            encoding="utf-8",
+        )
+        (self.profile_bundle / "profiles" / "steward-mcp-gw.json").write_text(
+            json.dumps(
+                {
+                    "network": network,
+                    "runtime": {"requiredBinaries": mcp_binaries},
+                }
+            ),
+            encoding="utf-8",
+        )
         validated_profiles = (
             "[{'id': 'steward-litellm', 'digest': 'sha256:' + '7' * 64}, "
             "{'id': 'steward-mcp-gw', 'digest': 'sha256:' + '8' * 64}]"
