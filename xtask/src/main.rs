@@ -26,12 +26,13 @@ use process::{checked_command, require_executed_tool_version, require_tool_versi
 
 type TaskResult = Result<(), String>;
 
-const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 5] = [
+const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 6] = [
     ("1.0.0", "config/provider-profile-bundle/v1"),
     ("1.1.0", "config/provider-profile-bundle/v1.1.0"),
     ("1.2.0", "config/provider-profile-bundle/v1.2.0"),
     ("1.2.1", "config/provider-profile-bundle/v1.2.1"),
     ("1.2.2", "config/provider-profile-bundle/v1.2.2"),
+    ("1.3.0", "config/provider-profile-bundle/v1.3.0"),
 ];
 
 fn main() -> ExitCode {
@@ -1936,6 +1937,7 @@ mod tests {
             ("1.2.0", "/v1.2.0"),
             ("1.2.1", "/v1.2.1"),
             ("1.2.2", "/v1.2.2"),
+            ("1.3.0", "/v1.3.0"),
         ] {
             let inputs = serde_json::json!({
                 "bundle": {"id": "steward-runtime-providers", "version": version}
@@ -1948,11 +1950,11 @@ mod tests {
             );
         }
         let unsupported = serde_json::json!({
-            "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"}
+            "bundle": {"id": "steward-runtime-providers", "version": "1.3.1"}
         });
         let result = provider_profile_bundle_directory_for_inputs(&unsupported.to_string());
         assert!(
-            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.0")),
+            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.1")),
             "unknown bundle identities must fail closed: {result:?}"
         );
         Ok(())
@@ -5103,6 +5105,51 @@ mod tests {
     }
 
     #[test]
+    fn g1_exercises_exact_governed_routes_and_refuses_escapes() -> Result<(), String> {
+        let script_path = root().join("scripts/g1-upstream-conformance-inside.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+
+        for (method, path) in [
+            ("POST", "/mcp"),
+            ("DELETE", "/mcp"),
+            ("POST", "/cli/run"),
+            ("POST", "/cli/jobs"),
+            ("POST", "/shell/run"),
+            ("POST", "/shell/jobs"),
+        ] {
+            assert!(
+                script.contains(&format!("method: {method}\n              path: {path}")),
+                "G-1 must configure the exact {method} {path} route"
+            );
+            assert!(
+                script.contains(&format!("assert_allowed_route {method} {path}")),
+                "G-1 must prove that the exact {method} {path} route reaches the controlled upstream"
+            );
+        }
+
+        for refused_probe in [
+            "assert_denied_route POST /cli/run/extra",
+            "assert_denied_route GET /cli/run",
+            "assert_denied_route POST /cli/other",
+        ] {
+            assert!(
+                script.contains(refused_probe),
+                "G-1 must retain the route escape probe: {refused_probe}"
+            );
+        }
+        assert!(
+            script.contains("assert_upstream_rejects_query POST '/cli/run?escape=1'"),
+            "G-1 must prove that the endpoint rejects an unexpected query on an allowed route"
+        );
+        assert!(
+            script.contains("https://docs.rs"),
+            "G-1 must retain an alternate-host escape probe"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn migration_diff_accepts_a_divergent_base() -> Result<(), String> {
         let repository = TestRepository::create()?;
         git(&repository.path, &["init", "--initial-branch=main"])?;
@@ -5256,6 +5303,88 @@ mod tests {
             assert!(
                 generator.contains(required),
                 "workflow generator must retain BOM-backed selector binding `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn governed_command_helper_is_pinned_packaged_and_tested() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
+            .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
+        let e2e = fs::read_to_string(root().join("scripts/codex-reference-runtime-e2e.sh"))
+            .map_err(|error| format!("Codex reference runtime E2E is required: {error}"))?;
+        let profile = fs::read_to_string(
+            root().join("config/provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json"),
+        )
+        .map_err(|error| format!("governed command provider profile is required: {error}"))?;
+        let profile_json: serde_json::Value = serde_json::from_str(&profile)
+            .map_err(|error| format!("governed command provider profile must be JSON: {error}"))?;
+        let guide = fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
+            .map_err(|error| format!("Codex reference runtime guide is required: {error}"))?;
+
+        for required in [
+            "ARG TARGETARCH",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
+            "cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e",
+            "ca2493fbca2b442b342c06815ea15cc34c68ebd7df65ff1440a19a122bb53b07",
+            "sha256sum --check --strict",
+            "/usr/local/bin/mcp-gw-sandbox-helper",
+            "/usr/local/bin/kubectl",
+            "/usr/local/bin/remote-shell",
+        ] {
+            assert!(
+                container.contains(required),
+                "runtime image must retain {required}"
+            );
+        }
+        assert_eq!(
+            profile_json.pointer("/network/allowedRoutes"),
+            Some(&serde_json::json!([
+                {"method": "POST", "path": "/mcp"},
+                {"method": "DELETE", "path": "/mcp"},
+                {"method": "POST", "path": "/cli/run"},
+                {"method": "POST", "path": "/cli/jobs"},
+                {"method": "POST", "path": "/shell/run"},
+                {"method": "POST", "path": "/shell/jobs"}
+            ])),
+            "the command profile must preserve only the existing MCP transport and exact command routes"
+        );
+        for required in [
+            "MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder",
+            "MCP_GW_CLI_URL",
+            "MCP_GW_SHELL_URL",
+            "exit code 125",
+            "kubectl",
+            "remote-shell",
+        ] {
+            assert!(
+                e2e.contains(required),
+                "governed sandbox E2E must prove {required}"
+            );
+        }
+        for required in [
+            "/cli/run",
+            "/cli/jobs",
+            "/shell/run",
+            "/shell/jobs",
+            "/usr/local/bin/mcp-gw-sandbox-helper",
+        ] {
+            assert!(
+                profile.contains(required),
+                "provider profile must bind {required}"
+            );
+        }
+        for required in [
+            "MCP-GW 0.7.0",
+            "openshell-token-grant-placeholder",
+            "MCP_GW_CLI_URL",
+            "MCP_GW_SHELL_URL",
+        ] {
+            assert!(
+                guide.contains(required),
+                "operator guide must document {required}"
             );
         }
         Ok(())

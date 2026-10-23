@@ -902,10 +902,83 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
     return values
 
 
-def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
+def provider_profile_bundle_contract(
+    bundle: pathlib.Path,
+) -> tuple[dict[str, str], list[dict[str, dict[str, str]]], list[str]]:
+    manifest = read_json(bundle / "bundle.json")
+    identity = require_object(manifest, "bundle", "provider-profile bundle")
+    bundle_id = require_string(identity, "id", "provider-profile bundle.bundle")
+    version = require_string(identity, "version", "provider-profile bundle.bundle")
+    if bundle_id != "steward-runtime-providers":
+        raise ValidationError("provider-profile bundle has an unexpected identity")
+
+    template = read_json(bundle / "profiles" / "steward-mcp-gw.json")
+    network = require_object(template, "network", "provider-profile MCP template")
+    routes = network.get("allowedRoutes")
+    methods = network.get("allowedMethods")
+    if isinstance(routes, list) and methods is None:
+        expected_rules = []
+        for index, route in enumerate(routes):
+            if not isinstance(route, dict):
+                raise ValidationError(
+                    f"provider-profile MCP template route {index} must be an object"
+                )
+            expected_rules.append(
+                {
+                    "allow": {
+                        "method": require_string(
+                            route, "method", f"provider-profile MCP template route {index}"
+                        ),
+                        "path": require_string(
+                            route, "path", f"provider-profile MCP template route {index}"
+                        ),
+                    }
+                }
+            )
+        governed_routes = [
+            {"allow": {"method": "POST", "path": "/mcp"}},
+            {"allow": {"method": "DELETE", "path": "/mcp"}},
+            {"allow": {"method": "POST", "path": "/cli/run"}},
+            {"allow": {"method": "POST", "path": "/cli/jobs"}},
+            {"allow": {"method": "POST", "path": "/shell/run"}},
+            {"allow": {"method": "POST", "path": "/shell/jobs"}},
+        ]
+        if expected_rules != governed_routes:
+            raise ValidationError(
+                "provider-profile MCP template must declare the exact governed gateway routes, including DELETE /mcp"
+            )
+    elif isinstance(methods, list) and routes is None and all(
+        isinstance(method, str) and method for method in methods
+    ):
+        if methods != ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]:
+            raise ValidationError(
+                "provider-profile MCP template must declare the complete legacy MCP transport, including DELETE"
+            )
+        expected_rules = [
+            {"allow": {"method": method, "path": "**"}} for method in methods
+        ]
+    else:
+        raise ValidationError(
+            "provider-profile MCP template must declare one exact network rule mode"
+        )
+
+    runtime = require_object(template, "runtime", "provider-profile MCP template")
+    binaries = runtime.get("requiredBinaries")
+    if not isinstance(binaries, list) or not binaries or not all(
+        isinstance(binary, str) and binary for binary in binaries
+    ):
+        raise ValidationError(
+            "provider-profile MCP template must declare required binaries"
+        )
+    return ({"id": bundle_id, "version": version}, expected_rules, binaries)
+
+
+def provider_profile_inputs(
+    data: dict[str, Any], bundle_identity: dict[str, str]
+) -> dict[str, Any]:
     return {
         "schema": "steward.provider-profile-inputs/v1",
-        "bundle": {"id": "steward-runtime-providers", "version": "1.2.2"},
+        "bundle": bundle_identity,
         "profiles": [
             {
                 "id": profile["name"],
@@ -922,12 +995,15 @@ def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_rendered_connections_profile(
-    data: dict[str, Any], rendered: dict[str, Any]
+    data: dict[str, Any],
+    rendered: dict[str, Any],
+    bundle_identity: dict[str, str],
+    expected_mcp_rules: list[dict[str, dict[str, str]]],
+    expected_mcp_binaries: list[str],
 ) -> None:
     if (
         rendered.get("schema") != "steward.provider-profile-install-state/v1"
-        or rendered.get("bundle")
-        != {"id": "steward-runtime-providers", "version": "1.2.2"}
+        or rendered.get("bundle") != bundle_identity
     ):
         raise ValidationError("released provider-profile renderer returned an unexpected contract")
     profiles = rendered.get("profiles")
@@ -965,17 +1041,11 @@ def validate_rendered_connections_profile(
                 f"rendered provider profile {profile_id} audience must equal execution.endpoints.mintAudience"
             )
         if profile_id == "steward-mcp-gw":
-            required_methods = {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
             for endpoint in endpoints:
                 rules = endpoint.get("rules")
-                methods = {
-                    rule.get("allow", {}).get("method")
-                    for rule in rules
-                    if isinstance(rule, dict) and isinstance(rule.get("allow"), dict)
-                } if isinstance(rules, list) else set()
-                if not required_methods.issubset(methods):
+                if rules != expected_mcp_rules:
                     raise ValidationError(
-                        "rendered steward-mcp-gw endpoints must allow the exact MCP HTTP transport including DELETE"
+                        "rendered steward-mcp-gw endpoints must match the exact governed gateway routes, including DELETE"
                     )
 
     binding = data["execution"]["binding"]
@@ -992,6 +1062,10 @@ def validate_rendered_connections_profile(
         raise ValidationError(
             f"rendered provider profile {tools_profile_id} must include "
             "/usr/local/bin/steward-connections-bridge"
+        )
+    if binaries != expected_mcp_binaries:
+        raise ValidationError(
+            f"rendered provider profile {tools_profile_id} must match the bundle's exact required binaries"
         )
 
     bridge_origin = data["execution"]["connectionsBridge"]["mcpGatewayOrigin"]
@@ -1019,7 +1093,12 @@ def validate_rendered_connections_profile(
 
 
 def resolve_provider_profile_digests(
-    data: dict[str, Any], bundle: pathlib.Path, inputs: dict[str, Any]
+    data: dict[str, Any],
+    bundle: pathlib.Path,
+    inputs: dict[str, Any],
+    bundle_identity: dict[str, str],
+    expected_mcp_rules: list[dict[str, dict[str, str]]],
+    expected_mcp_binaries: list[str],
 ) -> dict[str, str]:
     installer = bundle / "bin" / "steward-provider-profile"
     if not installer.is_file():
@@ -1067,7 +1146,13 @@ def resolve_provider_profile_digests(
             raise ValidationError(
                 "released provider-profile renderer returned an unexpected contract"
             )
-        validate_rendered_connections_profile(data, rendered)
+        validate_rendered_connections_profile(
+            data,
+            rendered,
+            bundle_identity,
+            expected_mcp_rules,
+            expected_mcp_binaries,
+        )
 
         result = subprocess.run(
             [
@@ -1098,8 +1183,7 @@ def resolve_provider_profile_digests(
         report.get("schemaVersion") != "steward.provider-profile-result/v1"
         or report.get("operation") != "validate"
         or report.get("status") != "valid"
-        or report.get("bundle")
-        != {"id": "steward-runtime-providers", "version": "1.2.2"}
+        or report.get("bundle") != bundle_identity
     ):
         raise ValidationError("released provider-profile installer returned an unexpected contract")
     reported_profiles = report.get("profiles")
@@ -1266,9 +1350,17 @@ def generate(args: argparse.Namespace) -> int:
     data = read_json(args.input)
     diagnostics = validate_input(data)
     validate_browser(data)
-    profile_inputs = provider_profile_inputs(data)
+    bundle_identity, expected_mcp_rules, expected_mcp_binaries = (
+        provider_profile_bundle_contract(args.provider_profile_bundle)
+    )
+    profile_inputs = provider_profile_inputs(data, bundle_identity)
     profile_digests = resolve_provider_profile_digests(
-        data, args.provider_profile_bundle, profile_inputs
+        data,
+        args.provider_profile_bundle,
+        profile_inputs,
+        bundle_identity,
+        expected_mcp_rules,
+        expected_mcp_binaries,
     )
     diagnostics.append(
         {
@@ -1314,9 +1406,17 @@ def validate_command(args: argparse.Namespace) -> int:
     data = read_json(args.input)
     diagnostics = validate_input(data)
     validate_browser(data)
-    profile_inputs = provider_profile_inputs(data)
+    bundle_identity, expected_mcp_rules, expected_mcp_binaries = (
+        provider_profile_bundle_contract(args.provider_profile_bundle)
+    )
+    profile_inputs = provider_profile_inputs(data, bundle_identity)
     profile_digests = resolve_provider_profile_digests(
-        data, args.provider_profile_bundle, profile_inputs
+        data,
+        args.provider_profile_bundle,
+        profile_inputs,
+        bundle_identity,
+        expected_mcp_rules,
+        expected_mcp_binaries,
     )
     diagnostics.append(
         {

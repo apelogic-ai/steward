@@ -40,6 +40,58 @@ impl CodexTaskExecutionAdapter {
     }
 }
 
+fn governed_command_environment(
+    request: &TaskExecutionPlanRequest<'_>,
+) -> Result<String, PortError> {
+    let cli = request.tools.iter().any(|tool| {
+        tool.provider == "cli"
+            && tool.resource == "kubectl"
+            && matches!(tool.action.as_str(), "read" | "write" | "destructive")
+    });
+    let shell = request.tools.iter().any(|tool| {
+        tool.provider == "remote-shell"
+            && tool.resource == "remote_shell_run"
+            && tool.action == "write"
+    });
+    if !cli && !shell {
+        return Ok(String::new());
+    }
+    let endpoint = request
+        .tool_transport_endpoint
+        .ok_or_else(|| PortError::Rejected {
+            reason: "governed command execution requires a governed tool endpoint".to_owned(),
+        })?;
+    let mut endpoint = reqwest::Url::parse(endpoint).map_err(|_| PortError::Rejected {
+        reason: "Codex tool endpoint must be an exact HTTP(S) URL".to_owned(),
+    })?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.port() == Some(0)
+    {
+        return Err(PortError::Rejected {
+            reason: "Codex tool endpoint must be an exact HTTP(S) URL".to_owned(),
+        });
+    }
+    let mut environment = "MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder ".to_owned();
+    if cli {
+        endpoint.set_path("/cli/run");
+        environment.push_str("MCP_GW_CLI_URL=");
+        environment.push_str(endpoint.as_str());
+        environment.push(' ');
+    }
+    if shell {
+        endpoint.set_path("/shell/run");
+        environment.push_str("MCP_GW_SHELL_URL=");
+        environment.push_str(endpoint.as_str());
+        environment.push(' ');
+    }
+    Ok(environment)
+}
+
 fn invalid_inference_endpoint() -> PortError {
     PortError::Rejected {
         reason: "Codex inference endpoint must be an exact HTTP(S) URL".to_owned(),
@@ -95,6 +147,7 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
         } else {
             ""
         };
+        let governed_command_environment = governed_command_environment(&request)?;
         let shell_command = format!(
             concat!(
                 "set -eu; umask 077; ",
@@ -109,12 +162,13 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
                 "printf '%s' \"$adapter_config\" > \"$CODEX_HOME/config.toml\"; ",
                 "{}",
+                "{}",
                 "OPENAI_API_KEY=openshell-token-grant-placeholder ",
                 "\"$executable\" exec --ephemeral --skip-git-repo-check ",
                 "--sandbox danger-full-access --model \"$model\" ",
                 "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$prompt\""
             ),
-            tool_bearer_environment,
+            tool_bearer_environment, governed_command_environment,
         );
         let mut command = vec![
             "/bin/sh".to_owned(),
@@ -243,6 +297,82 @@ mod tests {
         assert!(!plan.command[6].contains("[mcp_servers."));
         assert!(!plan.command[6].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
         assert!(!plan.command[2].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn governed_command_grants_expose_only_placeholder_backed_helper_routes() -> Result<(), String>
+    {
+        let adapter =
+            CodexTaskExecutionAdapter::new("https://inference.example.test/v1".to_owned())
+                .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        let model = ModelRef {
+            provider: "example-model".to_owned(),
+            model: "small".to_owned(),
+        };
+        let endpoint = Some("https://tools.example.test/mcp");
+        let command_tools = [
+            ToolGrant {
+                provider: "cli".to_owned(),
+                resource: "kubectl".to_owned(),
+                action: "read".to_owned(),
+            },
+            ToolGrant {
+                provider: "remote-shell".to_owned(),
+                resource: "remote_shell_run".to_owned(),
+                action: "write".to_owned(),
+            },
+        ];
+        let command_plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &model,
+                tools: &command_tools,
+                tool_transport_endpoint: endpoint,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render governed command plan: {error:?}"))?;
+        let shell = &command_plan.command[2];
+        assert!(shell.contains("MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder"));
+        assert!(shell.contains("MCP_GW_CLI_URL=https://tools.example.test/cli/run"));
+        assert!(shell.contains("MCP_GW_SHELL_URL=https://tools.example.test/shell/run"));
+        assert!(!shell.contains("MCP_GW_RUN_TOKEN_FILE"));
+
+        let unrelated_tools = [ToolGrant {
+            provider: "example-tool".to_owned(),
+            resource: "repository".to_owned(),
+            action: "read".to_owned(),
+        }];
+        let unrelated_plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &model,
+                tools: &unrelated_tools,
+                tool_transport_endpoint: endpoint,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render unrelated tool plan: {error:?}"))?;
+        assert!(!unrelated_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
+        assert!(!unrelated_plan.command[2].contains("MCP_GW_CLI_URL"));
+        assert!(!unrelated_plan.command[2].contains("MCP_GW_SHELL_URL"));
+
+        let over_class_tools = [ToolGrant {
+            provider: "cli".to_owned(),
+            resource: "kubectl".to_owned(),
+            action: "admin".to_owned(),
+        }];
+        let over_class_plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &model,
+                tools: &over_class_tools,
+                tool_transport_endpoint: endpoint,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render over-class tool plan: {error:?}"))?;
+        assert!(!over_class_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
+        assert!(!over_class_plan.command[2].contains("MCP_GW_CLI_URL"));
         Ok(())
     }
 
