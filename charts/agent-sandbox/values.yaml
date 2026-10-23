@@ -1,0 +1,14 @@
+targetNamespace: agent-sandbox-system
+nameOverride: ""
+fullnameOverride: ""
+image:
+  repository: registry.k8s.io/agent-sandbox/agent-sandbox-controller
+  tag: v0.5.0
+  digest: sha256:e99cac42f10cac69cab09a91e59f982c9d525b2933a5f5b7dfd52dae09340aa2
+  pullPolicy: IfNotPresent
+crdNamespacePatch:
+  image:
+    repository: registry.k8s.io/kubectl
+    tag: v1.32.1
+    digest: sha256:6ae337221866ae69380cfa08e2b38fa113fd5044cfb5b7a7662f5b0028be23b6
+    pullPolicy: IfNotPresent

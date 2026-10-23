@@ -1,0 +1,39 @@
+{{- $secret := .Values.openshell.server.externalDbSecret -}}
+{{- $secretNames := list
+  .Values.openshell.server.tls.certSecretName
+  .Values.openshell.server.tls.clientCaSecretName
+  .Values.openshell.server.tls.clientTlsSecretName
+  .Values.openshell.server.sandboxJwt.signingSecretName -}}
+{{- range $name := $secretNames -}}
+{{- if ne $name $secret -}}
+{{- fail "OpenShell secret references must name one existing Secret" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.openshell.pkiInitJob.enabled -}}
+{{- fail "OpenShell pkiInitJob must stay disabled; supply the existing Secret" -}}
+{{- end -}}
+{{- if .Values.openshell.certManager.enabled -}}
+{{- fail "OpenShell certManager integration must stay disabled; supply the existing Secret" -}}
+{{- end -}}
+{{- if .Values.openshell.grpcRoute.enabled -}}
+{{- fail "use the wrapper route contract instead of the upstream GRPCRoute" -}}
+{{- end -}}
+{{- if .Values.route.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: {{ include "steward-openshell.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  parentRefs:
+{{ toYaml .Values.route.parentRefs | indent 4 }}
+  hostnames:
+    - {{ .Values.route.hostname | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ include "steward-openshell.fullname" . }}
+          port: 8080
+      timeouts:
+        request: {{ .Values.route.timeouts.request | quote }}
+        backendRequest: {{ .Values.route.timeouts.backendRequest | quote }}
+{{- end }}

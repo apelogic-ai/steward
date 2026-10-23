@@ -18,6 +18,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added separately installable, release-pinned charts for SPIRE, agent-sandbox,
+  OpenShell, LiteLLM, and Actions Runner Controller. They use upstream chart
+  dependencies where available, create no Namespace, accept existing Secret
+  references instead of inline secret material, pin every rendered image by
+  digest, and document cluster-wide permissions and Pod Security needs. The
+  release publishes each chart as its own OCI artifact alongside Steward.
 - Installations can advertise governed `kubectl` read, write, and destructive classes plus remote
   shell in the deployment capability catalogue. Envelope requests and templates select those exact
   grants through the existing API-backed editor, Task admission allows any exact subset, and the

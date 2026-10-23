@@ -1,0 +1,43 @@
+{{- if hasKey .Values.litellm "masterkey" -}}
+{{- fail "inline LiteLLM master-key values are not supported" -}}
+{{- end -}}
+{{- $secret := .Values.litellm.masterkeySecretName -}}
+{{- if ne .Values.litellm.db.secret.name $secret -}}
+{{- fail "LiteLLM secret references must name one existing Secret" -}}
+{{- end -}}
+{{- range $name := .Values.litellm.environmentSecrets -}}
+{{- if ne $name $secret -}}
+{{- fail "LiteLLM environment secret references must name the existing Secret" -}}
+{{- end -}}
+{{- end -}}
+{{- if not .Values.litellm.db.useExisting -}}
+{{- fail "LiteLLM requires an existing database" -}}
+{{- end -}}
+{{- if .Values.litellm.db.deployStandalone -}}
+{{- fail "the bundled LiteLLM database is not supported" -}}
+{{- end -}}
+{{- if .Values.litellm.proxyConfigMap.create -}}
+{{- fail "LiteLLM requires an existing ConfigMap so provider credentials are not stored in the release" -}}
+{{- end -}}
+{{- if .Values.litellm.ingress.enabled -}}
+{{- fail "use the wrapper route contract instead of the upstream Ingress" -}}
+{{- end -}}
+{{- if .Values.route.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "steward-litellm.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  parentRefs:
+{{ toYaml .Values.route.parentRefs | indent 4 }}
+  hostnames:
+    - {{ .Values.route.hostname | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ include "steward-litellm.fullname" . }}
+          port: 4000
+      timeouts:
+        request: {{ .Values.route.timeouts.request | quote }}
+        backendRequest: {{ .Values.route.timeouts.backendRequest | quote }}
+{{- end }}

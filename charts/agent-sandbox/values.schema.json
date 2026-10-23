@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["targetNamespace", "nameOverride", "fullnameOverride", "image", "crdNamespacePatch"],
+  "properties": {
+    "global": {"type": "object"},
+    "targetNamespace": {"$ref": "#/definitions/name"},
+    "nameOverride": {"type": "string", "maxLength": 63},
+    "fullnameOverride": {"type": "string", "maxLength": 63},
+    "image": {"$ref": "#/definitions/image"},
+    "crdNamespacePatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {"image": {"$ref": "#/definitions/image"}}
+    }
+  },
+  "definitions": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "digest", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1, "pattern": "^[^@[:space:]]+$"},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    }
+  }
+}

@@ -424,6 +424,10 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: [steward, spire, agent-sandbox, openshell, litellm, arc]
     permissions:
       contents: read
       packages: write
@@ -455,22 +459,37 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist "$RUNNER_TEMP/chart-scan"
-          helm package charts/steward --destination dist --version "$version" --app-version "$version"
-          tar -xzf "dist/steward-$version.tgz" -C "$RUNNER_TEMP/chart-scan"
-          push_output="$(helm push "dist/steward-$version.tgz" 'oci://ghcr.io/${{ github.repository_owner }}/charts')"
+          chart='${{ matrix.chart }}'
+          chart_directory="charts/$chart"
+          if [[ "$chart" != steward ]]; then
+            bash scripts/prepare-governed-dependency-charts.sh "$RUNNER_TEMP/governed-charts"
+            chart_directory="$RUNNER_TEMP/governed-charts/$chart"
+          fi
+          mkdir -p dist "$RUNNER_TEMP/chart-scan/$chart"
+          if [[ "$chart" == steward ]]; then
+            helm package "$chart_directory" --destination dist --version "$version" --app-version "$version"
+          else
+            helm package "$chart_directory" --destination dist --version "$version"
+          fi
+          tar -xzf "dist/$chart-$version.tgz" -C "$RUNNER_TEMP/chart-scan/$chart"
+          push_output="$(helm push "dist/$chart-$version.tgz" 'oci://ghcr.io/${{ github.repository_owner }}/charts')"
           printf '%s\n' "$push_output"
           digest="$(printf '%s\n' "$push_output" | awk '$1 == "Digest:" {print $2}')"
-          test -n "$digest"
-          printf '%s\n' "$digest" > dist/helm-chart.digest
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$chart" == steward ]]; then
+            digest_file=dist/helm-chart.digest
+          else
+            digest_file="dist/helm-chart-$chart.digest"
+          fi
+          printf '%s\n' "$digest" > "$digest_file"
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Generate chart SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          path: ${{ runner.temp }}/chart-scan
+          path: ${{ runner.temp }}/chart-scan/${{ matrix.chart }}
           format: spdx-json
-          output-file: dist/helm-chart.spdx.json
+          output-file: dist/helm-chart-${{ matrix.chart }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
 
@@ -478,9 +497,9 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           scan-type: fs
-          scan-ref: ${{ runner.temp }}/chart-scan
+          scan-ref: ${{ runner.temp }}/chart-scan/${{ matrix.chart }}
           format: json
-          output: dist/helm-chart.vulnerabilities.json
+          output: dist/helm-chart-${{ matrix.chart }}.vulnerabilities.json
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
 
@@ -488,15 +507,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: release-helm-chart-vulnerability-report
-          path: dist/helm-chart.vulnerabilities.json
+          name: release-helm-chart-${{ matrix.chart }}-vulnerability-report
+          path: dist/helm-chart-${{ matrix.chart }}.vulnerabilities.json
           if-no-files-found: error
 
       - name: Enforce critical chart vulnerability policy
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           scan-type: fs
-          scan-ref: ${{ runner.temp }}/chart-scan
+          scan-ref: ${{ runner.temp }}/chart-scan/${{ matrix.chart }}
           format: table
           exit-code: "1"
           severity: CRITICAL
@@ -504,14 +523,14 @@ jobs:
       - name: Attest chart provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/charts/steward
+          subject-name: ghcr.io/${{ github.repository_owner }}/charts/${{ matrix.chart }}
           subject-digest: ${{ steps.chart.outputs.digest }}
           push-to-registry: true
 
       - name: Upload chart release evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: release-helm-chart
+          name: release-helm-chart-${{ matrix.chart }}
           path: dist/*
           if-no-files-found: error
 
@@ -789,6 +808,11 @@ jobs:
             done
             printf '| chart | oci://%s:%s | %s |\n' \
               "$chart" "$version" "$(cat dist/helm-chart.digest)"
+            for dependency_chart in spire agent-sandbox openshell litellm arc; do
+              printf '| %s chart | oci://ghcr.io/%s/charts/%s:%s | %s |\n' \
+                "$dependency_chart" "$GITHUB_REPOSITORY_OWNER" "$dependency_chart" \
+                "$version" "$(cat "dist/helm-chart-$dependency_chart.digest")"
+            done
             printf '\n## Reference runtimes\n\n'
             printf '| Agent | Platform | Reference | Digest |\n|---|---|---|---|\n'
             printf '| codex@0.140.0 | linux/amd64 | %s:0.140.0-steward-%s | %s |\n' \
@@ -878,9 +902,11 @@ jobs:
           done
           docker buildx imagetools inspect \
             "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)"
-          helm pull "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward" \
-            --version "${GITHUB_REF_NAME#v}" \
-            --destination "$RUNNER_TEMP"
+          for chart in steward spire agent-sandbox openshell litellm arc; do
+            helm pull "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/$chart" \
+              --version "${GITHUB_REF_NAME#v}" \
+              --destination "$RUNNER_TEMP"
+          done
 
       - name: Create GitHub Release
         env:

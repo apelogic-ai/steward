@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-crd-patch
+  namespace: {{ .Values.targetNamespace }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-crd-patch
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    resourceNames: [sandboxes.agents.x-k8s.io]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-crd-patch
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "agent-sandbox.fullname" . }}-crd-patch
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "agent-sandbox.fullname" . }}-crd-patch
+    namespace: {{ .Values.targetNamespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-crd-patch
+  namespace: {{ .Values.targetNamespace }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-9"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "agent-sandbox.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "agent-sandbox.fullname" . }}-crd-patch
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: patch
+          image: "{{ .Values.crdNamespacePatch.image.repository }}:{{ .Values.crdNamespacePatch.image.tag }}@{{ .Values.crdNamespacePatch.image.digest }}"
+          imagePullPolicy: {{ .Values.crdNamespacePatch.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          command: [kubectl]
+          args:
+            - patch
+            - customresourcedefinition
+            - sandboxes.agents.x-k8s.io
+            - --type=json
+            - --patch
+            - >-
+              [{"op":"replace","path":"/spec/conversion/webhook/clientConfig/service/name","value":"{{ include "agent-sandbox.webhookServiceName" . }}"},{"op":"replace","path":"/spec/conversion/webhook/clientConfig/service/namespace","value":"{{ .Values.targetNamespace }}"}]

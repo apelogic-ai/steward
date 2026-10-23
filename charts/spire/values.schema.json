@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spire", "spire-crds"],
+  "properties": {
+    "global": {"type": "object"},
+    "spire-crds": {"type": "object", "additionalProperties": true},
+    "spire": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["global", "spire-server", "spire-agent", "spiffe-csi-driver", "spiffe-oidc-discovery-provider"],
+      "properties": {
+        "global": {
+          "type": "object",
+          "properties": {
+            "spire": {
+              "type": "object",
+              "properties": {
+                "namespaces": {
+                  "type": "object",
+                  "properties": {"create": {"const": false}}
+                }
+              }
+            }
+          }
+        },
+        "spire-server": {
+          "type": "object",
+          "properties": {
+            "image": {"$ref": "#/definitions/digestTagImage"},
+            "controllerManager": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            },
+            "chown": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            }
+          }
+        },
+        "spire-agent": {"type": "object", "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}},
+        "spiffe-csi-driver": {
+          "type": "object",
+          "properties": {
+            "image": {"$ref": "#/definitions/digestTagImage"},
+            "nodeDriverRegistrar": {"type": "object", "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}}
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "digestTagImage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["tag"],
+      "properties": {"tag": {"type": "string", "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"}}
+    }
+  }
+}

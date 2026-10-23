@@ -1,0 +1,38 @@
+openshell:
+  image:
+    repository: ghcr.io/nvidia/openshell/gateway
+    tag: 0.0.98@sha256:34677638828895420d5e3dbf4811c8fad0358dd6cb22000e57523d2551cab9c8
+    pullPolicy: IfNotPresent
+  supervisor:
+    image:
+      repository: ghcr.io/nvidia/openshell/supervisor
+      tag: 0.0.98@sha256:3ccf9a11d49e229744d113e4c1c23a5a0c4283e8ed6f3368f390f7af07421be4
+      pullPolicy: IfNotPresent
+    topology: sidecar
+    sideloadMethod: init-container
+    sidecar:
+      processBinaryAwareNetworkPolicy: true
+  server:
+    sandboxNamespace: openshell-sandboxes
+    sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
+    externalDbSecret: governed-execution
+    tls:
+      certSecretName: governed-execution
+      clientCaSecretName: governed-execution
+      clientTlsSecretName: governed-execution
+    sandboxJwt:
+      signingSecretName: governed-execution
+  pkiInitJob:
+    enabled: false
+  certManager:
+    enabled: false
+  grpcRoute:
+    enabled: false
+
+route:
+  enabled: false
+  parentRefs: []
+  hostname: ""
+  timeouts:
+    request: ""
+    backendRequest: ""
