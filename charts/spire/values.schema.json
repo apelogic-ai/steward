@@ -139,7 +139,9 @@
               "type": "object",
               "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
             },
-            "extraEnv": {"type": "array", "maxItems": 0}
+            "extraEnv": {"type": "array", "maxItems": 0},
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0}
           }
         },
         "spire-agent": {
@@ -154,7 +156,9 @@
               "type": "object",
               "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
             },
-            "extraEnvVars": {"type": "array", "maxItems": 0}
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0}
           }
         },
         "spiffe-csi-driver": {
@@ -162,6 +166,7 @@
           "properties": {
             "image": {"$ref": "#/definitions/digestTagImage"},
             "extraEnvVars": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0},
             "nodeDriverRegistrar": {
               "type": "object",
               "properties": {
@@ -177,12 +182,17 @@
         },
         "upstream-spire-agent": {
           "type": "object",
-          "properties": {"extraEnvVars": {"type": "array", "maxItems": 0}}
+          "properties": {
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0}
+          }
         },
         "upstream-spiffe-csi-driver": {
           "type": "object",
           "properties": {
             "extraEnvVars": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0},
             "nodeDriverRegistrar": {
               "type": "object",
               "properties": {"extraEnvVars": {"type": "array", "maxItems": 0}}

@@ -18,6 +18,16 @@
         "environmentConfigMaps": {"type": "array", "maxItems": 0},
         "envVars": {"type": "object", "maxProperties": 0},
         "extraEnvVars": {"type": "object", "maxProperties": 0},
+        "extraContainers": {"type": "array", "maxItems": 0},
+        "extraInitContainers": {"type": "array", "maxItems": 0},
+        "command": {"type": "object", "maxProperties": 0},
+        "migrationJob": {
+          "type": "object",
+          "properties": {
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "extraInitContainers": {"type": "array", "maxItems": 0}
+          }
+        },
         "extraResources": {"type": "array", "maxItems": 0},
         "redis": {
           "type": "object",
