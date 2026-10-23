@@ -1340,6 +1340,8 @@ mod tests {
             .map_err(|error| format!("Bun workspace manifest is required: {error}"))?;
         let web_package = fs::read_to_string(repository.join("web/package.json"))
             .map_err(|error| format!("steward-web package manifest is required: {error}"))?;
+        let bun_lock = fs::read_to_string(repository.join("bun.lock"))
+            .map_err(|error| format!("Bun lockfile is required: {error}"))?;
         let proxy = fs::read_to_string(repository.join("web/src/proxy.ts"))
             .map_err(|error| format!("nonce-compatible Next proxy is required: {error}"))?;
         let layout = fs::read_to_string(repository.join("web/src/app/layout.tsx"))
@@ -1365,7 +1367,7 @@ mod tests {
             );
         }
         for required in [
-            "\"next\": \"16.3.6\"",
+            "\"next\": \"16.4.1\"",
             "\"react\": \"19.2.8\"",
             "\"tailwindcss\": \"4.3.3\"",
             "\"@hey-api/openapi-ts\": \"0.99.0\"",
@@ -1375,6 +1377,10 @@ mod tests {
                 "steward-web dependencies must stay exact-version pinned: {required}"
             );
         }
+        assert!(
+            bun_lock.contains("\"sharp\": [\"sharp@0.35.5\""),
+            "the web image must resolve sharp 0.35.5 or newer"
+        );
         for required in [
             "crypto.randomUUID()",
             "script-src 'self' 'nonce-${nonce}' 'strict-dynamic'",
