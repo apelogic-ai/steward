@@ -21,12 +21,12 @@ serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 p256.workspace = true
-steward-admission = { path = "../steward-admission", version = "=0.3.20" }
-steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.3.20" }
-steward-adapter-mcp-gw = { path = "../../adapters/mcp-gw", version = "=0.3.20" }
-steward-ports = { path = "../steward-ports", version = "=0.3.20" }
-steward-store = { path = "../steward-store", version = "=0.3.20" }
-steward-types = { path = "../steward-types", version = "=0.3.20" }
+steward-admission = { path = "../steward-admission", version = "=0.3.21" }
+steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.3.21" }
+steward-adapter-mcp-gw = { path = "../../adapters/mcp-gw", version = "=0.3.21" }
+steward-ports = { path = "../steward-ports", version = "=0.3.21" }
+steward-store = { path = "../steward-store", version = "=0.3.21" }
+steward-types = { path = "../steward-types", version = "=0.3.21" }
 tokio = { workspace = true, features = ["sync", "time"] }
 utoipa.workspace = true
 uuid.workspace = true
