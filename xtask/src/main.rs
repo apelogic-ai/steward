@@ -124,6 +124,7 @@ fn ci() -> TaskResult {
     quality_after_tool_checks()?;
     run("bash", &["scripts/check-litellm-image-pins.sh"])?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
+    run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
     conformance(&["--pinned".to_owned()])
