@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agentSandbox"],
+  "properties": {
+    "global": {"type": "object"},
+    "agentSandbox": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["namespace", "image"],
+      "properties": {
+        "namespace": {
+          "type": "object",
+          "required": ["create", "name"],
+          "properties": {
+            "create": {"const": false},
+            "name": {"$ref": "#/definitions/name"}
+          }
+        },
+        "image": {
+          "type": "object",
+          "required": ["repository", "tag", "pullPolicy"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string", "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"},
+            "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+  }
+}

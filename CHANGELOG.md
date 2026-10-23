@@ -9,6 +9,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added separately installable, release-pinned charts for SPIRE, agent-sandbox,
+  OpenShell, LiteLLM, and Actions Runner Controller. They use upstream chart
+  dependencies where available, create no Namespace, accept existing Secret
+  references instead of inline secret material, pin every rendered image by
+  digest, and document cluster-wide permissions and Pod Security needs. The
+  release publishes each chart as its own OCI artifact alongside Steward and
+  lists their immutable coordinates in the release handoff. SPIRE CRDs are
+  installed before dependent resources, agent-sandbox wraps its upstream Helm
+  chart, and the LiteLLM, SPIRE, and Actions Runner Controller wrappers refuse
+  free-form environment inputs. LiteLLM also refuses database URLs containing
+  passwords; its default workload security contexts satisfy a
+  restricted Pod Security profile. OpenShell's optional GRPCRoute requires an
+  existing Gateway and hostname; streaming timeouts remain configured on the
+  Gateway or backend because GRPCRoute has no timeout field. Existing Steward
+  chart SBOM and vulnerability asset names remain available.
 - Releases now include a `linux/amd64` Claude Code reference runtime for 2.1.222, its immutable digest,
   SBOM, vulnerability report, and provenance. The non-root image includes the same pinned read
   tools as the Codex runtime and uses the existing `claude-code-v1` execution binding. Its launcher

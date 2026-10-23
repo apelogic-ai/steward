@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spire"],
+  "properties": {
+    "global": {"type": "object"},
+    "spire": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["global", "spire-server", "spire-agent", "spiffe-csi-driver", "spiffe-oidc-discovery-provider"],
+      "properties": {
+        "global": {
+          "type": "object",
+          "properties": {
+            "spire": {
+              "type": "object",
+              "properties": {
+                "namespaces": {
+                  "type": "object",
+                  "properties": {
+                    "create": {"const": false},
+                    "system": {
+                      "type": "object",
+                      "properties": {"create": {"const": false}}
+                    },
+                    "server": {
+                      "type": "object",
+                      "properties": {"create": {"const": false}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "spire-server": {
+          "type": "object",
+          "properties": {
+            "image": {"$ref": "#/definitions/digestTagImage"},
+            "dataStore": {
+              "type": "object",
+              "properties": {
+                "sql": {
+                  "type": "object",
+                  "properties": {
+                    "password": {"const": ""},
+                    "readOnly": {
+                      "type": "object",
+                      "properties": {"password": {"const": ""}}
+                    }
+                  },
+                  "allOf": [{
+                    "if": {
+                      "required": ["databaseType"],
+                      "properties": {"databaseType": {"not": {"const": "sqlite3"}}}
+                    },
+                    "then": {
+                      "required": ["externalSecret"],
+                      "properties": {
+                        "externalSecret": {
+                          "type": "object",
+                          "required": ["enabled"],
+                          "properties": {"enabled": {"const": true}}
+                        }
+                      }
+                    }
+                  }]
+                }
+              }
+            },
+            "secrets": {
+              "type": "object",
+              "properties": {
+                "aws": {
+                  "type": "object",
+                  "properties": {
+                    "accessKeyID": {"const": ""},
+                    "secretAccessKey": {"const": ""}
+                  }
+                },
+                "gcp": {
+                  "type": "object",
+                  "properties": {"applicationCredentials": {"const": ""}}
+                }
+              }
+            },
+            "keyManager": {
+              "type": "object",
+              "properties": {
+                "awsKMS": {
+                  "type": "object",
+                  "properties": {
+                    "accessKeyID": {"const": ""},
+                    "secretAccessKey": {"const": ""}
+                  }
+                }
+              }
+            },
+            "upstreamAuthority": {
+              "type": "object",
+              "properties": {
+                "disk": {
+                  "type": "object",
+                  "properties": {
+                    "secret": {
+                      "type": "object",
+                      "properties": {"create": {"const": false}}
+                    }
+                  }
+                }
+              }
+            },
+            "kubeConfigs": {"type": "object", "maxProperties": 0},
+            "controllerManager": {
+              "type": "object",
+              "properties": {
+                "image": {"$ref": "#/definitions/digestTagImage"},
+                "extraEnv": {"type": "array", "maxItems": 0}
+              }
+            },
+            "externalControllerManagers": {
+              "type": "object",
+              "properties": {
+                "defaults": {
+                  "type": "object",
+                  "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+                },
+                "clusters": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "object",
+                    "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+                  }
+                }
+              }
+            },
+            "chown": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            },
+            "extraEnv": {"type": "array", "maxItems": 0},
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0}
+          }
+        },
+        "spire-agent": {
+          "type": "object",
+          "properties": {
+            "image": {"$ref": "#/definitions/digestTagImage"},
+            "fsGroupFix": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            },
+            "socketAlternate": {
+              "type": "object",
+              "properties": {"image": {"$ref": "#/definitions/digestTagImage"}}
+            },
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0}
+          }
+        },
+        "spiffe-csi-driver": {
+          "type": "object",
+          "properties": {
+            "image": {"$ref": "#/definitions/digestTagImage"},
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0},
+            "nodeDriverRegistrar": {
+              "type": "object",
+              "properties": {
+                "image": {"$ref": "#/definitions/digestTagImage"},
+                "extraEnvVars": {"type": "array", "maxItems": 0}
+              }
+            }
+          }
+        },
+        "spiffe-oidc-discovery-provider": {
+          "type": "object",
+          "properties": {"extraEnv": {"type": "array", "maxItems": 0}}
+        },
+        "upstream-spire-agent": {
+          "type": "object",
+          "properties": {
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "extraContainers": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0}
+          }
+        },
+        "upstream-spiffe-csi-driver": {
+          "type": "object",
+          "properties": {
+            "extraEnvVars": {"type": "array", "maxItems": 0},
+            "initContainers": {"type": "array", "maxItems": 0},
+            "nodeDriverRegistrar": {
+              "type": "object",
+              "properties": {"extraEnvVars": {"type": "array", "maxItems": 0}}
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "digestTagImage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["tag"],
+      "properties": {"tag": {"type": "string", "pattern": "^[^@[:space:]]+@sha256:[0-9a-f]{64}$"}}
+    }
+  }
+}

@@ -17,6 +17,15 @@ for observed in "${chart_version}" "${app_version}" "${readme_version}" "${guide
   fi
 done
 
+for dependency_chart in spire agent-sandbox openshell litellm arc; do
+  dependency_chart_file="${root}/charts/${dependency_chart}/Chart.yaml"
+  dependency_version="$(awk '$1 == "version:" { print $2; exit }' "${dependency_chart_file}")"
+  if [[ -z "${dependency_version}" || "${dependency_version}" != "${chart_version}" ]]; then
+    echo "release chart versions are inconsistent: steward=${chart_version}, ${dependency_chart}=${dependency_version}" >&2
+    exit 1
+  fi
+done
+
 if [[ "${chart_version}" == "0.3.21" ]]; then
   chart_readme_version="$(sed -nE "s/^Current release contract: chart ${tick}([^${tick}]+)${tick}.*/\\1/p" "${root}/charts/steward/README.md")"
   changelog_version="$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$/\1/p' "${root}/CHANGELOG.md" | head -n 1)"
