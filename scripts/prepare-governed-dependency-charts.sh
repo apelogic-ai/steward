@@ -11,6 +11,15 @@ output="$1"
 work="$(mktemp -d)"
 trap 'find "${work}" -depth -delete 2>/dev/null || true' EXIT INT TERM
 
+report_unexpected_failure() {
+  local status="$1" line="$2" command="$3"
+  trap - ERR
+  printf 'governed chart preparation failed at line %s: %s (exit %s)\n' \
+    "${line}" "${command}" "${status}" >&2
+  exit "${status}"
+}
+trap 'report_unexpected_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 if [[ -e "${output}" ]]; then
   echo "output directory already exists: ${output}" >&2
   exit 2
@@ -114,7 +123,14 @@ done
 
 helm dependency update "${output}/agent-sandbox" >/dev/null
 
-openshell_update="$(helm dependency update "${output}/openshell" 2>&1)"
+openshell_update=""
+if ! openshell_update="$(
+  helm dependency update "${output}/openshell" 2>&1
+)"; then
+  echo 'failed to prepare the OpenShell dependency chart:' >&2
+  printf '%s\n' "${openshell_update}" >&2
+  exit 1
+fi
 grep -Fq \
   'Digest: sha256:891b09f7d60e9341af2bb545b3d1a4a6c39870f6f48a77d8bddca3f443c6a9e6' \
   <<<"${openshell_update}" || {
@@ -124,7 +140,12 @@ grep -Fq \
 
 helm dependency update "${output}/litellm" >/dev/null
 
-arc_update="$(helm dependency update "${output}/arc" 2>&1)"
+arc_update=""
+if ! arc_update="$(helm dependency update "${output}/arc" 2>&1)"; then
+  echo 'failed to prepare the Actions Runner Controller dependency chart:' >&2
+  printf '%s\n' "${arc_update}" >&2
+  exit 1
+fi
 grep -Fq \
   'Digest: sha256:20a369215b8c2ed981c4c0c75e56e6009564d51fffcbbd314d5da0ef82de253a' \
   <<<"${arc_update}" || {

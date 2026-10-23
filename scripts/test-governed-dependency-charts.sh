@@ -4,6 +4,16 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'find "${fixture}" -depth -delete 2>/dev/null || true' EXIT INT TERM
+
+report_unexpected_failure() {
+  local status="$1" line="$2" command="$3"
+  trap - ERR
+  printf 'governed chart test failed at line %s: %s (exit %s)\n' \
+    "${line}" "${command}" "${status}" >&2
+  exit "${status}"
+}
+trap 'report_unexpected_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 printf '%s\n' 'apiVersion: v1' 'kind: Config' >"${fixture}/kubeconfig"
 export KUBECONFIG="${fixture}/kubeconfig"
 
