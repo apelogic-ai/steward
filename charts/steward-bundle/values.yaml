@@ -1,0 +1,82 @@
+components:
+  steward:
+    enabled: true
+  spire:
+    enabled: true
+  agentSandbox:
+    enabled: true
+  openshell:
+    enabled: true
+  litellm:
+    enabled: true
+  arc:
+    enabled: false
+
+spire:
+  spire:
+    spire-server:
+      controllerManager:
+        identities:
+          clusterSPIFFEIDs:
+            test-keys:
+              enabled: false
+            spike-bootstrap:
+              enabled: false
+            spike-keeper:
+              enabled: false
+            spike-nexus:
+              enabled: false
+            spike-pilot:
+              enabled: false
+            oidc-discovery-provider:
+              enabled: false
+agentSandbox: {}
+openshell: {}
+litellm: {}
+arc: {}
+
+# Steward keeps its standalone defaults unchanged. The bundle supplies the
+# released component coordinates and makes every default Secret reference use
+# one operator-created Secret.
+steward:
+  images:
+    repository: ghcr.io/apelogic-ai/steward
+    requireDigest: true
+    apiserver:
+      tag: 0.3.21-apiserver
+      digest: sha256:db37f89dd281928fdd6ca6aa4d2507cc2b59eef0b4f043644b6992a695e868f8
+    controller:
+      tag: 0.3.21-controller
+      digest: sha256:28dd3d4095bca559eae1f937fb8c5138cc6527a5c96d65678c7af8a97d3a074f
+    mint:
+      tag: 0.3.21-mint
+      digest: sha256:7986a0d1b01bd0ccdcd8c0ea95a217e176669fa69e5bab71688d0442127a8db7
+    web:
+      tag: 0.3.21-web
+      digest: sha256:051a977576ea1c0050ba33b7d3ddeb5b8e2f2096c71c562d546a6a0434809b78
+    triggerReceiver:
+      tag: 0.3.21-trigger-receiver
+      digest: sha256:5e938c750783a5bb333afd62675606a5666e57d0dc5e2949a4e38273aef6a033
+  secrets:
+    database:
+      name: governed-execution
+    managedInferenceDatabase:
+      name: governed-execution
+    managedInferenceEncryptionKey:
+      name: governed-execution
+    jira:
+      name: governed-execution
+    litellm:
+      name: governed-execution
+    openshellClient:
+      name: governed-execution
+    mint:
+      name: governed-execution
+  tls:
+    api:
+      secretName: governed-execution
+    webhook:
+      secretName: governed-execution
+      # Public trust material is not secret. Replace it with the CA that signs
+      # the certificate in the existing Secret before starting workloads.
+      caBundlePem: public-ca-required-before-workloads

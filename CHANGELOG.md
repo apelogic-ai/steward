@@ -9,6 +9,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added the optional `steward-bundle` OCI chart for installations that need one
+  Helm release for Steward, SPIRE, agent-sandbox, OpenShell, LiteLLM, and
+  optionally Actions Runner Controller. Every child chart is independently
+  switchable, creates no Namespace, uses digest-pinned images, and shares one
+  existing Secret without accepting inline secret material. The bundle keeps
+  the standalone Steward render unchanged, packages CRDs before dependent
+  objects, disables SPIRE's test-only identities, and requires the shared TLS
+  certificate to be supplied in that Secret rather than generated into it. It
+  is rendered and installed in a clean cluster by the release gates before
+  publication and after pulling the published artifact.
 - Added separately installable, release-pinned charts for SPIRE, agent-sandbox,
   OpenShell, LiteLLM, and Actions Runner Controller. They use upstream chart
   dependencies where available, create no Namespace, accept existing Secret
