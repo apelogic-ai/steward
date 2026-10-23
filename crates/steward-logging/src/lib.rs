@@ -336,6 +336,24 @@ fn is_email(token: &str) -> bool {
 mod tests {
     use super::{InvalidLogFormat, LogFormat, LogLevel, render_event, write_event};
 
+    fn assert_redacted_in_both_formats(message: &str, forbidden: &str) -> Result<(), String> {
+        for format in [LogFormat::Plain, LogFormat::Json] {
+            let rendered =
+                render_event(format, LogLevel::Error, "steward-apiserver", None, message);
+            if rendered.contains(forbidden) {
+                return Err(format!(
+                    "{format:?} output retained sensitive fixture {forbidden}: {rendered}"
+                ));
+            }
+            if !rendered.contains("[redacted]") {
+                return Err(format!(
+                    "{format:?} output did not retain the redaction marker: {rendered}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn plain_text_remains_the_default() -> Result<(), String> {
         if LogFormat::parse(None).map_err(|error| error.to_string())? != LogFormat::Plain {
@@ -453,6 +471,125 @@ mod tests {
         );
         if rendered.contains("request-id-fixture") || !rendered.contains("[redacted]") {
             return Err("request identifiers must use the same redaction contract".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_json_authorization_value_is_redacted_in_both_formats() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            r#"{"authorization":"Bearer json-auth-fixture"}"#,
+            "json-auth-fixture",
+        )
+    }
+
+    #[test]
+    fn glued_authorization_scheme_is_redacted_in_both_formats() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            "Authorization:Bearer glued-auth-fixture",
+            "glued-auth-fixture",
+        )
+    }
+
+    #[test]
+    fn authorization_basic_value_is_redacted_in_both_formats() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            "authorization=Basic basic-auth-fixture",
+            "basic-auth-fixture",
+        )
+    }
+
+    #[test]
+    fn glued_bearer_value_is_redacted_in_both_formats() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            "request failed bearer:bearer-fixture-value",
+            "bearer-fixture-value",
+        )
+    }
+
+    #[test]
+    fn spaced_password_value_is_redacted_in_both_formats() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            "password = password-field-fixture",
+            "password-field-fixture",
+        )
+    }
+
+    #[test]
+    fn api_key_header_value_is_redacted_in_both_formats() -> Result<(), String> {
+        assert_redacted_in_both_formats("x-api-key: api-key-fixture", "api-key-fixture")
+    }
+
+    #[test]
+    fn authorization_key_controls_basic_value_redaction() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            "authorization: Basic authorization-key-fixture",
+            "authorization-key-fixture",
+        )
+    }
+
+    #[test]
+    fn password_key_controls_value_redaction() -> Result<(), String> {
+        assert_redacted_in_both_formats("password: password-key-fixture", "password-key-fixture")
+    }
+
+    #[test]
+    fn token_key_controls_value_redaction() -> Result<(), String> {
+        assert_redacted_in_both_formats("token: token-key-fixture", "token-key-fixture")
+    }
+
+    #[test]
+    fn database_url_keys_control_value_redaction() -> Result<(), String> {
+        assert_redacted_in_both_formats(
+            "database_url: database-url-key-fixture",
+            "database-url-key-fixture",
+        )?;
+        assert_redacted_in_both_formats(
+            "database-url: database-dash-key-fixture",
+            "database-dash-key-fixture",
+        )
+    }
+
+    #[test]
+    fn prefixed_jwt_values_are_redacted_in_both_formats() -> Result<(), String> {
+        let jwt = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+        for prefix in ["id_token=", "jwt:", "assertion=\""] {
+            let message = format!("{prefix}{jwt}\"");
+            assert_redacted_in_both_formats(&message, jwt)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn secret_key_prefixes_are_redacted_without_hiding_ordinary_identifiers() -> Result<(), String>
+    {
+        for secret in [
+            "sk-fixture-token-value",
+            "sk-ant-fixture-token-value",
+            "sk-proj-fixture-token-value",
+        ] {
+            assert_redacted_in_both_formats(secret, secret)?;
+        }
+        for identifier in [
+            "task-0a1b2c3d4e5f",
+            "operation-id-task-0a1b2c3d4e5f",
+            "desk-example-identifier",
+            "disk-example-identifier",
+        ] {
+            for format in [LogFormat::Plain, LogFormat::Json] {
+                let rendered = render_event(
+                    format,
+                    LogLevel::Info,
+                    "steward-controller",
+                    None,
+                    identifier,
+                );
+                if !rendered.contains(identifier) || rendered.contains("[redacted]") {
+                    return Err(format!(
+                        "{format:?} output hid ordinary identifier {identifier}: {rendered}"
+                    ));
+                }
+            }
         }
         Ok(())
     }

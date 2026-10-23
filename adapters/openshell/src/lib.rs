@@ -4123,9 +4123,8 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[tokio::test]
-    async fn full_task_logging_records_escaped_task_output_material() -> Result<(), String> {
-        let secret_bearing_output =
-            b"Authorization: Bearer obviously-fake-task-credential\nrequest completed";
+    async fn full_task_logging_redacts_sensitive_task_output_material() -> Result<(), String> {
+        let secret_bearing_output = b"Authorization:Bearer task-output-fixture\nrequest completed";
         let mut stream = QueuedTaskProcessEventStream {
             events: VecDeque::from([Ok(stdout_event(secret_bearing_output)), Ok(exit_event(0))]),
         };
@@ -4147,12 +4146,25 @@ mod tests {
         assert_eq!(result.stdout, secret_bearing_output);
         assert_eq!(log_sink.records.len(), 1);
         let record = &log_sink.records[0];
-        assert_eq!(
-            record,
-            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout message=\"Authorization: Bearer obviously-fake-task-credential\\nrequest completed\"",
-            "full logging must expose the escaped task-process event"
+        assert!(
+            !record.contains("task-output-fixture"),
+            "full logging must refuse sensitive task-process output: {record}"
+        );
+        assert!(
+            record.contains("[redacted]") && record.contains("request completed"),
+            "full logging must retain the redacted task-process event: {record}"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn runtime_adapter_has_no_raw_stderr_log_paths() {
+        let raw_stderr_macro = ["eprintln", "!"].concat();
+        assert!(
+            !include_str!("lib.rs").contains(&raw_stderr_macro),
+            "runtime logs must use the shared structured writer"
+        );
     }
 
     #[cfg(feature = "runtime")]

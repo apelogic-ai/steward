@@ -1502,6 +1502,15 @@ mod tests {
     const CATALOG_TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const BLOB: &str = "dddddddddddddddddddddddddddddddddddddddd";
 
+    #[test]
+    fn adapter_has_no_raw_stderr_log_paths() {
+        let raw_stderr_macro = ["eprintln", "!"].concat();
+        assert!(
+            !include_str!("lib.rs").contains(&raw_stderr_macro),
+            "adapter logs must use the shared structured writer"
+        );
+    }
+
     fn git_command(repository: &Path) -> Command {
         let mut command = Command::new("git");
         command
