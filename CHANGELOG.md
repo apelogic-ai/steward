@@ -7,16 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-### Fixed
+## [0.3.24] - 2026-10-24
 
-- Chart publication now captures Helm output from both output streams, and the pull-request release
-  candidate uses the same package, push, and digest-validation script as tag-time publication.
-
-## [0.3.23] - 2026-10-23
-
-Steward v0.3.23 contains the v0.3.22 release content plus a release-workflow fix that pins Helm for
-chart publication and release artifact assembly. The v0.3.22 tag was not fully published: its
-governed dependency charts and `steward-bundle` were never pushed, and it has no GitHub release.
+Steward v0.3.24 contains the v0.3.23 release content plus a release-workflow fix that shares chart
+publication with the pull-request release candidate and captures Helm output from both output
+streams. The v0.3.23 tag pushed all seven charts, but chart evidence and released-artifact
+acceptance did not complete, and no GitHub release was created.
 
 This release adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
 evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
@@ -67,6 +63,8 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
 
 ### Fixed
 
+- Chart publication now captures Helm output from both output streams, and the pull-request release
+  candidate uses the same package, push, and digest-validation script as tag-time publication.
 - Chart publication and release artifact assembly now use the repository's pinned Helm version,
   preventing release output from changing when a newer Helm major version becomes available.
 
@@ -81,8 +79,15 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
   prior default rendering.
 - Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then
   restore execution bindings to a reference runtime supported by that release. Remove dependency
-  charts only when the installation adopted them solely for v0.3.23, and restore its previous
+  charts only when the installation adopted them solely for v0.3.24, and restore its previous
   dependency ownership. No database rollback is required.
+
+## [0.3.23] - 2026-10-23
+
+The v0.3.23 tag pushed all seven charts, component images, both reference runtimes, and auxiliary
+release artifacts. Its chart jobs stopped before publishing complete chart evidence and
+provenance, so released-artifact acceptance was skipped and no GitHub release was created. Use
+v0.3.24 for the complete release.
 
 ## [0.3.22] - 2026-10-23
 
@@ -1631,7 +1636,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.23...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.24...HEAD
+[0.3.24]: https://github.com/apelogic-ai/steward/compare/v0.3.23...v0.3.24
 [0.3.23]: https://github.com/apelogic-ai/steward/compare/v0.3.22...v0.3.23
 [0.3.22]: https://github.com/apelogic-ai/steward/compare/v0.3.21...v0.3.22
 [0.3.21]: https://github.com/apelogic-ai/steward/compare/v0.3.20...v0.3.21
