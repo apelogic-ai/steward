@@ -99,7 +99,7 @@ for required in \
   'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
   'steward-trigger-receiver:release-validation' \
   'docker push' \
-  'helm push' \
+  'scripts/publish-chart.sh' \
   'scripts/prepare-governed-dependency-charts.sh' \
   'scripts/prepare-steward-bundle-chart.sh' \
   "STEWARD_BUNDLE_RELEASE_IMAGE_REPOSITORY=\"\${runtime_repository}\"" \
@@ -109,7 +109,7 @@ for required in \
   'candidate bundle render omitted active Steward release images' \
   'helm template candidate-bundle' \
   "bash \"\${root}/scripts/steward-bundle-kind-smoke.sh\" \"\${bundle_archive}\"" \
-  '--plain-http 2>&1' \
+  '--plain-http' \
   "bash \"\${root}/scripts/customer-core-install-e2e.sh\""
 do
   grep -Fq -- "${required}" "${candidate_harness}" || {
