@@ -727,15 +727,11 @@ jobs:
           STEWARD_RELEASE_BUNDLE_CHART_REPOSITORY: oci://ghcr.io/${{ github.repository_owner }}/charts/steward-bundle
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
           digest="$(cat dist/helm-chart-steward-bundle.digest)"
           bundle_dir="$(mktemp -d "${RUNNER_TEMP%/}/steward-bundle-release.XXXXXX")"
           trap 'find "${bundle_dir}" -depth -delete' EXIT
-          pull_output="$(helm pull "${STEWARD_RELEASE_BUNDLE_CHART_REPOSITORY}@${digest}" --destination "${bundle_dir}" 2>&1)"
-          printf '%s\n' "${pull_output}"
-          test "$(printf '%s\n' "${pull_output}" | awk '$1 == "Digest:" { print $2 }')" = "${digest}"
-          bundle_archive="${bundle_dir}/steward-bundle-${version}.tgz"
-          test -s "${bundle_archive}"
+          bundle_archive="$(bash scripts/pull-chart-by-digest.sh \
+            "${STEWARD_RELEASE_BUNDLE_CHART_REPOSITORY}" "${digest}" "${bundle_dir}")"
           bash scripts/steward-bundle-kind-smoke.sh "${bundle_archive}"
 
   release:
