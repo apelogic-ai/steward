@@ -243,6 +243,7 @@ fn require_ci_tool_versions() -> TaskResult {
 }
 
 fn workflow_lint() -> TaskResult {
+    validate_workflow_tool_setup(&root().join(".github/workflows"))?;
     require_tool_version(
         "actionlint",
         &["-version"],
@@ -291,6 +292,119 @@ fn workflow_lint() -> TaskResult {
     } else {
         Err(format!("shellcheck exited with {status}"))
     }
+}
+
+fn validate_workflow_tool_setup(workflows_directory: &Path) -> TaskResult {
+    let mut workflow_paths = fs::read_dir(workflows_directory)
+        .map_err(|error| {
+            format!(
+                "failed to inspect workflow directory {}: {error}",
+                workflows_directory.display()
+            )
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("failed to inspect workflow entry: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    workflow_paths.retain(|path| {
+        matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("yml" | "yaml")
+        )
+    });
+    workflow_paths.sort();
+
+    for path in workflow_paths {
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read workflow {}: {error}", path.display()))?;
+        let workflow = serde_saphyr::from_str::<serde_json::Value>(&source)
+            .map_err(|error| format!("workflow {} is not valid YAML: {error}", path.display()))?;
+        validate_workflow_actions(&path, &workflow)?;
+    }
+    Ok(())
+}
+
+fn validate_workflow_actions(path: &Path, value: &serde_json::Value) -> TaskResult {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(action)) = object.get("uses") {
+                validate_workflow_action(path, action, object.get("with"))?;
+            }
+            for nested in object.values() {
+                validate_workflow_actions(path, nested)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                validate_workflow_actions(path, nested)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_workflow_action(
+    path: &Path,
+    action: &str,
+    inputs: Option<&serde_json::Value>,
+) -> TaskResult {
+    const SETUP_TOOLS: &str = "./.github/actions/setup-tools";
+    const PINNED_TOOLS: [&str; 10] = [
+        "actionlint",
+        "cargo-deny",
+        "cargo-zigbuild",
+        "helm",
+        "kind",
+        "kubectl",
+        "opa",
+        "oras",
+        "shellcheck",
+        "zig",
+    ];
+
+    if action == SETUP_TOOLS {
+        if let Some(serde_json::Value::Object(inputs)) = inputs {
+            for tool in PINNED_TOOLS {
+                let version_input = format!("{tool}-version");
+                if inputs.contains_key(&version_input) {
+                    return Err(format!(
+                        "workflow {} overrides the central {tool} pin; update {SETUP_TOOLS} instead",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+    if action.starts_with("./") {
+        return Ok(());
+    }
+
+    let (action_name, revision) = action.rsplit_once('@').ok_or_else(|| {
+        format!(
+            "workflow {} action `{action}` must use an exact commit SHA",
+            path.display()
+        )
+    })?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "workflow {} action `{action}` must use an exact 40-character commit SHA",
+            path.display()
+        ));
+    }
+
+    let normalized = action_name.to_ascii_lowercase();
+    let installer = normalized.contains("setup") || normalized.contains("install");
+    if installer && PINNED_TOOLS.iter().any(|tool| normalized.contains(tool)) {
+        return Err(format!(
+            "workflow {} installs a centrally pinned tool through `{action_name}`; use {SETUP_TOOLS}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn m1_contracts_check() -> TaskResult {
@@ -1168,7 +1282,7 @@ mod tests {
     use super::{
         checked_command, git_command_in_repository, journey_tags, migration_changes,
         provider_profile_bundle_directory_for_inputs, root, should_skip_directory,
-        validate_conformance_test_result,
+        validate_conformance_test_result, validate_workflow_action, validate_workflow_tool_setup,
     };
     use std::collections::BTreeSet;
     use std::fs;
@@ -1178,6 +1292,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn workflows_install_pinned_tools_only_through_setup_tools() -> Result<(), String> {
+        validate_workflow_tool_setup(&root().join(".github/workflows"))
+    }
+
+    #[test]
+    fn workflow_tool_setup_rejects_bypasses_and_floating_actions() -> Result<(), String> {
+        let path = Path::new(".github/workflows/example.yml");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let Err(bypass) = validate_workflow_action(path, &format!("azure/setup-helm@{sha}"), None)
+        else {
+            return Err("an external Helm installer was accepted".to_owned());
+        };
+        assert!(bypass.contains("use ./.github/actions/setup-tools"));
+
+        let Err(floating) = validate_workflow_action(path, "actions/checkout@v6", None) else {
+            return Err("a floating external action was accepted".to_owned());
+        };
+        assert!(floating.contains("exact 40-character commit SHA"));
+
+        let override_inputs = serde_json::json!({"helm-version": "3.17.1"});
+        let Err(override_error) = validate_workflow_action(
+            path,
+            "./.github/actions/setup-tools",
+            Some(&override_inputs),
+        ) else {
+            return Err("a workflow-specific Helm version was accepted".to_owned());
+        };
+        assert!(override_error.contains("overrides the central helm pin"));
+
+        validate_workflow_action(
+            path,
+            "./.github/actions/setup-tools",
+            Some(&serde_json::json!({"kubernetes-tools": "true"})),
+        )?;
+        validate_workflow_action(path, &format!("oven-sh/setup-bun@{sha}"), None)
+    }
 
     fn uses_user_envelope_only_contract() -> Result<bool, String> {
         let chart = fs::read_to_string(root().join("charts/steward/Chart.yaml"))

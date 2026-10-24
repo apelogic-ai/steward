@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Chart publication and release artifact assembly now use the repository's pinned Helm version,
+  preventing release output from changing when a newer Helm major version becomes available.
+
 ## [0.3.22] - 2026-10-23
 
 Steward v0.3.22 adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
