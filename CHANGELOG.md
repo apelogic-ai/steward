@@ -7,23 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-### Fixed
+## [0.3.25] - 2026-10-24
 
-- Released-bundle acceptance now uses the single chart archive Helm writes for a digest pull,
-  instead of assuming Helm will name it with the chart version.
-- The pull-request release candidate now installs the bundle archive it retrieves from its local
-  registry by digest, using the same digest verification and archive lookup as the tag-time release.
-- Release acceptance cleanup now uses each run's kubeconfig and decides whether cleanup succeeded by
-  verifying that its owned cluster and temporary directory are absent. It now also fails when Kind
-  cannot list clusters to confirm that the owned cluster is gone.
-
-## [0.3.24] - 2026-10-24
-
-Steward v0.3.24 contains the v0.3.23 release content plus release-workflow fixes that share chart
-publication with the pull-request release candidate, capture Helm output from both output streams,
-and cleanly remove the candidate registry from the Kind network after acceptance. The v0.3.23 tag
-pushed all seven charts, but chart evidence and released-artifact acceptance did not complete, and
-no GitHub release was created.
+Steward v0.3.25 contains the v0.3.24 release content plus a released-artifact acceptance fix that
+locates the single chart archive Helm writes for a digest pull and uses the same verified pull path
+in the pull-request release candidate. The v0.3.24 tag published all seven charts and all images but
+stopped at released-artifact acceptance, so no v0.3.24 GitHub release was created.
 
 This release adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
 evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
@@ -74,6 +63,13 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
 
 ### Fixed
 
+- Released-bundle acceptance now uses the single chart archive Helm writes for a digest pull,
+  instead of assuming Helm will name it with the chart version.
+- The pull-request release candidate now installs the bundle archive it retrieves from its local
+  registry by digest, using the same digest verification and archive lookup as the tag-time release.
+- Release acceptance cleanup now uses each run's kubeconfig and decides whether cleanup succeeded by
+  verifying that its owned cluster and temporary directory are absent. It now also fails when Kind
+  cannot list clusters to confirm that the owned cluster is gone.
 - Chart publication now captures Helm output from both output streams, and the pull-request release
   candidate uses the same package, push, and digest-validation script as tag-time publication.
 - Release-candidate cleanup now disconnects its local registry before deleting the disposable Kind
@@ -93,21 +89,27 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
   prior default rendering.
 - Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then
   restore execution bindings to a reference runtime supported by that release. Remove dependency
-  charts only when the installation adopted them solely for v0.3.24, and restore its previous
+  charts only when the installation adopted them solely for v0.3.25, and restore its previous
   dependency ownership. No database rollback is required.
+
+## [0.3.24] - 2026-10-24
+
+The v0.3.24 tag published all seven charts, component images, both reference runtimes, and auxiliary
+release artifacts. Released-artifact acceptance stopped before installing the published bundle, so
+no GitHub release was created. Use v0.3.25 for the complete release.
 
 ## [0.3.23] - 2026-10-23
 
 The v0.3.23 tag pushed all seven charts, component images, both reference runtimes, and auxiliary
 release artifacts. Its chart jobs stopped before publishing complete chart evidence and
 provenance, so released-artifact acceptance was skipped and no GitHub release was created. Use
-v0.3.24 for the complete release.
+v0.3.25 for the complete release.
 
 ## [0.3.22] - 2026-10-23
 
 The v0.3.22 tag was only partly published. Component images, both reference runtimes, and the
 `steward` chart were published, but the governed dependency charts and `steward-bundle` were never
-pushed, and no GitHub release was created. Use v0.3.23 for the complete release.
+pushed, and no GitHub release was created. Use v0.3.25 for the complete release.
 
 ## [0.3.21] - 2026-10-22
 
@@ -1650,7 +1652,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.24...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.25...HEAD
+[0.3.25]: https://github.com/apelogic-ai/steward/compare/v0.3.24...v0.3.25
 [0.3.24]: https://github.com/apelogic-ai/steward/compare/v0.3.23...v0.3.24
 [0.3.23]: https://github.com/apelogic-ai/steward/compare/v0.3.22...v0.3.23
 [0.3.22]: https://github.com/apelogic-ai/steward/compare/v0.3.21...v0.3.22

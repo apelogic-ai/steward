@@ -12,11 +12,11 @@ k8s-openapi.workspace = true # Reads runtime-bound inference credentials from ty
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Resolves live AgentRuntime authority from the Kubernetes source of truth.
 serde.workspace = true # Reads only the provider records Mint needs from the deployment capability catalog.
 serde_json.workspace = true # Parses the mounted deployment capability catalog without coupling Mint to the API server.
-steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.24", features = ["identity"] } # Resolves vendor sandbox UUIDs without leaking OpenShell labels into the mint.
-steward-adapter-spire = { path = "../../adapters/spire", version = "=0.3.24" } # Connects the workload-identity port to the mounted SPIRE socket.
-steward-mint = { path = "../../crates/steward-mint", version = "=0.3.24" } # Owns the reviewed SVID-to-HOP-1 exchange and signing-key boundary.
-steward-store = { path = "../../crates/steward-store", version = "=0.3.24" } # Lazily resolves encrypted per-user inference credentials without coupling unrelated Mint endpoints to database availability.
-steward-types = { path = "../../crates/steward-types", version = "=0.3.24" } # Reads AgentRuntime principal, tool authority, and lifecycle state.
+steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.25", features = ["identity"] } # Resolves vendor sandbox UUIDs without leaking OpenShell labels into the mint.
+steward-adapter-spire = { path = "../../adapters/spire", version = "=0.3.25" } # Connects the workload-identity port to the mounted SPIRE socket.
+steward-mint = { path = "../../crates/steward-mint", version = "=0.3.25" } # Owns the reviewed SVID-to-HOP-1 exchange and signing-key boundary.
+steward-store = { path = "../../crates/steward-store", version = "=0.3.25" } # Lazily resolves encrypted per-user inference credentials without coupling unrelated Mint endpoints to database availability.
+steward-types = { path = "../../crates/steward-types", version = "=0.3.25" } # Reads AgentRuntime principal, tool authority, and lifecycle state.
 tokio.workspace = true # Runs Kubernetes, SPIRE, and HTTP I/O.
 tokio-rustls.workspace = true # Selects the process-wide Rustls Ring provider before constructing the Kubernetes client in the combined release build.
 

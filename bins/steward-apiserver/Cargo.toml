@@ -13,15 +13,15 @@ reqwest.workspace = true # Calls the bearer-authenticated operator API instead o
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true # Parses bounded, strict operator-authored Envelope Template YAML without accepting duplicate keys or aliases.
-steward-adapter-claude-code = { path = "../../adapters/claude-code", version = "=0.3.24" } # Renders Claude Code disposable Task commands behind its stable execution adapter contract.
-steward-adapter-codex = { path = "../../adapters/codex", version = "=0.3.24" } # Renders Codex-specific disposable Task commands behind the neutral execution adapter seam.
-steward-adapter-jira = { path = "../../adapters/jira", version = "=0.3.24" } # Delivers escalation decisions without leaking Jira types into core.
-steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.3.24" } # Verifies the same digest-pinned bridge artifact used by controller provisioning.
-steward-adapter-github-source = { path = "../../adapters/github-source", version = "=0.3.24" } # Resolves exact direct-package Git objects through a read-only GitHub App.
-steward-admission = { path = "../../crates/steward-admission", version = "=0.3.24" }
-steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.24" } # Provides the single authenticated REST admission router.
-steward-store = { path = "../../crates/steward-store", version = "=0.3.24" } # Persists immutable envelopes, decisions, approvals, and instance grants.
-steward-types = { path = "../../crates/steward-types", version = "=0.3.24" } # Parses opaque canonical user IDs for the explicit local-RBAC bootstrap command.
+steward-adapter-claude-code = { path = "../../adapters/claude-code", version = "=0.3.25" } # Renders Claude Code disposable Task commands behind its stable execution adapter contract.
+steward-adapter-codex = { path = "../../adapters/codex", version = "=0.3.25" } # Renders Codex-specific disposable Task commands behind the neutral execution adapter seam.
+steward-adapter-jira = { path = "../../adapters/jira", version = "=0.3.25" } # Delivers escalation decisions without leaking Jira types into core.
+steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.3.25" } # Verifies the same digest-pinned bridge artifact used by controller provisioning.
+steward-adapter-github-source = { path = "../../adapters/github-source", version = "=0.3.25" } # Resolves exact direct-package Git objects through a read-only GitHub App.
+steward-admission = { path = "../../crates/steward-admission", version = "=0.3.25" }
+steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.25" } # Provides the single authenticated REST admission router.
+steward-store = { path = "../../crates/steward-store", version = "=0.3.25" } # Persists immutable envelopes, decisions, approvals, and instance grants.
+steward-types = { path = "../../crates/steward-types", version = "=0.3.25" } # Parses opaque canonical user IDs for the explicit local-RBAC bootstrap command.
 tokio.workspace = true # Runs the HTTPS listener and Kubernetes/Postgres/Jira I/O.
 tokio-rustls.workspace = true # Terminates TLS for bearer-authenticated production endpoints.
 
