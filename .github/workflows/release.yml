@@ -577,48 +577,34 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           chart='${{ matrix.chart }}'
-          if [[ "$chart" == steward-bundle ]]; then
-            mkdir -p "$RUNNER_TEMP/release"
-            STEWARD_BUNDLE_RELEASE_VERSION="$version" \
-              STEWARD_BUNDLE_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)" \
-              STEWARD_BUNDLE_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)" \
-              STEWARD_BUNDLE_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)" \
-              STEWARD_BUNDLE_RELEASE_WEB_DIGEST="$(cat dist/web.digest)" \
-              STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="$(cat dist/trigger-receiver.digest)" \
-              bash scripts/prepare-steward-bundle-chart.sh "$RUNNER_TEMP/release/charts/steward-bundle"
-          elif [[ "$chart" != steward ]]; then
-            mkdir -p "$RUNNER_TEMP/release"
-            bash scripts/prepare-governed-dependency-charts.sh "$RUNNER_TEMP/release/charts"
-          fi
-          mkdir -p dist "$RUNNER_TEMP/chart-scan/$chart"
           case "$chart" in
             steward)
-              helm package charts/steward --destination dist --version "$version" --app-version "$version"
+              chart_root="$GITHUB_WORKSPACE"
               ;;
             steward-bundle)
-              (cd "$RUNNER_TEMP/release" && helm package charts/steward-bundle --destination "$GITHUB_WORKSPACE/dist" --version "$version" --app-version "$version")
+              mkdir -p "$RUNNER_TEMP/release"
+              STEWARD_BUNDLE_RELEASE_VERSION="$version" \
+                STEWARD_BUNDLE_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)" \
+                STEWARD_BUNDLE_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)" \
+                STEWARD_BUNDLE_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)" \
+                STEWARD_BUNDLE_RELEASE_WEB_DIGEST="$(cat dist/web.digest)" \
+                STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="$(cat dist/trigger-receiver.digest)" \
+                bash scripts/prepare-steward-bundle-chart.sh "$RUNNER_TEMP/release/charts/steward-bundle"
+              chart_root="$RUNNER_TEMP/release"
               ;;
-            spire)
-              (cd "$RUNNER_TEMP/release" && helm package charts/spire --destination "$GITHUB_WORKSPACE/dist" --version "$version")
-              ;;
-            agent-sandbox)
-              (cd "$RUNNER_TEMP/release" && helm package charts/agent-sandbox --destination "$GITHUB_WORKSPACE/dist" --version "$version")
-              ;;
-            openshell)
-              (cd "$RUNNER_TEMP/release" && helm package charts/openshell --destination "$GITHUB_WORKSPACE/dist" --version "$version")
-              ;;
-            litellm)
-              (cd "$RUNNER_TEMP/release" && helm package charts/litellm --destination "$GITHUB_WORKSPACE/dist" --version "$version")
-              ;;
-            arc)
-              (cd "$RUNNER_TEMP/release" && helm package charts/arc --destination "$GITHUB_WORKSPACE/dist" --version "$version")
+            *)
+              mkdir -p "$RUNNER_TEMP/release"
+              bash scripts/prepare-governed-dependency-charts.sh "$RUNNER_TEMP/release/charts"
+              chart_root="$RUNNER_TEMP/release"
               ;;
           esac
+          mkdir -p dist "$RUNNER_TEMP/chart-scan/$chart"
+          digest="$(
+            cd "$chart_root"
+            bash "$GITHUB_WORKSPACE/scripts/publish-chart.sh" "$chart" "$version" \
+              'oci://ghcr.io/${{ github.repository_owner }}/charts' "$GITHUB_WORKSPACE/dist"
+          )"
           tar -xzf "dist/$chart-$version.tgz" -C "$RUNNER_TEMP/chart-scan/$chart"
-          push_output="$(helm push "dist/$chart-$version.tgz" 'oci://ghcr.io/${{ github.repository_owner }}/charts')"
-          printf '%s\n' "$push_output"
-          digest="$(printf '%s\n' "$push_output" | awk '$1 == "Digest:" {print $2}')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           if [[ "$chart" == steward ]]; then
             digest_file=dist/helm-chart.digest
           else

@@ -80,47 +80,21 @@ for component in apiserver controller mint trigger-receiver bridge web; do
   esac
 done
 
-helm package "${root}/charts/steward" --destination "${run_dir}" \
-  --version "${release_version}" --app-version "${release_version}" >/dev/null
-chart_archive="${run_dir}/steward-${release_version}.tgz"
-chart_push="$(helm push "${chart_archive}" "oci://${registry_address}/charts" --plain-http 2>&1)"
-chart_digest="$(printf '%s\n' "${chart_push}" | awk '$1 == "Digest:" { print $2 }')"
-if [[ ! "${chart_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "local chart publication returned invalid digest ${chart_digest}" >&2
-  exit 1
-fi
+chart_digest="$({
+  cd "${root}"
+  bash scripts/publish-chart.sh steward "${release_version}" \
+    "oci://${registry_address}/charts" "${run_dir}" --plain-http
+})"
 
 governed_charts="${run_dir}/charts"
 bash "${root}/scripts/prepare-governed-dependency-charts.sh" "${governed_charts}"
 for dependency_chart in spire agent-sandbox openshell litellm arc; do
-  case "${dependency_chart}" in
-    spire)
-      (cd "${run_dir}" && helm package charts/spire --destination . --version "${release_version}" >/dev/null)
-      ;;
-    agent-sandbox)
-      (cd "${run_dir}" && helm package charts/agent-sandbox --destination . --version "${release_version}" >/dev/null)
-      ;;
-    openshell)
-      (cd "${run_dir}" && helm package charts/openshell --destination . --version "${release_version}" >/dev/null)
-      ;;
-    litellm)
-      (cd "${run_dir}" && helm package charts/litellm --destination . --version "${release_version}" >/dev/null)
-      ;;
-    arc)
-      (cd "${run_dir}" && helm package charts/arc --destination . --version "${release_version}" >/dev/null)
-      ;;
-  esac
-  dependency_push="$(
-    helm push "${run_dir}/${dependency_chart}-${release_version}.tgz" \
-      "oci://${registry_address}/charts" --plain-http 2>&1
-  )"
-  dependency_digest="$(
-    printf '%s\n' "${dependency_push}" | awk '$1 == "Digest:" { print $2 }'
-  )"
-  if [[ ! "${dependency_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    echo "local ${dependency_chart} chart publication returned invalid digest ${dependency_digest}" >&2
-    exit 1
-  fi
+  (
+    cd "${run_dir}"
+    bash "${root}/scripts/publish-chart.sh" "${dependency_chart}" \
+      "${release_version}" "oci://${registry_address}/charts" "${run_dir}" \
+      --plain-http >/dev/null
+  )
 done
 
 bundle_chart="${run_dir}/charts/steward-bundle"
@@ -132,9 +106,12 @@ STEWARD_BUNDLE_RELEASE_VERSION="${release_version}" \
   STEWARD_BUNDLE_RELEASE_WEB_DIGEST="${web_digest}" \
   STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="${trigger_receiver_digest}" \
   bash "${root}/scripts/prepare-steward-bundle-chart.sh" "${bundle_chart}"
-(cd "${run_dir}" && helm package charts/steward-bundle --destination . \
-  --version "${release_version}" --app-version "${release_version}" >/dev/null)
 bundle_archive="${run_dir}/steward-bundle-${release_version}.tgz"
+(
+  cd "${run_dir}"
+  bash "${root}/scripts/publish-chart.sh" steward-bundle "${release_version}" \
+    "oci://${registry_address}/charts" "${run_dir}" --plain-http >/dev/null
+)
 bundle_values="${run_dir}/steward-bundle-values.yaml"
 helm show values "${bundle_archive}" >"${bundle_values}"
 if [[ "$(awk '
@@ -166,14 +143,6 @@ helm template candidate-bundle "${bundle_archive}" --namespace steward-test \
 if ! grep -Fq "${runtime_repository}:${release_version}-" "${bundle_render}" \
   || grep -Fq 'ghcr.io/apelogic-ai/steward:' "${bundle_render}"; then
   echo 'candidate bundle render omitted active Steward release images' >&2
-  exit 1
-fi
-bundle_push="$(
-  helm push "${bundle_archive}" "oci://${registry_address}/charts" --plain-http 2>&1
-)"
-bundle_digest="$(printf '%s\n' "${bundle_push}" | awk '$1 == "Digest:" { print $2 }')"
-if [[ ! "${bundle_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "local steward-bundle chart publication returned invalid digest ${bundle_digest}" >&2
   exit 1
 fi
 bash "${root}/scripts/steward-bundle-kind-smoke.sh" "${bundle_archive}"

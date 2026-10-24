@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Chart publication now captures Helm output from both output streams, and the pull-request release
+  candidate uses the same package, push, and digest-validation script as tag-time publication.
+
 ## [0.3.23] - 2026-10-23
 
 Steward v0.3.23 contains the v0.3.22 release content plus a release-workflow fix that pins Helm for
