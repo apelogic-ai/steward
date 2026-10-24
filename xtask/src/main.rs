@@ -1342,12 +1342,19 @@ mod tests {
             "steward-apiserver-bin v0.3.22",
         )?;
 
-        for forbidden in ["p256 v0.13.2", "crypto-bigint v0.5.5"] {
+        for (forbidden, crate_name) in [
+            ("p256 v0.13.2", "p256"),
+            ("crypto-bigint v0.5.5", "crypto-bigint"),
+        ] {
             let tree = format!("steward-apiserver-bin v0.3.22\n└── {forbidden}");
-            let error = validate_production_dependency_tree("steward-apiserver-bin", &tree)
-                .expect_err("production tree should reject test-only cryptography");
+            let Err(error) = validate_production_dependency_tree("steward-apiserver-bin", &tree)
+            else {
+                return Err(format!(
+                    "production tree accepted forbidden dependency {forbidden}"
+                ));
+            };
             assert!(error.contains("steward-apiserver-bin"));
-            assert!(error.contains(forbidden.split_once(' ').unwrap().0));
+            assert!(error.contains(crate_name));
         }
         Ok(())
     }
