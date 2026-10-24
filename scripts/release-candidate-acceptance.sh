@@ -106,12 +106,15 @@ STEWARD_BUNDLE_RELEASE_VERSION="${release_version}" \
   STEWARD_BUNDLE_RELEASE_WEB_DIGEST="${web_digest}" \
   STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="${trigger_receiver_digest}" \
   bash "${root}/scripts/prepare-steward-bundle-chart.sh" "${bundle_chart}"
-bundle_archive="${run_dir}/steward-bundle-${release_version}.tgz"
-(
+bundle_digest="$({
   cd "${run_dir}"
   bash "${root}/scripts/publish-chart.sh" steward-bundle "${release_version}" \
-    "oci://${registry_address}/charts" "${run_dir}" --plain-http >/dev/null
-)
+    "oci://${registry_address}/charts" "${run_dir}" --plain-http
+})"
+bundle_pull_dir="$(mktemp -d "${run_dir}/steward-bundle-pull.XXXXXX")"
+bundle_archive="$(bash "${root}/scripts/pull-chart-by-digest.sh" \
+  "oci://${registry_address}/charts/steward-bundle" "${bundle_digest}" \
+  "${bundle_pull_dir}" --plain-http)"
 bundle_values="${run_dir}/steward-bundle-values.yaml"
 helm show values "${bundle_archive}" >"${bundle_values}"
 if [[ "$(awk '

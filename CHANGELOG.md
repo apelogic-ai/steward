@@ -7,6 +7,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Released-bundle acceptance now uses the single chart archive Helm writes for a digest pull,
+  instead of assuming Helm will name it with the chart version.
+- The pull-request release candidate now installs the bundle archive it retrieves from its local
+  registry by digest, using the same digest verification and archive lookup as the tag-time release.
+- Release acceptance cleanup now uses each run's kubeconfig and decides whether cleanup succeeded by
+  verifying that its owned cluster and temporary directory are absent. It now also fails when Kind
+  cannot list clusters to confirm that the owned cluster is gone.
+
 ## [0.3.24] - 2026-10-24
 
 Steward v0.3.24 contains the v0.3.23 release content plus release-workflow fixes that share chart

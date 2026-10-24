@@ -117,6 +117,7 @@ bash "${root}/scripts/test-steward-bundle-chart.sh"
 bash "${root}/scripts/test-validate-release-version.sh"
 bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-publish-chart.sh"
+bash "${root}/scripts/test-pull-chart-by-digest.sh"
 bash "${root}/scripts/test-released-artifact-acceptance.sh"
 bash "${root}/scripts/test-release-chart-contract.sh"
 bash "${root}/scripts/test-chart-nullable-values.sh"

@@ -17,16 +17,28 @@ kubeconfig="${run_dir}/kubeconfig"
 prepared="${run_dir}/steward-bundle"
 rendered="${run_dir}/rendered.yaml"
 inventory="${run_dir}/ownership.txt"
+cluster_created=0
 
 cleanup() {
   local status="$?"
   trap - EXIT INT TERM
   set +e
-  if kind get clusters 2>/dev/null | grep -Fxq "${cluster}"; then
-    KUBECONFIG="${kubeconfig}" kind delete cluster --name "${cluster}" >/dev/null
+  if [[ "${cluster_created}" == 1 ]]; then
+    KUBECONFIG="${kubeconfig}" kind delete cluster --name "${cluster}" >&2 || true
   fi
   find "${run_dir}" -depth -delete 2>/dev/null || status=1
-  if kind get clusters 2>/dev/null | grep -Fxq "${cluster}" \
+  clusters=''
+  cluster_check_failed=0
+  if [[ "${cluster_created}" == 1 ]] \
+    && ! clusters="$(kind get clusters 2>/dev/null)"; then
+    echo "steward-bundle smoke cleanup could not be verified; Kind clusters could not be listed" >&2
+    if [[ "${status}" == 0 ]]; then
+      status=1
+    fi
+    cluster_check_failed=1
+  fi
+  if { [[ "${cluster_created}" == 1 && "${cluster_check_failed}" == 0 ]] \
+      && grep -Fxq "${cluster}" <<<"${clusters}"; } \
     || [[ -e "${run_dir}" ]]; then
     echo "steward-bundle smoke cleanup left ${cluster} or ${run_dir}" >&2
     status=1
@@ -59,6 +71,7 @@ printf '%s\n' \
   'unlabeled=all Helm release objects are isolated inside the run-owned cluster' \
   >"${inventory}"
 
+cluster_created=1
 kind create cluster --name "${cluster}" --kubeconfig "${kubeconfig}" \
   --image "${kind_node_image}" --wait 120s
 chmod 600 "${kubeconfig}"
