@@ -54,6 +54,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "ci" if rest.is_empty() => ci(),
         "quality" if rest.is_empty() => quality(),
         "workflow-lint" if rest.is_empty() => workflow_lint(),
+        "production-deps" if rest == ["--check"] => production_dependencies_check(),
         "storage" if rest == ["check"] => storage::check(&root()),
         "storage" if rest == ["audit"] => storage::audit(&root()),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
@@ -86,6 +87,7 @@ fn usage() -> String {
         "  ci",
         "  quality",
         "  workflow-lint",
+        "  production-deps --check",
         "  storage check|audit",
         "  e2e-openshell-adapter",
         "  e2e-governed-connections",
@@ -171,6 +173,7 @@ fn quality_after_tool_checks() -> TaskResult {
         "cargo",
         &["test", "--manifest-path", "e2e/Cargo.toml", "--no-run"],
     )?;
+    production_dependencies_check()?;
     // Vendor SDKs are introduced in later slices, so unused wrapper declarations
     // are expected here. `layering_test` below exercises the wrapper rule itself.
     run("cargo", &["deny", "check", "-A", "unused-wrapper"])?;
@@ -184,6 +187,44 @@ fn quality_after_tool_checks() -> TaskResult {
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()
+}
+
+fn production_dependencies_check() -> TaskResult {
+    for package in [
+        "steward-apiserver-bin",
+        "steward-controller-bin",
+        "steward-mint-bin",
+        "steward-trigger-receiver",
+    ] {
+        println!("+ cargo tree --edges normal --package {package}");
+        let output = checked_command("cargo")?
+            .args(["tree", "--edges", "normal", "--package", package])
+            .current_dir(root())
+            .output()
+            .map_err(|error| {
+                format!("failed to inspect production dependencies for {package}: {error}")
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo tree failed for production package {package}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        validate_production_dependency_tree(package, &String::from_utf8_lossy(&output.stdout))?;
+    }
+    println!("production-deps --check: shipped binaries exclude test-only cryptography");
+    Ok(())
+}
+
+fn validate_production_dependency_tree(package: &str, tree: &str) -> TaskResult {
+    for forbidden in ["p256 v", "crypto-bigint v0.5."] {
+        if tree.lines().any(|line| line.contains(forbidden)) {
+            return Err(format!(
+                "production package {package} includes forbidden dependency `{forbidden}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_quality_tool_versions() -> TaskResult {
@@ -1282,7 +1323,8 @@ mod tests {
     use super::{
         checked_command, git_command_in_repository, journey_tags, migration_changes,
         provider_profile_bundle_directory_for_inputs, root, should_skip_directory,
-        validate_conformance_test_result, validate_workflow_action, validate_workflow_tool_setup,
+        validate_conformance_test_result, validate_production_dependency_tree,
+        validate_workflow_action, validate_workflow_tool_setup,
     };
     use std::collections::BTreeSet;
     use std::fs;
@@ -1292,6 +1334,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn production_dependency_tree_rejects_test_only_cryptography() -> Result<(), String> {
+        validate_production_dependency_tree(
+            "steward-apiserver-bin",
+            "steward-apiserver-bin v0.3.22",
+        )?;
+
+        for forbidden in ["p256 v0.13.2", "crypto-bigint v0.5.5"] {
+            let tree = format!("steward-apiserver-bin v0.3.22\n└── {forbidden}");
+            let error = validate_production_dependency_tree("steward-apiserver-bin", &tree)
+                .expect_err("production tree should reject test-only cryptography");
+            assert!(error.contains("steward-apiserver-bin"));
+            assert!(error.contains(forbidden.split_once(' ').unwrap().0));
+        }
+        Ok(())
+    }
 
     #[test]
     fn workflows_install_pinned_tools_only_through_setup_tools() -> Result<(), String> {
