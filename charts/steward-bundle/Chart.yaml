@@ -2,8 +2,8 @@ apiVersion: v2
 name: steward-bundle
 description: Steward with pinned governed-execution dependencies
 type: application
-version: 0.3.23
-appVersion: 0.3.23
+version: 0.3.24
+appVersion: 0.3.24
 kubeVersion: ">=1.32.0-0"
 home: https://github.com/apelogic-ai/steward
 sources:
@@ -15,28 +15,28 @@ keywords:
 dependencies:
   - name: steward
     repository: file://../steward
-    version: 0.3.23
+    version: 0.3.24
     condition: components.steward.enabled
   - name: spire
     repository: file://../spire
-    version: 0.3.23
+    version: 0.3.24
     condition: components.spire.enabled
   - name: agent-sandbox
     alias: agentSandbox
     repository: file://../agent-sandbox
-    version: 0.3.23
+    version: 0.3.24
     condition: components.agentSandbox.enabled
   - name: openshell
     repository: file://../openshell
-    version: 0.3.23
+    version: 0.3.24
     condition: components.openshell.enabled
   - name: litellm
     repository: file://../litellm
-    version: 0.3.23
+    version: 0.3.24
     condition: components.litellm.enabled
   - name: arc
     repository: file://../arc
-    version: 0.3.23
+    version: 0.3.24
     condition: components.arc.enabled
 annotations:
   artifacthub.io/license: MIT

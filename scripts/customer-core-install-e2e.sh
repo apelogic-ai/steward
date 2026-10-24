@@ -142,6 +142,9 @@ cleanup() {
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
     wait "${port_forward_pid}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${registry_mirror}" ]]; then
+    docker network disconnect kind "${registry_mirror%%:*}" >/dev/null 2>&1 || status=1
+  fi
   if [[ "${cluster_created}" == 1 ]]; then
     kind delete cluster --name "${cluster}" >/dev/null 2>&1 || status=1
   fi

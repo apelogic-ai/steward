@@ -11,8 +11,8 @@ reqwest.workspace = true # Calls the LiteLLM management API over rustls-backed H
 serde.workspace = true # Decodes the pinned LiteLLM management response contracts.
 serde_json.workspace = true # Builds vendor wire payloads inside the adapter boundary.
 sha2.workspace = true # Derives a stable, non-secret runtime key alias.
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.23" }
-steward-types = { path = "../../crates/steward-types", version = "=0.3.23" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.24" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.24" }
 
 [dev-dependencies]
 tokio.workspace = true # Executes asynchronous adapter contract tests without external services.
