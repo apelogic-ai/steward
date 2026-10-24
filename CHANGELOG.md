@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Security
+
+- Kept ES256 test-key generation dependencies out of shipped binaries. A production dependency
+  check now prevents `p256` and affected `crypto-bigint` 0.5 releases from entering those binaries;
+  `RUSTSEC-2026-0387` remains narrowly ignored only while test tooling requires it.
+
 ### Fixed
 
 - Chart publication and release artifact assembly now use the repository's pinned Helm version,
