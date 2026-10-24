@@ -9,10 +9,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [0.3.24] - 2026-10-24
 
-Steward v0.3.24 contains the v0.3.23 release content plus a release-workflow fix that shares chart
-publication with the pull-request release candidate and captures Helm output from both output
-streams. The v0.3.23 tag pushed all seven charts, but chart evidence and released-artifact
-acceptance did not complete, and no GitHub release was created.
+Steward v0.3.24 contains the v0.3.23 release content plus release-workflow fixes that share chart
+publication with the pull-request release candidate, capture Helm output from both output streams,
+and cleanly remove the candidate registry from the Kind network after acceptance. The v0.3.23 tag
+pushed all seven charts, but chart evidence and released-artifact acceptance did not complete, and
+no GitHub release was created.
 
 This release adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
 evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
@@ -65,6 +66,9 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
 
 - Chart publication now captures Helm output from both output streams, and the pull-request release
   candidate uses the same package, push, and digest-validation script as tag-time publication.
+- Release-candidate cleanup now disconnects its local registry before deleting the disposable Kind
+  cluster, so the pinned Kind version can remove its network without turning a successful dry-run
+  into a cleanup failure.
 - Chart publication and release artifact assembly now use the repository's pinned Helm version,
   preventing release output from changing when a newer Helm major version becomes available.
 

@@ -69,13 +69,24 @@ for required in \
   'STEWARD_RELEASE_IMAGE_PULL_REPOSITORY' \
   'STEWARD_RELEASE_REGISTRY_MIRROR' \
   'STEWARD_RELEASE_PLAIN_HTTP' \
-  'STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST'
+  'STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST' \
+  "docker network disconnect kind \"\${registry_mirror%%:*}\""
 do
   grep -Fq "${required}" "${harness}" || {
     echo "released-artifact acceptance omitted candidate-registry input ${required}" >&2
     exit 1
   }
 done
+
+disconnect_line="$(grep -nF "docker network disconnect kind \"\${registry_mirror%%:*}\"" \
+  "${harness}" | cut -d: -f1)"
+delete_line="$(grep -nF "kind delete cluster --name \"\${cluster}\"" \
+  "${harness}" | cut -d: -f1)"
+if [[ -z "${disconnect_line}" || -z "${delete_line}" ]] \
+  || ((disconnect_line >= delete_line)); then
+  echo 'released-artifact acceptance must disconnect the candidate registry before Kind teardown' >&2
+  exit 1
+fi
 
 missing_receiver_status=0
 missing_receiver_output="$({
