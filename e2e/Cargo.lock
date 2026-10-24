@@ -3720,7 +3720,6 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
- "p256",
  "reqwest 0.12.28",
  "serde",
  "serde-saphyr",

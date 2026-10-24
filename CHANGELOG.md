@@ -55,6 +55,9 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
 
 ### Security
 
+- Kept ES256 test-key generation dependencies out of shipped binaries. A production dependency
+  check now prevents `p256` and affected `crypto-bigint` 0.5 releases from entering those binaries;
+  `RUSTSEC-2026-0387` remains narrowly ignored only while test tooling requires it.
 - Update Tokio to 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness).
 
 ### Fixed
