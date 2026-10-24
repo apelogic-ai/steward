@@ -1,4 +1,4 @@
-# Source: Jira governed-tool acceptance for version 0.3.22.
+# Source: Jira governed-tool acceptance for version 0.3.23.
 # The owner completes Atlassian sign-in before this journey; the saved Playwright state remains localhost-only.
 @needs-jira
 Feature: J11 - User runs a Task with Jira

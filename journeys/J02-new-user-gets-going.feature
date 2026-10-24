@@ -1,4 +1,4 @@
-# Source: user journey J2. UI text exercised against the 0.3.22 release candidate.
+# Source: user journey J2. UI text exercised against the 0.3.23 release candidate.
 # "member" stands for the role the template is meant for.
 Feature: J2 - New user gets going
   As a user who signs in for the first time
