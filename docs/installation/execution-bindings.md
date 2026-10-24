@@ -1,6 +1,6 @@
 # Execution bindings
 
-Status: current Steward 0.3.22 installation contract
+Status: current Steward 0.3.23 installation contract
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding

@@ -7,20 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-### Security
+## [0.3.23] - 2026-10-23
 
-- Kept ES256 test-key generation dependencies out of shipped binaries. A production dependency
-  check now prevents `p256` and affected `crypto-bigint` 0.5 releases from entering those binaries;
-  `RUSTSEC-2026-0387` remains narrowly ignored only while test tooling requires it.
+Steward v0.3.23 contains the v0.3.22 release content plus a release-workflow fix that pins Helm for
+chart publication and release artifact assembly. The v0.3.22 tag was not fully published: its
+governed dependency charts and `steward-bundle` were never pushed, and it has no GitHub release.
 
-### Fixed
-
-- Chart publication and release artifact assembly now use the repository's pinned Helm version,
-  preventing release output from changing when a newer Helm major version becomes available.
-
-## [0.3.22] - 2026-10-23
-
-Steward v0.3.22 adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
+This release adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
 evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
 LiteLLM, and Actions Runner Controller, and a bundle chart that installs them with Steward as one
 release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
@@ -62,7 +55,15 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
 
 ### Security
 
+- Kept ES256 test-key generation dependencies out of shipped binaries. A production dependency
+  check now prevents `p256` and affected `crypto-bigint` 0.5 releases from entering those binaries;
+  `RUSTSEC-2026-0387` remains narrowly ignored only while test tooling requires it.
 - Update Tokio to 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness).
+
+### Fixed
+
+- Chart publication and release artifact assembly now use the repository's pinned Helm version,
+  preventing release output from changing when a newer Helm major version becomes available.
 
 ### Upgrade and rollback
 
@@ -75,8 +76,14 @@ release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
   prior default rendering.
 - Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then
   restore execution bindings to a reference runtime supported by that release. Remove dependency
-  charts only when the installation adopted them solely for v0.3.22, and restore its previous
+  charts only when the installation adopted them solely for v0.3.23, and restore its previous
   dependency ownership. No database rollback is required.
+
+## [0.3.22] - 2026-10-23
+
+The v0.3.22 tag was only partly published. Component images, both reference runtimes, and the
+`steward` chart were published, but the governed dependency charts and `steward-bundle` were never
+pushed, and no GitHub release was created. Use v0.3.23 for the complete release.
 
 ## [0.3.21] - 2026-10-22
 
@@ -1619,7 +1626,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.22...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.23...HEAD
+[0.3.23]: https://github.com/apelogic-ai/steward/compare/v0.3.22...v0.3.23
 [0.3.22]: https://github.com/apelogic-ai/steward/compare/v0.3.21...v0.3.22
 [0.3.21]: https://github.com/apelogic-ai/steward/compare/v0.3.20...v0.3.21
 [0.3.20]: https://github.com/apelogic-ai/steward/compare/v0.3.19...v0.3.20
