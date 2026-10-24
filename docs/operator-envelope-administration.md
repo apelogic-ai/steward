@@ -1,6 +1,6 @@
 # User Envelope and RBAC administration
 
-Status: current Steward v0.3.24 contract.
+Status: current Steward v0.3.25 contract.
 
 This guide covers the catalog-backed User Envelope model and the supported
 day-two operator commands introduced after Steward 0.2.6. Canonical user IDs,

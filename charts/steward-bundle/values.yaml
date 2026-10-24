@@ -43,19 +43,19 @@ steward:
     repository: ghcr.io/apelogic-ai/steward
     requireDigest: true
     apiserver:
-      tag: 0.3.24-apiserver
+      tag: 0.3.25-apiserver
       digest: sha256:db37f89dd281928fdd6ca6aa4d2507cc2b59eef0b4f043644b6992a695e868f8
     controller:
-      tag: 0.3.24-controller
+      tag: 0.3.25-controller
       digest: sha256:28dd3d4095bca559eae1f937fb8c5138cc6527a5c96d65678c7af8a97d3a074f
     mint:
-      tag: 0.3.24-mint
+      tag: 0.3.25-mint
       digest: sha256:7986a0d1b01bd0ccdcd8c0ea95a217e176669fa69e5bab71688d0442127a8db7
     web:
-      tag: 0.3.24-web
+      tag: 0.3.25-web
       digest: sha256:051a977576ea1c0050ba33b7d3ddeb5b8e2f2096c71c562d546a6a0434809b78
     triggerReceiver:
-      tag: 0.3.24-trigger-receiver
+      tag: 0.3.25-trigger-receiver
       digest: sha256:5e938c750783a5bb333afd62675606a5666e57d0dc5e2949a4e38273aef6a033
   secrets:
     database:
