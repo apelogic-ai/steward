@@ -536,6 +536,9 @@ pub fn upgrade_rendered_provider_profile_bundle(
         ) | (
             ("steward-runtime-providers", "1.2.1"),
             ("steward-runtime-providers", "1.2.2")
+        ) | (
+            ("steward-runtime-providers", "1.2.2"),
+            ("steward-runtime-providers", "1.3.0")
         )
     );
     if !supported_transition {
@@ -727,6 +730,31 @@ fn validate_provider_profile_upgrade_delta(
         let replacement_profile = replacement.profiles.get(profile_id).ok_or_else(|| {
             format!("replacement provider profile {profile_id} is required for upgrade")
         })?;
+        if current_version == "1.2.2" && replacement_version == "1.3.0" {
+            let mut expected = current_profile.clone();
+            if profile_id == "steward-mcp-gw" {
+                expected["endpoints"][0]["rules"] = serde_json::json!([
+                    {"allow": {"method": "POST", "path": "/mcp"}},
+                    {"allow": {"method": "DELETE", "path": "/mcp"}},
+                    {"allow": {"method": "POST", "path": "/cli/run"}},
+                    {"allow": {"method": "POST", "path": "/cli/jobs"}},
+                    {"allow": {"method": "POST", "path": "/shell/run"}},
+                    {"allow": {"method": "POST", "path": "/shell/jobs"}}
+                ]);
+                expected["binaries"]
+                    .as_array_mut()
+                    .ok_or_else(|| "MCP provider profile requires binaries".to_owned())?
+                    .push(Value::String(
+                        "/usr/local/bin/mcp-gw-sandbox-helper".to_owned(),
+                    ));
+            }
+            if &expected != replacement_profile {
+                return Err(format!(
+                    "provider profile upgrade for {profile_id} permits only the declared governed command routes and helper binary"
+                ));
+            }
+            continue;
+        }
         if current_version == "1.2.1" && replacement_version == "1.2.2" {
             let mut expected = current_profile.clone();
             if profile_id == "steward-mcp-gw" {
@@ -1045,6 +1073,7 @@ fn render_provider_profile(
         .any(|capability| capability.as_str() == Some("inference.completions"));
     let access = network.get("access").and_then(Value::as_str);
     let allowed_methods = network.get("allowedMethods").and_then(Value::as_array);
+    let allowed_routes = network.get("allowedRoutes").and_then(Value::as_array);
     let default_access = if capabilities
         .iter()
         .any(|capability| capability.as_str() == Some("tool.read"))
@@ -1081,7 +1110,30 @@ fn render_provider_profile(
         "enforcement": "enforce",
         "allowed_ips": allowed_ips,
     });
-    if let Some(methods) = allowed_methods {
+    if let Some(routes) = allowed_routes {
+        endpoint_policy["rules"] = Value::Array(
+            routes
+                .iter()
+                .map(|route| {
+                    let route = route.as_object().ok_or_else(|| {
+                        "provider profile route must be a validated object".to_owned()
+                    })?;
+                    let method = route.get("method").ok_or_else(|| {
+                        "provider profile route must have a validated method".to_owned()
+                    })?;
+                    let path = route.get("path").ok_or_else(|| {
+                        "provider profile route must have a validated path".to_owned()
+                    })?;
+                    Ok(serde_json::json!({
+                        "allow": {
+                            "method": method,
+                            "path": path,
+                        }
+                    }))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
+    } else if let Some(methods) = allowed_methods {
         endpoint_policy["rules"] = Value::Array(
             methods
                 .iter()
@@ -1418,10 +1470,13 @@ fn validate_provider_profile_template(
         .filter_map(|input| input.get("name").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
     let network = require_object(object, "network", "provider profile template")?;
-    if network.contains_key("access") && network.contains_key("allowedMethods") {
+    let policy_modes = ["access", "allowedMethods", "allowedRoutes"]
+        .into_iter()
+        .filter(|key| network.contains_key(*key))
+        .count();
+    if policy_modes > 1 {
         return Err(
-            "provider profile template network must choose access or allowedMethods, not both"
-                .to_owned(),
+            "provider profile template network must choose exactly one access policy".to_owned(),
         );
     }
     let expected_network_keys = if network.contains_key("access") {
@@ -1432,6 +1487,13 @@ fn validate_provider_profile_template(
             "allowedCidrsInput",
             "protocol",
             "allowedMethods",
+        ][..]
+    } else if network.contains_key("allowedRoutes") {
+        &[
+            "endpointInput",
+            "allowedCidrsInput",
+            "protocol",
+            "allowedRoutes",
         ][..]
     } else {
         &["endpointInput", "allowedCidrsInput", "protocol"][..]
@@ -1491,6 +1553,52 @@ fn validate_provider_profile_template(
                 "provider profile template network allowedMethods must contain unique supported HTTP methods"
                     .to_owned(),
             );
+        }
+    }
+    if let Some(routes) = network.get("allowedRoutes") {
+        let routes = routes.as_array().ok_or_else(|| {
+            "provider profile template network allowedRoutes must be an array".to_owned()
+        })?;
+        let allowed = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+        let mut unique = BTreeSet::new();
+        if routes.is_empty() {
+            return Err(
+                "provider profile template network allowedRoutes must not be empty".to_owned(),
+            );
+        }
+        for route in routes {
+            let route = route.as_object().ok_or_else(|| {
+                "provider profile template network allowedRoutes entries must be objects".to_owned()
+            })?;
+            require_exact_keys(
+                route,
+                &["method", "path"],
+                "provider profile template network allowedRoutes entry",
+            )?;
+            let method = require_nonempty_string(
+                route,
+                "method",
+                "provider profile template network allowedRoutes entry",
+            )?;
+            let path = require_nonempty_string(
+                route,
+                "path",
+                "provider profile template network allowedRoutes entry",
+            )?;
+            if !allowed.contains(&method)
+                || !path.starts_with('/')
+                || path.len() == 1
+                || path.contains("//")
+                || !path
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'))
+                || !unique.insert((method, path))
+            {
+                return Err(
+                    "provider profile template network allowedRoutes must contain unique exact HTTP routes"
+                        .to_owned(),
+                );
+            }
         }
     }
     let authorization = require_object(object, "authorization", "provider profile template")?;
@@ -3212,6 +3320,114 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_exact_routes_render_without_host_or_path_escape() -> Result<(), String> {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"},
+          "transitions": {"install": ["absent"], "reconcile": ["same-bundle"]},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "template": "profiles/steward-mcp-gw.json",
+            "inputs": [
+              {"name": "gateway-origin", "kind": "https-origin"},
+              {"name": "runtime-grant-origin", "kind": "https-origin"},
+              {"name": "service-cidrs", "kind": "cidr-list"}
+            ]
+          }]
+        }"#;
+        let template = r#"{
+          "schema": "steward.provider-profile-template/v1",
+          "id": "steward-mcp-gw",
+          "metadata": {"displayName": "Steward MCP gateway", "description": "Runtime-scoped gateway access", "category": "source_control"},
+          "capabilities": ["tool.read"],
+          "network": {
+            "endpointInput": "gateway-origin",
+            "allowedCidrsInput": "service-cidrs",
+            "protocol": "https",
+            "allowedRoutes": [
+              {"method": "POST", "path": "/mcp"},
+              {"method": "DELETE", "path": "/mcp"},
+              {"method": "POST", "path": "/cli/run"},
+              {"method": "POST", "path": "/cli/jobs"},
+              {"method": "POST", "path": "/shell/run"},
+              {"method": "POST", "path": "/shell/jobs"}
+            ]
+          },
+          "authorization": {
+            "authName": "access_token",
+            "authDescription": "Runtime-bound gateway access",
+            "tokenGrantOriginInput": "runtime-grant-origin",
+            "tokenPath": "/token",
+            "audience": "steward-mcp",
+            "jwtSvidAudience": "steward-mint",
+            "scopes": ["mcp"],
+            "cacheTtlSeconds": 2
+          },
+          "runtime": {"requiredBinaries": ["/usr/local/bin/mcp-gw-sandbox-helper"]}
+        }"#;
+        let inputs = r#"{
+          "schema": "steward.provider-profile-inputs/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "inputs": {
+              "gateway-origin": "https://mcp.gateway.test",
+              "runtime-grant-origin": "https://mint.gateway.test",
+              "service-cidrs": ["192.0.2.0/24"]
+            }
+          }]
+        }"#;
+
+        let rendered = render_provider_profile_bundle(
+            bundle,
+            [("profiles/steward-mcp-gw.json", template)],
+            inputs,
+        )?;
+        let endpoint = rendered
+            .profiles
+            .get("steward-mcp-gw")
+            .and_then(|profile| profile.pointer("/endpoints/0"))
+            .ok_or_else(|| "rendered command endpoint is required".to_owned())?;
+        assert_eq!(
+            endpoint.get("protocol").and_then(Value::as_str),
+            Some("rest")
+        );
+        assert_eq!(
+            endpoint.get("rules"),
+            Some(&serde_json::json!([
+                {"allow": {"method": "POST", "path": "/mcp"}},
+                {"allow": {"method": "DELETE", "path": "/mcp"}},
+                {"allow": {"method": "POST", "path": "/cli/run"}},
+                {"allow": {"method": "POST", "path": "/cli/jobs"}},
+                {"allow": {"method": "POST", "path": "/shell/run"}},
+                {"allow": {"method": "POST", "path": "/shell/jobs"}}
+            ]))
+        );
+        assert_eq!(
+            endpoint.get("host").and_then(Value::as_str),
+            Some("mcp.gateway.test")
+        );
+
+        for escaped_path in [
+            "/cli/*",
+            "/cli/jobs*",
+            "/shell/run?other=true",
+            "https://other.test/cli/run",
+        ] {
+            let escaped = template.replace("/cli/run", escaped_path);
+            let result = validate_provider_profile_bundle(
+                bundle,
+                [("profiles/steward-mcp-gw.json", escaped.as_str())],
+            );
+            assert!(
+                result.is_err(),
+                "route escape {escaped_path} must fail closed before profile rendering"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn provider_profile_install_is_absent_only_and_reconcile_rejects_drift() -> Result<(), String> {
         let profile = serde_json::json!({"id": "steward-mcp-gw", "policy": "read-only"});
         let mut profiles = BTreeMap::new();
@@ -3591,7 +3807,7 @@ mod tests {
                 }
             ]
         });
-        if matches!(version, "1.2.1" | "1.2.2") {
+        if matches!(version, "1.2.1" | "1.2.2" | "1.3.0") {
             for profile in inputs["profiles"]
                 .as_array_mut()
                 .ok_or_else(|| "test provider profile inputs require profiles".to_owned())?
@@ -3653,6 +3869,74 @@ mod tests {
             install_rendered_provider_profile_bundle(&output, &current)?;
             upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
             reconcile_rendered_provider_profile_bundle(&output, &replacement)
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
+    }
+
+    #[test]
+    fn provider_profile_upgrade_to_1_3_0_adds_only_governed_command_routes() -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1.2.2",
+            "1.2.2",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        let mut replacement = RenderedProviderProfileBundle {
+            profiles: current.profiles.clone(),
+            state: current.state.clone(),
+        };
+        replacement.state["bundle"]["version"] = serde_json::json!("1.3.0");
+        let mcp = replacement
+            .profiles
+            .get_mut("steward-mcp-gw")
+            .ok_or_else(|| "replacement MCP profile is required".to_owned())?;
+        mcp["endpoints"][0]["rules"] = serde_json::json!([
+            {"allow": {"method": "POST", "path": "/mcp"}},
+            {"allow": {"method": "DELETE", "path": "/mcp"}},
+            {"allow": {"method": "POST", "path": "/cli/run"}},
+            {"allow": {"method": "POST", "path": "/cli/jobs"}},
+            {"allow": {"method": "POST", "path": "/shell/run"}},
+            {"allow": {"method": "POST", "path": "/shell/jobs"}}
+        ]);
+        mcp["binaries"]
+            .as_array_mut()
+            .ok_or_else(|| "replacement MCP profile binaries are required".to_owned())?
+            .push(serde_json::json!("/usr/local/bin/mcp-gw-sandbox-helper"));
+        replacement.state["profiles"] = serde_json::to_value(&replacement.profiles)
+            .map_err(|error| format!("render replacement state: {error}"))?;
+
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-1-3-0-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
+
+            let mut escaped = RenderedProviderProfileBundle {
+                profiles: replacement.profiles.clone(),
+                state: replacement.state.clone(),
+            };
+            *escaped
+                .profiles
+                .get_mut("steward-mcp-gw")
+                .and_then(|profile| profile.pointer_mut("/endpoints/0/rules/0/allow/path"))
+                .ok_or_else(|| "escaped route fixture is required".to_owned())? =
+                serde_json::json!("/cli/**");
+            escaped.state["profiles"] = serde_json::to_value(&escaped.profiles)
+                .map_err(|error| format!("render escaped state: {error}"))?;
+            if validate_provider_profile_upgrade_delta(&current, &escaped, "1.2.2", "1.3.0").is_ok()
+            {
+                return Err("provider profile upgrade must reject broader command paths".to_owned());
+            }
+            Ok(())
         })();
         fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
         result

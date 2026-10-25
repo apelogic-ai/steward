@@ -42,9 +42,48 @@ class PlatformPreflightTests(unittest.TestCase):
         include_all_profiles: bool = True,
         include_delete: bool = True,
         shared_audience: bool = True,
+        bundle_version: str = "1.2.2",
+        exact_routes: bool = False,
+        extra_route: bool = False,
     ) -> None:
         installer = self.profile_bundle / "bin" / "steward-provider-profile"
         installer.parent.mkdir(parents=True, exist_ok=True)
+        mcp_binaries = ["/usr/bin/curl"]
+        if include_bridge_binary:
+            mcp_binaries.append("/usr/local/bin/steward-connections-bridge")
+        if exact_routes:
+            mcp_binaries.append("/usr/local/bin/mcp-gw-sandbox-helper")
+            network = {
+                "allowedRoutes": [
+                    {"method": "POST", "path": "/mcp"},
+                    {"method": "DELETE", "path": "/mcp"},
+                    {"method": "POST", "path": "/cli/run"},
+                    {"method": "POST", "path": "/cli/jobs"},
+                    {"method": "POST", "path": "/shell/run"},
+                    {"method": "POST", "path": "/shell/jobs"},
+                ]
+            }
+        else:
+            methods = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"]
+            if include_delete:
+                methods.append("DELETE")
+            network = {"allowedMethods": methods}
+        (self.profile_bundle / "profiles").mkdir(parents=True, exist_ok=True)
+        (self.profile_bundle / "bundle.json").write_text(
+            json.dumps(
+                {"bundle": {"id": "steward-runtime-providers", "version": bundle_version}}
+            ),
+            encoding="utf-8",
+        )
+        (self.profile_bundle / "profiles" / "steward-mcp-gw.json").write_text(
+            json.dumps(
+                {
+                    "network": network,
+                    "runtime": {"requiredBinaries": mcp_binaries},
+                }
+            ),
+            encoding="utf-8",
+        )
         validated_profiles = (
             "[{'id': 'steward-litellm', 'digest': 'sha256:' + '7' * 64}, "
             "{'id': 'steward-mcp-gw', 'digest': 'sha256:' + '8' * 64}]"
@@ -64,11 +103,24 @@ class PlatformPreflightTests(unittest.TestCase):
             "    binaries = ['/usr/bin/curl']\n"
             f"    if profile['id'] == 'steward-mcp-gw' and {include_bridge_binary!r}:\n"
             "      binaries.append('/usr/local/bin/steward-connections-bridge')\n"
+            f"    if profile['id'] == 'steward-mcp-gw' and {exact_routes!r}:\n"
+            "      binaries.append('/usr/local/bin/mcp-gw-sandbox-helper')\n"
             "    endpoint = {'host': origin.hostname, 'port': origin.port or 443, 'allowed_ips': profile['inputs']['service-cidrs']}\n"
             "    if profile['id'] == 'steward-mcp-gw':\n"
-            "      methods = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH']\n"
-            f"      if {include_delete!r}: methods.append('DELETE')\n"
-            "      endpoint['rules'] = [{'allow': {'method': method, 'path': '**'}} for method in methods]\n"
+            f"      if {exact_routes!r}:\n"
+            "        endpoint['rules'] = [\n"
+            "          {'allow': {'method': 'POST', 'path': '/mcp'}},\n"
+            "          {'allow': {'method': 'DELETE', 'path': '/mcp'}},\n"
+            "          {'allow': {'method': 'POST', 'path': '/cli/run'}},\n"
+            "          {'allow': {'method': 'POST', 'path': '/cli/jobs'}},\n"
+            "          {'allow': {'method': 'POST', 'path': '/shell/run'}},\n"
+            "          {'allow': {'method': 'POST', 'path': '/shell/jobs'}},\n"
+            "        ]\n"
+            f"        if {extra_route!r}: endpoint['rules'].append({{'allow': {{'method': 'POST', 'path': '/cli/**'}}}})\n"
+            "      else:\n"
+            "        methods = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH']\n"
+            f"        if {include_delete!r}: methods.append('DELETE')\n"
+            "        endpoint['rules'] = [{'allow': {'method': method, 'path': '**'}} for method in methods]\n"
             "    else:\n"
             "      endpoint['access'] = 'read-write'\n"
             "    audience = profile['inputs']['mint-audience']\n"
@@ -78,7 +130,7 @@ class PlatformPreflightTests(unittest.TestCase):
             "      'credentials': [{'token_grant': {'audience': audience}}],\n"
             "      'binaries': binaries,\n"
             "    }\n"
-            "  installation = {'schema': 'steward.provider-profile-install-state/v1', 'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.2'}, 'profiles': profiles}\n"
+            f"  installation = {{'schema': 'steward.provider-profile-install-state/v1', 'bundle': {{'id': 'steward-runtime-providers', 'version': {bundle_version!r}}}, 'profiles': profiles}}\n"
             "  result = {'schemaVersion': 'steward.provider-profile-result/v1', 'operation': 'render', 'status': 'valid'}\n"
             "  print(json.dumps({'result': result, 'installation': installation}, separators=(',', ':')))\n"
             "else:\n"
@@ -86,7 +138,7 @@ class PlatformPreflightTests(unittest.TestCase):
             "    'schemaVersion': 'steward.provider-profile-result/v1',\n"
             "    'operation': 'validate',\n"
             "    'status': 'valid',\n"
-            "    'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.2'},\n"
+            f"    'bundle': {{'id': 'steward-runtime-providers', 'version': {bundle_version!r}}},\n"
             f"    'profiles': {validated_profiles}\n"
             "  }, separators=(',', ':')))\n",
             encoding="utf-8",
@@ -501,6 +553,51 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("including DELETE", result.stderr)
+
+    def test_selected_1_3_0_bundle_generates_matching_inputs_and_exact_routes(self) -> None:
+        self.profile_bundle = self.profile_bundle.parent / "v1.3.0"
+        self.write_profile_installer(
+            include_bridge_binary=True,
+            bundle_version="1.3.0",
+            exact_routes=True,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            input_path = base / "input.json"
+            output = base / "rendered"
+            input_path.write_text(json.dumps(self.input), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    str(TOOL),
+                    "generate",
+                    "--input",
+                    str(input_path),
+                    "--provider-profile-bundle",
+                    str(self.profile_bundle),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            profile_inputs = json.loads(
+                (output / "provider-profile-inputs.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(profile_inputs["bundle"]["version"], "1.3.0")
+
+    def test_selected_1_3_0_bundle_refuses_any_route_expansion(self) -> None:
+        self.profile_bundle = self.profile_bundle.parent / "v1.3.0"
+        self.write_profile_installer(
+            include_bridge_binary=True,
+            bundle_version="1.3.0",
+            exact_routes=True,
+            extra_route=True,
+        )
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exact governed gateway routes", result.stderr)
 
     def test_rejects_rendered_profile_with_mismatched_mint_audience(self) -> None:
         self.write_profile_installer(include_bridge_binary=True, shared_audience=False)
