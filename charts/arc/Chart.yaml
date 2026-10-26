@@ -1,0 +1,19 @@
+apiVersion: v2
+name: arc
+description: Pinned Actions Runner Controller dependency for Steward installations
+type: application
+version: 0.3.25
+appVersion: 0.15.0
+kubeVersion: ">=1.32.0-0"
+home: https://github.com/apelogic-ai/steward
+sources:
+  - https://github.com/actions/actions-runner-controller
+dependencies:
+  - name: gha-runner-scale-set-controller
+    alias: arc
+    repository: oci://ghcr.io/actions/actions-runner-controller-charts
+    version: 0.15.0
+annotations:
+  artifacthub.io/license: Apache-2.0
+  steward.apelogic.ai/upstream-chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller:0.15.0
+  steward.apelogic.ai/upstream-chart-digest: sha256:20a369215b8c2ed981c4c0c75e56e6009564d51fffcbbd314d5da0ef82de253a

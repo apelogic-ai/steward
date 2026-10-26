@@ -15,13 +15,13 @@ ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.21", features = ["workload-exchange"] }
-steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.21" }
-steward-admission = { path = "../../crates/steward-admission", version = "=0.3.21" }
-steward-logging = { path = "../../crates/steward-logging", version = "=0.3.21" }
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.21" }
-steward-store = { path = "../../crates/steward-store", version = "=0.3.21" }
-steward-types = { path = "../../crates/steward-types", version = "=0.3.21" }
+steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.25", features = ["workload-exchange"] }
+steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.25" }
+steward-admission = { path = "../../crates/steward-admission", version = "=0.3.25" }
+steward-logging = { path = "../../crates/steward-logging", version = "=0.3.25" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.25" }
+steward-store = { path = "../../crates/steward-store", version = "=0.3.25" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.25" }
 tokio.workspace = true
 tokio-rustls.workspace = true
 uuid.workspace = true

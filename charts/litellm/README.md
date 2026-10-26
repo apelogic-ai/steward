@@ -1,0 +1,33 @@
+# LiteLLM dependency chart
+
+This Steward release chart wraps the LiteLLM chart from the pinned `v1.106.2`
+source archive. The archive checksum is recorded in `Chart.yaml`; preparation
+verifies it before Helm packages the dependency. No upstream workload template
+is copied into this wrapper.
+
+## Values mapping
+
+| Purpose | Upstream value |
+|---|---|
+| Proxy and migration image | `litellm.image.repository`, `litellm.image.tag` |
+| Existing Secret | `litellm.masterkeySecretName`, `litellm.environmentSecrets[]`, `litellm.db.secret.name` |
+| Secret keys | `litellm.masterkeySecretKey`, `litellm.db.secret.usernameKey`, `litellm.db.secret.passwordKey` |
+| Existing configuration | `litellm.proxyConfigMap.name`, `litellm.proxyConfigMap.key` |
+| Shared Gateway route | `route.parentRefs`, `route.hostname`, `route.timeouts.*` |
+
+The default proxy and migration image tag includes an `@sha256:` digest.
+Optional upstream extras are disabled by default and are outside this wrapper's
+immutable default image set. Inline master keys, the
+bundled database, generated proxy configuration, credential-shaped inline
+environment variables, password-bearing database URLs, and multiple Secret
+names are refused. The existing configuration must contain the model routes
+and provider environment lookups needed by the installation.
+Free-form environment inputs are disabled; use the existing Secret and proxy
+ConfigMap instead.
+
+## Platform requirements
+
+Create the release namespace, existing database, Secret, and ConfigMap before
+installing. The chart creates no Namespace and no cluster-scoped object. Its
+pods can run under a restricted Pod Security profile when the supplied storage
+and configuration do not add broader permissions.

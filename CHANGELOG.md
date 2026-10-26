@@ -15,6 +15,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   authorization headers, bearer and secret-shaped tokens, password-bearing database URLs, and
   email addresses with `[redacted]` without stopping the component. The Next.js web server keeps
   its existing runtime log format; #621 tracks equivalent structured web logs.
+
+## [0.3.25] - 2026-10-24
+
+Steward v0.3.25 contains the v0.3.24 release content plus a released-artifact acceptance fix that
+locates the single chart archive Helm writes for a digest pull and uses the same verified pull path
+in the pull-request release candidate. The v0.3.24 tag published all seven charts and all images but
+stopped at released-artifact acceptance, so no v0.3.24 GitHub release was created.
+
+This release adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
+evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
+LiteLLM, and Actions Runner Controller, and a bundle chart that installs them with Steward as one
+release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
+
+### Added
+
+- Added the optional `steward-bundle` OCI chart for installations that need one
+  Helm release for Steward, SPIRE, agent-sandbox, OpenShell, LiteLLM, and
+  optionally Actions Runner Controller. Every child chart is independently
+  switchable, creates no Namespace, uses digest-pinned images, and shares one
+  existing Secret without accepting inline secret material. The bundle keeps
+  the standalone Steward render unchanged, packages CRDs before dependent
+  objects, disables SPIRE's test-only identities, and requires the shared TLS
+  certificate to be supplied in that Secret rather than generated into it. It
+  is rendered and installed in a clean cluster by the release gates before
+  publication and after pulling the published artifact.
+- Added separately installable, release-pinned charts for SPIRE, agent-sandbox,
+  OpenShell, LiteLLM, and Actions Runner Controller. They use upstream chart
+  dependencies where available, create no Namespace, accept existing Secret
+  references instead of inline secret material, pin every rendered image by
+  digest, and document cluster-wide permissions and Pod Security needs. The
+  release publishes each chart as its own OCI artifact alongside Steward and
+  lists their immutable coordinates in the release handoff. SPIRE CRDs are
+  installed before dependent resources, agent-sandbox wraps its upstream Helm
+  chart, and the LiteLLM, SPIRE, and Actions Runner Controller wrappers refuse
+  free-form environment inputs. LiteLLM also refuses database URLs containing
+  passwords; its default workload security contexts satisfy a
+  restricted Pod Security profile. OpenShell's optional GRPCRoute requires an
+  existing Gateway and hostname; streaming timeouts remain configured on the
+  Gateway or backend because GRPCRoute has no timeout field. Existing Steward
+  chart SBOM and vulnerability asset names remain available.
 - Releases now include a `linux/amd64` Claude Code reference runtime for 2.1.222, its immutable digest,
   SBOM, vulnerability report, and provenance. The non-root image includes the same pinned read
   tools as the Codex runtime and uses the existing `claude-code-v1` execution binding. Its launcher
@@ -22,6 +62,63 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   disables updates and nonessential traffic, removes alternate Claude authentication paths, and
   exits 125 before startup when those settings are missing or changed. Operators must mirror the
   new `referenceRuntimes.claudeCode` artifact and use its digest in the binding before activation.
+
+### Security
+
+- Kept ES256 test-key generation dependencies out of shipped binaries. A production dependency
+  check now prevents `p256` and affected `crypto-bigint` 0.5 releases from entering those binaries;
+  `RUSTSEC-2026-0387` remains narrowly ignored only while test tooling requires it.
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness).
+
+### Fixed
+
+- Released-bundle acceptance now uses the single chart archive Helm writes for a digest pull,
+  instead of assuming Helm will name it with the chart version.
+- The pull-request release candidate now installs the bundle archive it retrieves from its local
+  registry by digest, using the same digest verification and archive lookup as the tag-time release.
+- Release acceptance cleanup now uses each run's kubeconfig and decides whether cleanup succeeded by
+  verifying that its owned cluster and temporary directory are absent. It now also fails when Kind
+  cannot list clusters to confirm that the owned cluster is gone.
+- Chart publication now captures Helm output from both output streams, and the pull-request release
+  candidate uses the same package, push, and digest-validation script as tag-time publication.
+- Release-candidate cleanup now disconnects its local registry before deleting the disposable Kind
+  cluster, so the pinned Kind version can remove its network without turning a successful dry-run
+  into a cleanup failure.
+- Chart publication and release artifact assembly now use the repository's pinned Helm version,
+  preventing release output from changing when a newer Helm major version becomes available.
+
+### Upgrade and rollback
+
+- No database migration is required when upgrading from v0.3.21. Deploy the chart and component
+  images as one release unit, mirror the digest-pinned Claude Code reference runtime, and update
+  `claude-code-v1` execution bindings to that digest before activating it.
+- The governed dependency charts are separate, opt-in release artifacts. Before adopting one,
+  provide its target namespaces, existing Secret references, required cluster-wide permissions,
+  and any Gateway configuration documented by that chart. The existing Steward chart keeps its
+  prior default rendering.
+- Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then
+  restore execution bindings to a reference runtime supported by that release. Remove dependency
+  charts only when the installation adopted them solely for v0.3.25, and restore its previous
+  dependency ownership. No database rollback is required.
+
+## [0.3.24] - 2026-10-24
+
+The v0.3.24 tag published all seven charts, component images, both reference runtimes, and auxiliary
+release artifacts. Released-artifact acceptance stopped before installing the published bundle, so
+no GitHub release was created. Use v0.3.25 for the complete release.
+
+## [0.3.23] - 2026-10-23
+
+The v0.3.23 tag pushed all seven charts, component images, both reference runtimes, and auxiliary
+release artifacts. Its chart jobs stopped before publishing complete chart evidence and
+provenance, so released-artifact acceptance was skipped and no GitHub release was created. Use
+v0.3.25 for the complete release.
+
+## [0.3.22] - 2026-10-23
+
+The v0.3.22 tag was only partly published. Component images, both reference runtimes, and the
+`steward` chart were published, but the governed dependency charts and `steward-bundle` were never
+pushed, and no GitHub release was created. Use v0.3.25 for the complete release.
 
 ## [0.3.21] - 2026-10-22
 
@@ -1564,7 +1661,11 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.21...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.25...HEAD
+[0.3.25]: https://github.com/apelogic-ai/steward/compare/v0.3.24...v0.3.25
+[0.3.24]: https://github.com/apelogic-ai/steward/compare/v0.3.23...v0.3.24
+[0.3.23]: https://github.com/apelogic-ai/steward/compare/v0.3.22...v0.3.23
+[0.3.22]: https://github.com/apelogic-ai/steward/compare/v0.3.21...v0.3.22
 [0.3.21]: https://github.com/apelogic-ai/steward/compare/v0.3.20...v0.3.21
 [0.3.20]: https://github.com/apelogic-ai/steward/compare/v0.3.19...v0.3.20
 [0.3.19]: https://github.com/apelogic-ai/steward/compare/v0.3.18...v0.3.19

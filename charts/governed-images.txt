@@ -1,0 +1,13 @@
+cgr.dev/chainguard/bash:latest@sha256:90041f375e30f41aa7e0390075d8a69dc61900771d52fa98d63ee5d03d866a58
+busybox:1.37.0-uclibc@sha256:31b72538c3019a20336b04c4cebcd47c36511d0b45aa76666804c2845055bbd3
+ghcr.io/actions/gha-runner-scale-set-controller:0.15.0@sha256:162dfb5bfbda9e7e49fbed67d428994c9ced55b41a37a18b75b46dab0aa98d37
+ghcr.io/berriai/litellm-database:v1.106.2@sha256:35f2cec3a14bb297e08bfab56c1fc377432bc4071aaf71978fdff043a5d91e79
+ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
+ghcr.io/nvidia/openshell/gateway:0.0.98@sha256:34677638828895420d5e3dbf4811c8fad0358dd6cb22000e57523d2551cab9c8
+ghcr.io/nvidia/openshell/supervisor:0.0.98@sha256:3ccf9a11d49e229744d113e4c1c23a5a0c4283e8ed6f3368f390f7af07421be4
+ghcr.io/spiffe/spiffe-csi-driver:0.2.7@sha256:9dfe4f0caff096164fd921aa7f15319804df2fc0325f1d90bc793ef3256ab1cd
+ghcr.io/spiffe/spire-agent:1.15.2@sha256:1d042e4040466686e0ee46f74981ff2167c86adfadca19b3835946f4d6047536
+ghcr.io/spiffe/spire-controller-manager:0.6.6@sha256:3f70cfa140a829e4ef456763e72b461b0fb491900efb89c4b34b6a10be1c2d7a
+ghcr.io/spiffe/spire-server:1.15.2@sha256:aa74ef1be86bc8e0684007d84a4d9859d294384d842c30425048d73429f3216e
+registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0@sha256:e99cac42f10cac69cab09a91e59f982c9d525b2933a5f5b7dfd52dae09340aa2
+registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0@sha256:11f199f6bec47403b03cb49c79a41f445884b213b382582a60710b8c6fdc316a

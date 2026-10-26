@@ -54,6 +54,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "ci" if rest.is_empty() => ci(),
         "quality" if rest.is_empty() => quality(),
         "workflow-lint" if rest.is_empty() => workflow_lint(),
+        "production-deps" if rest == ["--check"] => production_dependencies_check(),
         "storage" if rest == ["check"] => storage::check(&root()),
         "storage" if rest == ["audit"] => storage::audit(&root()),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
@@ -86,6 +87,7 @@ fn usage() -> String {
         "  ci",
         "  quality",
         "  workflow-lint",
+        "  production-deps --check",
         "  storage check|audit",
         "  e2e-openshell-adapter",
         "  e2e-governed-connections",
@@ -123,6 +125,8 @@ fn ci() -> TaskResult {
     require_ci_tool_versions()?;
     quality_after_tool_checks()?;
     run("bash", &["scripts/check-litellm-image-pins.sh"])?;
+    run("bash", &["scripts/test-check-litellm-image-pins.sh"])?;
+    run("bash", &["scripts/test-governed-dependency-charts.sh"])?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
     run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
@@ -169,6 +173,7 @@ fn quality_after_tool_checks() -> TaskResult {
         "cargo",
         &["test", "--manifest-path", "e2e/Cargo.toml", "--no-run"],
     )?;
+    production_dependencies_check()?;
     // Vendor SDKs are introduced in later slices, so unused wrapper declarations
     // are expected here. `layering_test` below exercises the wrapper rule itself.
     run("cargo", &["deny", "check", "-A", "unused-wrapper"])?;
@@ -182,6 +187,44 @@ fn quality_after_tool_checks() -> TaskResult {
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()
+}
+
+fn production_dependencies_check() -> TaskResult {
+    for package in [
+        "steward-apiserver-bin",
+        "steward-controller-bin",
+        "steward-mint-bin",
+        "steward-trigger-receiver",
+    ] {
+        println!("+ cargo tree --edges normal --package {package}");
+        let output = checked_command("cargo")?
+            .args(["tree", "--edges", "normal", "--package", package])
+            .current_dir(root())
+            .output()
+            .map_err(|error| {
+                format!("failed to inspect production dependencies for {package}: {error}")
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo tree failed for production package {package}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        validate_production_dependency_tree(package, &String::from_utf8_lossy(&output.stdout))?;
+    }
+    println!("production-deps --check: shipped binaries exclude test-only cryptography");
+    Ok(())
+}
+
+fn validate_production_dependency_tree(package: &str, tree: &str) -> TaskResult {
+    for forbidden in ["p256 v", "crypto-bigint v0.5."] {
+        if tree.lines().any(|line| line.contains(forbidden)) {
+            return Err(format!(
+                "production package {package} includes forbidden dependency `{forbidden}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_quality_tool_versions() -> TaskResult {
@@ -241,6 +284,7 @@ fn require_ci_tool_versions() -> TaskResult {
 }
 
 fn workflow_lint() -> TaskResult {
+    validate_workflow_tool_setup(&root().join(".github/workflows"))?;
     require_tool_version(
         "actionlint",
         &["-version"],
@@ -289,6 +333,119 @@ fn workflow_lint() -> TaskResult {
     } else {
         Err(format!("shellcheck exited with {status}"))
     }
+}
+
+fn validate_workflow_tool_setup(workflows_directory: &Path) -> TaskResult {
+    let mut workflow_paths = fs::read_dir(workflows_directory)
+        .map_err(|error| {
+            format!(
+                "failed to inspect workflow directory {}: {error}",
+                workflows_directory.display()
+            )
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("failed to inspect workflow entry: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    workflow_paths.retain(|path| {
+        matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("yml" | "yaml")
+        )
+    });
+    workflow_paths.sort();
+
+    for path in workflow_paths {
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read workflow {}: {error}", path.display()))?;
+        let workflow = serde_saphyr::from_str::<serde_json::Value>(&source)
+            .map_err(|error| format!("workflow {} is not valid YAML: {error}", path.display()))?;
+        validate_workflow_actions(&path, &workflow)?;
+    }
+    Ok(())
+}
+
+fn validate_workflow_actions(path: &Path, value: &serde_json::Value) -> TaskResult {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(action)) = object.get("uses") {
+                validate_workflow_action(path, action, object.get("with"))?;
+            }
+            for nested in object.values() {
+                validate_workflow_actions(path, nested)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                validate_workflow_actions(path, nested)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_workflow_action(
+    path: &Path,
+    action: &str,
+    inputs: Option<&serde_json::Value>,
+) -> TaskResult {
+    const SETUP_TOOLS: &str = "./.github/actions/setup-tools";
+    const PINNED_TOOLS: [&str; 10] = [
+        "actionlint",
+        "cargo-deny",
+        "cargo-zigbuild",
+        "helm",
+        "kind",
+        "kubectl",
+        "opa",
+        "oras",
+        "shellcheck",
+        "zig",
+    ];
+
+    if action == SETUP_TOOLS {
+        if let Some(serde_json::Value::Object(inputs)) = inputs {
+            for tool in PINNED_TOOLS {
+                let version_input = format!("{tool}-version");
+                if inputs.contains_key(&version_input) {
+                    return Err(format!(
+                        "workflow {} overrides the central {tool} pin; update {SETUP_TOOLS} instead",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+    if action.starts_with("./") {
+        return Ok(());
+    }
+
+    let (action_name, revision) = action.rsplit_once('@').ok_or_else(|| {
+        format!(
+            "workflow {} action `{action}` must use an exact commit SHA",
+            path.display()
+        )
+    })?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "workflow {} action `{action}` must use an exact 40-character commit SHA",
+            path.display()
+        ));
+    }
+
+    let normalized = action_name.to_ascii_lowercase();
+    let installer = normalized.contains("setup") || normalized.contains("install");
+    if installer && PINNED_TOOLS.iter().any(|tool| normalized.contains(tool)) {
+        return Err(format!(
+            "workflow {} installs a centrally pinned tool through `{action_name}`; use {SETUP_TOOLS}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn m1_contracts_check() -> TaskResult {
@@ -1166,7 +1323,8 @@ mod tests {
     use super::{
         checked_command, git_command_in_repository, journey_tags, migration_changes,
         provider_profile_bundle_directory_for_inputs, root, should_skip_directory,
-        validate_conformance_test_result,
+        validate_conformance_test_result, validate_production_dependency_tree,
+        validate_workflow_action, validate_workflow_tool_setup,
     };
     use std::collections::BTreeSet;
     use std::fs;
@@ -1177,6 +1335,69 @@ mod tests {
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn production_dependency_tree_rejects_test_only_cryptography() -> Result<(), String> {
+        validate_production_dependency_tree(
+            "steward-apiserver-bin",
+            "steward-apiserver-bin v0.3.22",
+        )?;
+
+        for (forbidden, crate_name) in [
+            ("p256 v0.13.2", "p256"),
+            ("crypto-bigint v0.5.5", "crypto-bigint"),
+        ] {
+            let tree = format!("steward-apiserver-bin v0.3.22\n└── {forbidden}");
+            let Err(error) = validate_production_dependency_tree("steward-apiserver-bin", &tree)
+            else {
+                return Err(format!(
+                    "production tree accepted forbidden dependency {forbidden}"
+                ));
+            };
+            assert!(error.contains("steward-apiserver-bin"));
+            assert!(error.contains(crate_name));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflows_install_pinned_tools_only_through_setup_tools() -> Result<(), String> {
+        validate_workflow_tool_setup(&root().join(".github/workflows"))
+    }
+
+    #[test]
+    fn workflow_tool_setup_rejects_bypasses_and_floating_actions() -> Result<(), String> {
+        let path = Path::new(".github/workflows/example.yml");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let Err(bypass) = validate_workflow_action(path, &format!("azure/setup-helm@{sha}"), None)
+        else {
+            return Err("an external Helm installer was accepted".to_owned());
+        };
+        assert!(bypass.contains("use ./.github/actions/setup-tools"));
+
+        let Err(floating) = validate_workflow_action(path, "actions/checkout@v6", None) else {
+            return Err("a floating external action was accepted".to_owned());
+        };
+        assert!(floating.contains("exact 40-character commit SHA"));
+
+        let override_inputs = serde_json::json!({"helm-version": "3.17.1"});
+        let Err(override_error) = validate_workflow_action(
+            path,
+            "./.github/actions/setup-tools",
+            Some(&override_inputs),
+        ) else {
+            return Err("a workflow-specific Helm version was accepted".to_owned());
+        };
+        assert!(override_error.contains("overrides the central helm pin"));
+
+        validate_workflow_action(
+            path,
+            "./.github/actions/setup-tools",
+            Some(&serde_json::json!({"kubernetes-tools": "true"})),
+        )?;
+        validate_workflow_action(path, &format!("oven-sh/setup-bun@{sha}"), None)
+    }
+
     fn uses_user_envelope_only_contract() -> Result<bool, String> {
         let chart = fs::read_to_string(root().join("charts/steward/Chart.yaml"))
             .map_err(|error| format!("Steward chart metadata is required: {error}"))?;
@@ -1186,7 +1407,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.21" => Ok(true),
+            "0.3.25" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -5403,7 +5624,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.21")
+            Some("0.3.25")
         );
         assert_eq!(
             manifest

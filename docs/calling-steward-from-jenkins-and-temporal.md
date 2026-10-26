@@ -1,6 +1,6 @@
 # Calling Steward from Jenkins and Temporal
 
-Status: **Current Steward v0.3.21 contract**
+Status: **Current Steward v0.3.25 contract**
 
 Jenkins pipelines and Temporal activities can start governed runs through the
 same Run API used by other service callers. They authenticate as deployment-

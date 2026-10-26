@@ -26,6 +26,7 @@ done
 helm package "${root}/charts/steward" --destination "${package_dir}" >/dev/null
 archive="$(find "${package_dir}" -maxdepth 1 -name 'steward-*.tgz' -print -quit)"
 test -n "${archive}"
-tar -tzf "${archive}" | grep -Fxq steward/LICENSE
+tar -tzf "${archive}" >"${package_dir}/archive-contents.txt"
+grep -Fxq steward/LICENSE "${package_dir}/archive-contents.txt"
 
 echo 'Steward license artifacts and metadata passed'

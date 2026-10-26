@@ -13,9 +13,9 @@ jsonwebtoken = { workspace = true, features = ["use_pem"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.21" }
-steward-logging = { path = "../../crates/steward-logging", version = "=0.3.21" }
-steward-types = { path = "../../crates/steward-types", version = "=0.3.21" }
+steward-logging = { path = "../../crates/steward-logging", version = "=0.3.25" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.25" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.25" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util"] }
