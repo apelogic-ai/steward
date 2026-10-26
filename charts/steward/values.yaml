@@ -86,6 +86,12 @@ web:
         key: ca.crt
         # Optional public certificate bundle rendered into the named ConfigMap.
         data: ""
+mint:
+  httpRoute:
+    # Mint Gateway API routing is opt-in and uses only the public token and JWKS paths.
+    enabled: false
+    hostnames: []
+    parentRefs: []
 triggerReceiver:
   # Opt in only after the receiver image, read-only database role, trust bundles,
   # and every referenced Jira webhook signing Secret are available.

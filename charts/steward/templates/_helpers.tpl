@@ -8,6 +8,13 @@
 {{- $tag := default .root.Chart.AppVersion .image.tag -}}
 {{- printf "%s:%s" $repository $tag -}}{{- with .image.digest -}}@{{ . }}{{- end -}}
 {{- end -}}
+{{- define "steward.httpRouteParentRefs" }}
+{{- range . }}
+    - name: {{ .name | quote }}
+      namespace: {{ .namespace | quote }}
+      sectionName: {{ .sectionName | quote }}
+{{- end }}
+{{- end }}
 {{- define "steward.mcpGwInternalVersion" -}}
 {{- if eq .Values.connectionsBridge.mcpGatewayAuthorityContract "steward.connections.github/v1" -}}
 0.3.2

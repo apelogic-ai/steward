@@ -212,6 +212,29 @@ networkPolicy:
   ingressNamespace: envoy-gateway-system
 ```
 
+For Mint on a separate public hostname, enable its default-off route and name
+the existing Gateway listeners explicitly:
+
+```yaml
+mint:
+  httpRoute:
+    enabled: true
+    hostnames:
+      - mint.example.com
+    parentRefs:
+      - name: shared-gateway
+        namespace: envoy-gateway-system
+        sectionName: mint-https
+```
+
+The chart then renders one `steward-mint` `HTTPRoute` to the existing
+`steward-mint` Service. It exposes only exact `/token` and
+`/.well-known/jwks.json` matches. The path set is not configurable, so the
+route cannot expose `/introspect` or a prefix. Enabling the route requires
+governed execution, at least one hostname, and at least one parent reference.
+The chart still does not create the Gateway, listener, DNS record, or public
+certificate.
+
 Gateway API `v1.4.0` or later and a controller whose selected `GatewayClass`
 reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
 currently supported, tested controller line for this chart. The chart does not

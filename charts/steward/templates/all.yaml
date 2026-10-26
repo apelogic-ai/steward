@@ -1214,11 +1214,7 @@ metadata:
   name: steward-api
 spec:
   parentRefs:
-{{- range .Values.web.httpRoute.parentRefs }}
-    - name: {{ .name | quote }}
-      namespace: {{ .namespace | quote }}
-      sectionName: {{ .sectionName | quote }}
-{{- end }}
+{{ include "steward.httpRouteParentRefs" .Values.web.httpRoute.parentRefs }}
   hostnames: [{{ .Values.web.httpRoute.hostname | quote }}]
   rules:
     - matches:
@@ -1244,11 +1240,7 @@ metadata:
   name: steward-web
 spec:
   parentRefs:
-{{- range .Values.web.httpRoute.parentRefs }}
-    - name: {{ .name | quote }}
-      namespace: {{ .namespace | quote }}
-      sectionName: {{ .sectionName | quote }}
-{{- end }}
+{{ include "steward.httpRouteParentRefs" .Values.web.httpRoute.parentRefs }}
   hostnames: [{{ .Values.web.httpRoute.hostname | quote }}]
   rules:
     - matches:
@@ -1267,6 +1259,27 @@ spec:
       backendRefs:
         - name: steward-web
           port: {{ .Values.services.webPort }}
+{{- end }}
+{{- if .Values.mint.httpRoute.enabled }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: steward-mint
+spec:
+  parentRefs:
+{{ include "steward.httpRouteParentRefs" .Values.mint.httpRoute.parentRefs }}
+  hostnames:
+{{- range .Values.mint.httpRoute.hostnames }}
+    - {{ . | quote }}
+{{- end }}
+  rules:
+    - matches:
+        - path: { type: Exact, value: "/token" }
+        - path: { type: Exact, value: "/.well-known/jwks.json" }
+      backendRefs:
+        - name: steward-mint
+          port: {{ .Values.services.mintPort }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
