@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- The Helm chart can optionally render a Mint `HTTPRoute` on explicitly configured hostnames and
+  Gateway parents. It remains disabled by default, targets the existing Mint Service, and exposes
+  only exact `/token` and `/.well-known/jwks.json` matches.
+
 ## [0.3.25] - 2026-10-24
 
 Steward v0.3.25 contains the v0.3.24 release content plus a released-artifact acceptance fix that

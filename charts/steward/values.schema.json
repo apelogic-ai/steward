@@ -7,6 +7,7 @@
     "execution",
     "inference",
     "web",
+    "mint",
     "triggerReceiver",
     "secrets",
     "databaseTls",
@@ -179,6 +180,31 @@
                   ]
                 }
               }
+            }
+          }
+        }
+      }
+    },
+    "mint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["httpRoute"],
+      "properties": {
+        "httpRoute": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "hostnames", "parentRefs"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "hostnames": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/nonempty"},
+              "uniqueItems": true
+            },
+            "parentRefs": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/httpRouteParentRef"},
+              "uniqueItems": true
             }
           }
         }
@@ -1723,6 +1749,33 @@
         "properties": {
           "networkPolicy": {
             "properties": {"githubApiCidrs": {"minItems": 1}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mint": {
+            "properties": {
+              "httpRoute": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}
+            },
+            "required": ["httpRoute"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "execution": {"properties": {"enabled": {"const": true}}},
+          "mint": {
+            "properties": {
+              "httpRoute": {
+                "properties": {
+                  "hostnames": {"minItems": 1},
+                  "parentRefs": {"minItems": 1}
+                }
+              }
+            }
           }
         }
       }
