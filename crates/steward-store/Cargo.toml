@@ -13,6 +13,7 @@ ring.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 steward-admission = { path = "../steward-admission", version = "=0.3.25" }
+steward-logging = { path = "../steward-logging", version = "=0.3.25" }
 steward-types = { path = "../steward-types", version = "=0.3.25" }
 uuid.workspace = true
 zeroize.workspace = true

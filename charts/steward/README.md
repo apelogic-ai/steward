@@ -142,6 +142,28 @@ documented component interfaces do not expose a stable Prometheus contract.
 Use the Kubernetes deployment/probe state and the platform's approved log and
 event collection until a separately versioned observability interface exists.
 
+### Component log format
+
+Released Steward 0.3.21 does not include the `logging.format` setting. In the
+Unreleased chart, `logging.format` defaults to `plain`, which leaves component
+environments and the existing text format unchanged. Set it to `json` to make
+the API server, controller, Mint, and Trigger receiver emit exactly one JSON
+object per line with stable `level`, `component`, `request_id`, and `message`
+fields. Events without a request ID use JSON `null`.
+
+Both formats replace authorization headers, bearer and secret-shaped tokens,
+password-bearing database URLs, and email addresses with `[redacted]`. A write
+or formatting failure is discarded rather than stopping the service. The
+chart rejects values other than `plain` and `json`; a directly supplied invalid
+environment value falls back to plain text with a fixed warning that does not
+repeat the rejected value.
+
+The Next.js server does not yet implement this contract, so its framework logs
+remain in the runtime's existing format even when the backend services use JSON.
+Issue #621 tracks web parity; the chart deliberately does not pass
+`STEWARD_LOG_FORMAT` to `steward-web` until it can honor the same fields and
+redaction guarantees.
+
 For a shared Gateway API platform, set `web.httpRoute.enabled=true`. The chart
 then renders two `HTTPRoute` objects and one `BackendTLSPolicy`:
 `steward-api` targets `steward-apiserver` port `https` (443, targeting the

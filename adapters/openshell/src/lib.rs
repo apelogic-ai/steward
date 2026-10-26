@@ -1277,7 +1277,12 @@ impl TaskProcessLogSink for ControllerTaskProcessLogSink {
         stream: TaskProcessStream,
         message: &[u8],
     ) {
-        eprintln!("{}", task_process_log_record(context, stream, message));
+        steward_logging::emit_with_stream(
+            steward_logging::LogLevel::Info,
+            &context.runtime_uid,
+            stream.as_str(),
+            format_args!("{}", task_process_log_record(context, stream, message)),
+        );
     }
 }
 
@@ -1300,7 +1305,7 @@ fn task_process_log_record(
 #[cfg(feature = "runtime")]
 fn escaped_task_log_value(value: &[u8]) -> String {
     fn append_valid_utf8(output: &mut String, value: &str) {
-        for character in value.chars() {
+        for character in steward_logging::redact_text(value).chars() {
             match character {
                 '\\' => output.push_str("\\\\"),
                 '"' => output.push_str("\\\""),
@@ -2975,18 +2980,18 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     self.observe_task(attempt_id, request).await
                 }
                 Ok(_) => {
-                    eprintln!(
-                        "openshell_task_launch_failed runtime_uid=\"{}\" category=launcher_unconfirmed",
-                        escaped_task_log_value(request.runtime.0.as_bytes())
+                    steward_logging::error!(
+                        request_id = request.runtime.0,
+                        "openshell_task_launch_failed category=launcher_unconfirmed"
                     );
                     Err(PortError::Failed {
                         reason: "OpenShell task launch could not be confirmed".to_owned(),
                     })
                 }
                 Err(error) => {
-                    eprintln!(
-                        "openshell_task_launch_failed runtime_uid=\"{}\" category=transport",
-                        escaped_task_log_value(request.runtime.0.as_bytes())
+                    steward_logging::error!(
+                        request_id = request.runtime.0,
+                        "openshell_task_launch_failed category=transport"
                     );
                     Err(error)
                 }
@@ -4123,9 +4128,8 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[tokio::test]
-    async fn full_task_logging_records_escaped_task_output_material() -> Result<(), String> {
-        let secret_bearing_output =
-            b"Authorization: Bearer obviously-fake-task-credential\nrequest completed";
+    async fn full_task_logging_redacts_sensitive_task_output_material() -> Result<(), String> {
+        let secret_bearing_output = b"Authorization:Bearer task-output-fixture\nrequest completed";
         let mut stream = QueuedTaskProcessEventStream {
             events: VecDeque::from([Ok(stdout_event(secret_bearing_output)), Ok(exit_event(0))]),
         };
@@ -4147,12 +4151,25 @@ mod tests {
         assert_eq!(result.stdout, secret_bearing_output);
         assert_eq!(log_sink.records.len(), 1);
         let record = &log_sink.records[0];
-        assert_eq!(
-            record,
-            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout message=\"Authorization: Bearer obviously-fake-task-credential\\nrequest completed\"",
-            "full logging must expose the escaped task-process event"
+        assert!(
+            !record.contains("task-output-fixture"),
+            "full logging must refuse sensitive task-process output: {record}"
+        );
+        assert!(
+            record.contains("[redacted]") && record.contains("request completed"),
+            "full logging must retain the redacted task-process event: {record}"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn runtime_adapter_has_no_raw_stderr_log_paths() {
+        let raw_stderr_macro = ["eprintln", "!"].concat();
+        assert!(
+            !include_str!("lib.rs").contains(&raw_stderr_macro),
+            "runtime logs must use the shared structured writer"
+        );
     }
 
     #[cfg(feature = "runtime")]

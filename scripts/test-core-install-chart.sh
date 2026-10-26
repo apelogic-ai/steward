@@ -209,6 +209,33 @@ then
   echo 'tag-only component images must not render a digest separator' >&2
   exit 1
 fi
+if grep -Fq 'STEWARD_LOG_FORMAT' "${component_rendered}"; then
+  echo 'plain logging must remain the default without changing component environments' >&2
+  exit 1
+fi
+if helm_template \
+  "${tag_only_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string logging.format=unsupported \
+  --set-string tls.webhook.caBundlePem=public-test-ca >/dev/null 2>&1
+then
+  echo 'the chart must reject an unsupported component log format' >&2
+  exit 1
+fi
+helm_template \
+  "${tag_only_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string logging.format=json \
+  --set-string tls.webhook.caBundlePem=public-test-ca > "${component_rendered}"
+if [[ "$(grep -cF 'name: STEWARD_LOG_FORMAT, value: "json"' "${component_rendered}")" != 4 ]]; then
+  echo 'JSON logging must configure every supported service component' >&2
+  exit 1
+fi
+web_deployment="$(awk '/^metadata: \{ name: steward-web \}/ { found = 1 } found { print } found && /^---$/ { exit }' "${component_rendered}")"
+if grep -Fq 'STEWARD_LOG_FORMAT' <<< "${web_deployment}"; then
+  echo 'the web server must not claim support for the component log contract' >&2
+  exit 1
+fi
 
 if helm_template \
   --set-string images.apiserver.repository=registry.example.test/platform/steward-apiserver \

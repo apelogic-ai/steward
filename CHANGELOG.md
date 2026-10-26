@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- The Helm chart can opt the API server, controller, Mint, and Trigger receiver into one JSON
+  object per log line with stable `level`, `component`, `request_id`, and `message` fields by
+  setting `logging.format=json`; plain text remains the default. Both formats replace
+  authorization headers, bearer and secret-shaped tokens, password-bearing database URLs, and
+  email addresses with `[redacted]` without stopping the component. The Next.js web server keeps
+  its existing runtime log format; #621 tracks equivalent structured web logs.
+
 ## [0.3.25] - 2026-10-24
 
 Steward v0.3.25 contains the v0.3.24 release content plus a released-artifact acceptance fix that

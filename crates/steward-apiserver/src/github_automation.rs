@@ -1614,7 +1614,7 @@ async fn resolve_admitted(
             })
             .collect::<Vec<_>>()
             .join("; ");
-        eprintln!(
+        steward_logging::error!(
             "admitted repository listing: {} of {} source repositories unresolved: {examples}",
             failures.len(),
             references.len()

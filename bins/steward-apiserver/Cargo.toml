@@ -20,6 +20,7 @@ steward-adapter-github-artifact = { path = "../../adapters/github-artifact", ver
 steward-adapter-github-source = { path = "../../adapters/github-source", version = "=0.3.25" } # Resolves exact direct-package Git objects through a read-only GitHub App.
 steward-admission = { path = "../../crates/steward-admission", version = "=0.3.25" }
 steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.25" } # Provides the single authenticated REST admission router.
+steward-logging = { path = "../../crates/steward-logging", version = "=0.3.25" } # Emits the deployment-selected process log contract without exposing credentials.
 steward-store = { path = "../../crates/steward-store", version = "=0.3.25" } # Persists immutable envelopes, decisions, approvals, and instance grants.
 steward-types = { path = "../../crates/steward-types", version = "=0.3.25" } # Parses opaque canonical user IDs for the explicit local-RBAC bootstrap command.
 tokio.workspace = true # Runs the HTTPS listener and Kubernetes/Postgres/Jira I/O.

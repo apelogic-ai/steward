@@ -34,6 +34,9 @@ execution:
 inference:
   # Runtime credential mode. Managed mode resolves each user's encrypted key in Mint.
   mode: stock
+logging:
+  # Plain text remains the compatibility default. JSON emits one structured object per line.
+  format: plain
 serviceAccounts:
   # The chart creates these fixed service accounts. Annotations support
   # platform workload identity (for example, EKS IRSA) without exposing any

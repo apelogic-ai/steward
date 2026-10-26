@@ -642,7 +642,7 @@ impl GitHubSourceAdapter {
             Err(error) if error.is_timeout() => "timed out".to_owned(),
             Err(_) => "request failed".to_owned(),
         };
-        eprintln!("github source: metadata token revocation failed: {failure}");
+        steward_logging::warn!("github source: metadata token revocation failed: {failure}");
     }
 
     async fn describe_repository(
@@ -1501,6 +1501,15 @@ mod tests {
     const ROOT_TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const CATALOG_TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const BLOB: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+    #[test]
+    fn adapter_has_no_raw_stderr_log_paths() {
+        let raw_stderr_macro = ["eprintln", "!"].concat();
+        assert!(
+            !include_str!("lib.rs").contains(&raw_stderr_macro),
+            "adapter logs must use the shared structured writer"
+        );
+    }
 
     fn git_command(repository: &Path) -> Command {
         let mut command = Command::new("git");

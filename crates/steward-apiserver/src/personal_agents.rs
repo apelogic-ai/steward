@@ -901,7 +901,9 @@ pub(crate) async fn run_dispatcher(
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    eprintln!("personal agent claim failed and was rolled back: {error}");
+                    steward_logging::error!(
+                        "personal agent claim failed and was rolled back: {error}"
+                    );
                     break;
                 }
             }
@@ -933,11 +935,13 @@ fn report_completed_turn(
         }
         Some(Ok((task_id, Err(error)))) => {
             active_turns.remove(&task_id);
-            eprintln!("personal agent turn will be retried after storage failure: {error}");
+            steward_logging::error!(
+                "personal agent turn will be retried after storage failure: {error}"
+            );
         }
         Some(Err(error)) => {
             active_turns.remove(&error.id());
-            eprintln!("personal agent turn worker stopped unexpectedly: {error}");
+            steward_logging::error!("personal agent turn worker stopped unexpectedly: {error}");
         }
         None => {}
     }
@@ -1071,7 +1075,7 @@ async fn run_turn(
             }
             Err(error) => {
                 if keep_monitoring_after_status_error(error) {
-                    eprintln!(
+                    steward_logging::error!(
                         "personal agent Task status could not be read; turn_id={}: transient error",
                         dispatch.turn.id
                     );

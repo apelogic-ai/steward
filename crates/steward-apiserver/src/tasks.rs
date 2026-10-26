@@ -442,7 +442,7 @@ impl Default for TaskApiConfig {
             orchestration_mode: TaskOrchestrationMode::Staged,
             direct_git_resolver: None,
             source_repository_bindings: BTreeSet::new(),
-            failure_reporter: Arc::new(|line| eprintln!("{line}")),
+            failure_reporter: Arc::new(|line| steward_logging::error!("{line}")),
             inference_mode: InferenceMode::Stock,
             managed_inference_cipher: None,
             workspace_policy: WorkspaceDeploymentPolicy::default(),
@@ -1224,7 +1224,7 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
                             )
                             .await
                         {
-                            eprintln!(
+                            steward_logging::error!(
                                 "best-effort v2 federated-subject seeding failed: category={}",
                                 v2_seed_failure_category(&error)
                             );

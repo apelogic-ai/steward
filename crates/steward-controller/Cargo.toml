@@ -13,6 +13,7 @@ kube = { workspace = true, features = ["admission", "client", "ring", "runtime",
 serde_json.workspace = true
 sha2.workspace = true
 steward-admission = { path = "../steward-admission", version = "=0.3.25" }
+steward-logging = { path = "../steward-logging", version = "=0.3.25" }
 steward-ports = { path = "../steward-ports", version = "=0.3.25" }
 steward-store = { path = "../steward-store", version = "=0.3.25" }
 steward-types = { path = "../steward-types", version = "=0.3.25" }

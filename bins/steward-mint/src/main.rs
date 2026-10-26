@@ -6,6 +6,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -312,7 +313,18 @@ impl ControlPlaneWorkloadAuthenticator for KubernetesControlPlaneWorkloadAuthent
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    steward_logging::init("steward-mint");
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            steward_logging::error!("Error: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     rustls_crypto_provider::install()?;
     let client = Client::try_default().await?;
     let identity = OpenShellIdentityResolver::discover(

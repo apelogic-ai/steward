@@ -531,6 +531,9 @@ spec:
             tcpSocket: { port: https }
 {{ toYaml .Values.probes.apiserver.liveness | nindent 12 }}
           env:
+{{- if eq .Values.logging.format "json" }}
+            - { name: STEWARD_LOG_FORMAT, value: {{ .Values.logging.format | quote }} }
+{{- end }}
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
             - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
 {{- if eq .Values.inference.mode "managed" }}
@@ -756,6 +759,9 @@ spec:
             tcpSocket: { port: webhook }
 {{ toYaml .Values.probes.controller.liveness | nindent 12 }}
           env:
+{{- if eq .Values.logging.format "json" }}
+            - { name: STEWARD_LOG_FORMAT, value: {{ .Values.logging.format | quote }} }
+{{- end }}
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
             - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
@@ -900,6 +906,9 @@ spec:
             tcpSocket: { port: http }
 {{ toYaml .Values.probes.triggerReceiver.liveness | nindent 12 }}
           env:
+{{- if eq .Values.logging.format "json" }}
+            - { name: STEWARD_LOG_FORMAT, value: {{ .Values.logging.format | quote }} }
+{{- end }}
             - { name: STEWARD_TRIGGER_BIND, value: {{ printf "0.0.0.0:%v" .Values.services.triggerReceiverPort | quote }} }
             - { name: STEWARD_TRIGGER_CONFIG_FILE, value: /run/trigger-config/config.json }
             - { name: STEWARD_CAPABILITY_CATALOG_FILE, value: /run/capability-catalog/capability-catalog.json }
@@ -1031,6 +1040,9 @@ spec:
 {{ toYaml .Values.probes.mint.liveness | nindent 12 }}
           env:
             - { name: SPIFFE_ENDPOINT_SOCKET, value: {{ printf "unix://%s/spire-agent.sock" .Values.spire.socketPath | quote }} }
+{{- if eq .Values.logging.format "json" }}
+            - { name: STEWARD_LOG_FORMAT, value: {{ .Values.logging.format | quote }} }
+{{- end }}
             - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
 {{- if eq .Values.inference.mode "managed" }}
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.managedInferenceDatabase.name }}, key: {{ .Values.secrets.managedInferenceDatabase.key }} } } }

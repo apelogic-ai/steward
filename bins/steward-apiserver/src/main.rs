@@ -89,6 +89,7 @@ impl Error for OperatorCommandError {}
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    steward_logging::init("steward-apiserver");
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let operator_command = arguments.first().is_some_and(|command| {
         matches!(
@@ -99,7 +100,7 @@ async fn main() -> ExitCode {
     match run(arguments).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            steward_logging::error!("{error}");
             ExitCode::from(if operator_command {
                 operator_exit_code(error.as_ref())
             } else {
@@ -137,7 +138,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         env::var_os("STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON").is_some()
             || env::var_os("STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE").is_some(),
     ) {
-        eprintln!("{warning}");
+        steward_logging::warn!("{warning}");
     }
     let client = kube::Client::try_default().await?;
     let task_orchestration_mode = task_orchestration_mode()?;
@@ -1017,7 +1018,7 @@ async fn browser_application_router(
         .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?
         .is_none()
     {
-        eprintln!(
+        steward_logging::warn!(
             "warning: onboarding sample Workflow is unavailable because no configured execution binding advertises its immutable agent"
         );
     }
@@ -2178,7 +2179,7 @@ fn completed_handshake(result: JoinedHandshake) -> Option<TlsConnection> {
     match result {
         Some(Ok(connection)) => connection,
         Some(Err(error)) => {
-            eprintln!("apiserver TLS handshake task failed: {error}");
+            steward_logging::error!("apiserver TLS handshake task failed: {error}");
             None
         }
         None => None,
@@ -2206,18 +2207,18 @@ impl Listener for TlsListener {
                             match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                                 Ok(Ok(stream)) => Some((stream, address)),
                                 Ok(Err(error)) => {
-                                    eprintln!("apiserver TLS handshake failed: {error}");
+                                    steward_logging::error!("apiserver TLS handshake failed: {error}");
                                     None
                                 }
                                 Err(_) => {
-                                    eprintln!("apiserver TLS handshake timed out");
+                                    steward_logging::error!("apiserver TLS handshake timed out");
                                     None
                                 }
                             }
                         });
                     }
                     Err(error) => {
-                        eprintln!("apiserver listener accept failed: {error}");
+                        steward_logging::error!("apiserver listener accept failed: {error}");
                         sleep(Duration::from_secs(1)).await;
                     }
                 },

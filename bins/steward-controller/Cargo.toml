@@ -14,6 +14,7 @@ steward-adapter-github-artifact = { path = "../../adapters/github-artifact", ver
 steward-adapter-jira = { path = "../../adapters/jira", version = "=0.3.25" } # Delivers durable Task approval outbox rows through the decision-channel port.
 steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.25", features = ["runtime"] }
 steward-controller = { path = "../../crates/steward-controller", version = "=0.3.25" }
+steward-logging = { path = "../../crates/steward-logging", version = "=0.3.25" } # Emits the deployment-selected process log contract without exposing credentials.
 steward-ports = { path = "../../crates/steward-ports", version = "=0.3.25" } # Selects the deployment inference plane without leaking adapter types into core.
 steward-store = { path = "../../crates/steward-store", version = "=0.3.25" } # Shares the migrated authority ledger with reconciliation and admission.
 steward-types = { path = "../../crates/steward-types", version = "=0.3.25" } # Parses the stock or managed deployment inference mode.

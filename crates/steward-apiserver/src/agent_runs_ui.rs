@@ -1013,7 +1013,7 @@ where
         if readable {
             Some(record)
         } else {
-            eprintln!(
+            steward_logging::error!(
                 "skipping unreadable browser Task run {} while resolving Task detail",
                 record.task_uid
             );
@@ -1304,7 +1304,7 @@ where
     }
     for record in executed {
         let Some(item) = executed_task_list_item(&record) else {
-            eprintln!(
+            steward_logging::error!(
                 "skipping unreadable browser Task run {} while listing Task library",
                 record.task_uid
             );
