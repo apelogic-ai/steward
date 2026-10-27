@@ -7,11 +7,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.26] - 2026-10-26
+
+Steward v0.3.26 adds an optional Mint `HTTPRoute` to the Steward chart so installations can publish
+Mint's token and JWKS endpoints through an existing Gateway without managing a separate route.
+
 ### Added
 
 - The Helm chart can optionally render a Mint `HTTPRoute` on explicitly configured hostnames and
   Gateway parents. It remains disabled by default, targets the existing Mint Service, and exposes
   only exact `/token` and `/.well-known/jwks.json` matches.
+
+### Upgrade and rollback
+
+- No database migration is required when upgrading from v0.3.25. Deploy the chart and component
+  images as one release unit. Existing chart values keep their prior rendering.
+- Enabling `mint.httpRoute` requires governed execution, at least one hostname, and at least one
+  parent reference. The chart does not create the Gateway, listener, DNS record, or public
+  certificate.
+- Before rolling back to v0.3.25, remove the `mint.httpRoute` values before installing the older
+  chart, and restore any Mint routing the installation managed outside the chart. No database
+  rollback is required.
 
 ## [0.3.25] - 2026-10-24
 
@@ -1658,7 +1674,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.25...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.26...HEAD
+[0.3.26]: https://github.com/apelogic-ai/steward/compare/v0.3.25...v0.3.26
 [0.3.25]: https://github.com/apelogic-ai/steward/compare/v0.3.24...v0.3.25
 [0.3.24]: https://github.com/apelogic-ai/steward/compare/v0.3.23...v0.3.24
 [0.3.23]: https://github.com/apelogic-ai/steward/compare/v0.3.22...v0.3.23
