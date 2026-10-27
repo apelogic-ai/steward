@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.25"
+          test "$version" = "0.3.26"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -969,20 +969,16 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.25 contains the v0.3.24 release content plus a release fix that locates the chart archive produced by a digest pull and uses the same verified pull path in the pull-request release candidate. The v0.3.24 tag published all seven charts and all images but stopped at released-artifact acceptance, so no v0.3.24 GitHub release was created.\n\n'
-            printf 'The release adds a hardened linux/amd64 Claude Code reference runtime for 2.1.222. It publishes the runtime immutable digest, SBOM, vulnerability report, and provenance alongside the existing Codex reference runtime.\n\n'
-            printf 'The Claude Code launcher accepts only the deployment-provided Anthropic-compatible LiteLLM URL and OpenShell placeholder, disables updates and nonessential traffic, removes alternate authentication paths, and refuses startup when those settings are missing or changed.\n\n'
-            printf 'The release also publishes separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell, LiteLLM, and Actions Runner Controller. They retain their upstream values, require existing Secret references instead of inline secret material, create no Namespace, and pin every rendered image by digest.\n\n'
-            printf 'Security maintenance updates Tokio to 1.53.3 for RUSTSEC-2026-0386.\n\n'
+            printf 'Steward v0.3.26 adds an optional Mint HTTPRoute to the Steward chart. When an operator enables it with explicit hostnames and Gateway parent references, the chart routes only the exact /token and /.well-known/jwks.json paths to the existing Mint Service. The route is disabled by default, and existing chart values keep their prior rendering.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'No database migration is required when upgrading from v0.3.21. Deploy the chart and component images as one release unit, mirror the digest-pinned Claude Code reference runtime, and update claude-code-v1 execution bindings to that digest before activating it.\n\n'
-            printf 'The governed dependency charts are separate, opt-in release artifacts. Before adopting one, provide its target namespaces, existing Secret references, required cluster-wide permissions, and any Gateway configuration documented by that chart. The existing Steward chart keeps its prior default rendering.\n\n'
-            printf 'Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then restore execution bindings to a reference runtime supported by that release. Remove dependency charts only when the installation adopted them solely for v0.3.25, and restore its previous dependency ownership. No database rollback is required.\n\n'
+            printf 'No database migration is required when upgrading from v0.3.25. Deploy the chart and component images as one release unit.\n\n'
+            printf 'The Mint HTTPRoute is opt-in. Enabling it requires governed execution, at least one hostname, and at least one parent reference. The chart does not create the Gateway, listener, DNS record, or public certificate.\n\n'
+            printf 'Before rolling back to v0.3.25, remove the mint.httpRoute values before installing the older chart, and restore any Mint routing the installation managed outside the chart. No database rollback is required.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
             printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
-            printf 'Mirror referenceRuntimes.claudeCode by digest before enabling the claude-code-v1 execution binding. Mirror every adopted chart by its release-handoff digest, and provide its documented namespaces, existing Secret references, permissions, and Gateway settings before installation.\n\n'
+            printf 'No action is required for existing installations. To route Mint through the chart, provide the Gateway listener, DNS record, and public certificate, then set mint.httpRoute.enabled, mint.httpRoute.hostnames, and mint.httpRoute.parentRefs.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1062,7 +1058,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.25.json
+          subject-path: dist/steward-product-compatibility-0.3.26.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1072,7 +1068,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.25.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.26.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

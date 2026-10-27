@@ -2,7 +2,7 @@
   "name": "steward-web",
   "license": "MIT",
   "private": true,
-  "version": "0.3.25",
+  "version": "0.3.26",
   "packageManager": "bun@1.2.21",
   "engines": {
     "bun": "1.2.21",
