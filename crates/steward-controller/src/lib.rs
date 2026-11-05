@@ -7554,35 +7554,37 @@ mod tests {
     }
 
     #[test]
-    fn task_diagnostics_come_from_persisted_evidence_and_never_provider_control()
+    fn ordinary_agent_tasks_always_capture_diagnostics_and_provider_control_never_does()
     -> Result<(), String> {
-        let evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
+        let mut evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
         ))
         .map_err(|error| format!("parse direct evidence fixture: {error}"))?;
+        evidence.diagnostics.execution_log = ExecutionLogMode::Off;
         assert_eq!(
             sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence), None)
                 .execution_log,
-            ExecutionLogMode::Full
+            ExecutionLogMode::Full,
+            "an explicit compatibility off value must not hide agent output"
         );
         assert_eq!(
             sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, None).execution_log,
-            ExecutionLogMode::Off,
-            "legacy Tasks must not opt into caller-visible transcripts"
+            ExecutionLogMode::Full,
+            "legacy workflow Tasks must retain agent output"
         );
         let browser_evidence: BrowserTaskEvidence = serde_json::from_value(serde_json::json!({
             "source": "inline",
             "revision": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "path": "task-definition.json",
             "closureDigest": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "diagnostics": { "executionLog": "full" }
+            "diagnostics": { "executionLog": "off" }
         }))
         .map_err(|error| format!("parse browser evidence fixture: {error}"))?;
         assert_eq!(
             sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, Some(&browser_evidence),)
                 .execution_log,
             ExecutionLogMode::Full,
-            "browser Tasks must honor their persisted diagnostics snapshot"
+            "browser Tasks must retain agent output"
         );
         assert_eq!(
             sandbox_task_diagnostics(

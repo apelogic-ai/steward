@@ -14197,6 +14197,66 @@ mod tests {
         Ok((status, content_type, body.to_vec()))
     }
 
+    #[tokio::test]
+    async fn runner_log_route_is_submitter_scoped_and_incremental() -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let task_uid = submit_package_path_task(
+            &app,
+            "runner-incremental-log",
+            Some(serde_json::json!({ "executionLog": "off" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            task_uid,
+            &stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]),
+            Some(strict_transcript(b"agent stdout\n", b"agent stderr\n")),
+        )?;
+
+        let request = |assertion: &str, stream: &str, after: usize| {
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/tasks/{task_uid}/logs/{stream}?after={after}"))
+                .header("authorization", format!("Bearer {assertion}"))
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .map_err(|error| format!("build runner log request: {error}"))
+        };
+
+        let response = app
+            .clone()
+            .oneshot(request("github-assertion", "stdout", 6)?)
+            .await
+            .map_err(|error| format!("request runner stdout: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read runner stdout: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode runner stdout: {error}"))?;
+        assert_eq!(body["stream"], "stdout");
+        assert_eq!(body["content"], "stdout\n");
+        assert_eq!(body["sizeBytes"], 13);
+        assert_eq!(body["complete"], true);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["truncated"], false);
+
+        let hidden = app
+            .clone()
+            .oneshot(request("github-bob-assertion", "stderr", 0)?)
+            .await
+            .map_err(|error| format!("request another caller's stderr: {error}"))?;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let invalid = app
+            .oneshot(request("github-assertion", "combined", 0)?)
+            .await
+            .map_err(|error| format!("request invalid runner stream: {error}"))?;
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
     fn stored_output_archive(entries: &[(&str, &[u8], u8)]) -> Vec<u8> {
         use steward_types::task_output_archive::{
             TarEntryKind, append_tar_entry, finish_tar_archive,

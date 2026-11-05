@@ -4083,6 +4083,12 @@ mod tests {
         assert_eq!(view.stages[0].display_name, "Pre-run checks");
         assert_eq!(view.stages[2].id, BrowserRunStageId::AgentExecution);
         assert_eq!(view.stages[2].state, BrowserRunStageState::Running);
+        assert_eq!(
+            view.stages[2].steps[0].log_streams,
+            vec!["stdout", "stderr"],
+            "Agent Runs must expose both streams for legacy workflow Tasks"
+        );
+        assert_eq!(view.execution_log, ExecutionLogMode::Full);
         Ok(())
     }
 
