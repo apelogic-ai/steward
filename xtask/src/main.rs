@@ -59,6 +59,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "storage" if rest == ["audit"] => storage::audit(&root()),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "e2e-governed-connections" if rest.is_empty() => e2e_governed_connections(),
+        "e2e-hosted-litellm-aliases" if rest.is_empty() => e2e_hosted_litellm_aliases(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "browser-e2e" if rest.is_empty() => browser_e2e(false),
         "browser-e2e" if rest == ["--browser-ready"] => browser_e2e(true),
@@ -91,6 +92,7 @@ fn usage() -> String {
         "  storage check|audit",
         "  e2e-openshell-adapter",
         "  e2e-governed-connections",
+        "  e2e-hosted-litellm-aliases",
         "  e2e-postgres-tls",
         "  browser-e2e [--browser-ready]",
         "  journeys --tags <expression>",
@@ -131,7 +133,8 @@ fn ci() -> TaskResult {
     run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
-    conformance(&["--pinned".to_owned()])
+    conformance(&["--pinned".to_owned()])?;
+    e2e_hosted_litellm_aliases()
 }
 
 fn quality() -> TaskResult {
@@ -609,6 +612,10 @@ fn e2e_openshell_adapter() -> TaskResult {
 
 fn e2e_governed_connections() -> TaskResult {
     run("bash", &["scripts/governed-connections-e2e.sh"])
+}
+
+fn e2e_hosted_litellm_aliases() -> TaskResult {
+    run("bash", &["scripts/hosted-litellm-alias-e2e.sh"])
 }
 
 fn e2e_postgres_tls() -> TaskResult {
@@ -3536,6 +3543,44 @@ mod tests {
             "cargo xtask quality must compile every e2e target without running it"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn real_hosted_litellm_alias_e2e_is_part_of_the_shared_ci_gate() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let xtask_source = fs::read_to_string(root().join("xtask/src/main.rs"))
+            .map_err(|error| format!("xtask source is required: {error}"))?;
+        let harness = fs::read_to_string(root().join("scripts/hosted-litellm-alias-e2e.sh"))
+            .map_err(|error| format!("hosted LiteLLM alias harness is required: {error}"))?;
+
+        assert!(
+            xtask_source.contains(
+                "conformance(&[\"--pinned\".to_owned()])?;\n    e2e_hosted_litellm_aliases()"
+            ),
+            "cargo xtask ci must run the real hosted LiteLLM alias integration"
+        );
+        let pinned = ci
+            .split_once("  conformance-pinned:\n")
+            .and_then(|(_before, after)| after.split_once("\n  openshell-adapter:"))
+            .map(|(job, _after)| job)
+            .ok_or_else(|| "pinned conformance job could not be isolated".to_owned())?;
+        assert!(
+            pinned.contains("run: cargo xtask e2e-hosted-litellm-aliases"),
+            "the pinned LiteLLM CI lane must run the real hosted-alias integration"
+        );
+        for required in [
+            "ghcr.io/berriai/litellm-database:v1.93.0@sha256:72360d8bd5602faa49be5098a8ac3dd069d9fb74503d6bd014242d96dc753e43",
+            "steward.test/run-id",
+            "disable_spend_logs: false",
+            "--test hosted_litellm_aliases",
+        ] {
+            assert!(
+                harness.contains(required),
+                "hosted LiteLLM alias harness is missing {required}"
+            );
+        }
         Ok(())
     }
 

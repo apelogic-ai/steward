@@ -3683,6 +3683,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-adapter-litellm"
+version = "0.3.27"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "steward-ports",
+ "steward-types",
+]
+
+[[package]]
 name = "steward-adapter-mcp-gw"
 version = "0.3.27"
 dependencies = [
@@ -3772,11 +3784,13 @@ dependencies = [
  "kube",
  "p256",
  "rand_core 0.6.4",
+ "reqwest 0.12.28",
  "serde_json",
  "sha2",
  "sqlx",
  "steward-adapter-claude-code",
  "steward-adapter-codex",
+ "steward-adapter-litellm",
  "steward-adapter-openshell",
  "steward-admission",
  "steward-apiserver",
