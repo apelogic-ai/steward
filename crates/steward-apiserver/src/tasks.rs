@@ -8835,7 +8835,7 @@ mod workflow_request_tests {
                 "--prompt".to_owned(),
                 request.workflow_prompt.to_owned(),
                 "--model".to_owned(),
-                format!("{}/{}", request.model.provider, request.model.model),
+                request.model.model.clone(),
                 "--executable".to_owned(),
                 request.binding.executable.clone(),
                 "--expected-version".to_owned(),
@@ -9241,8 +9241,8 @@ mod workflow_request_tests {
         );
         assert_eq!(
             plan.command.get(4).map(String::as_str),
-            Some("openai/gpt-5.4"),
-            "the approved provider and model must be passed as an opaque shell argument"
+            Some("gpt-5.4"),
+            "the approved model alias must be passed as an opaque shell argument"
         );
         assert_eq!(
             plan.command.last().map(String::as_str),
@@ -9281,10 +9281,7 @@ mod workflow_request_tests {
             &task_config(Some("https://mcp-gw.example.test/mcp"))?,
         )
         .map_err(|error| format!("configured model unknown to Steward was rejected: {error:?}"))?;
-        assert_eq!(
-            plan.command.get(4).map(String::as_str),
-            Some("example/model-x")
-        );
+        assert_eq!(plan.command.get(4).map(String::as_str), Some("model-x"));
 
         let mut incompatible_catalog =
             serde_json::from_str::<serde_json::Value>(&execution_catalog(&workflow().agent, 'a')?)

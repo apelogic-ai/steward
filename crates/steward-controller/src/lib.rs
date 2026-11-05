@@ -10314,9 +10314,7 @@ mod webhook_tests {
         ) -> WebhookFuture<'a, Result<(), steward_ports::PortError>> {
             Box::pin(async {
                 Err(steward_ports::PortError::Rejected {
-                    reason:
-                        "models are absent from the priced inference catalog: provider-a/model-a"
-                            .to_owned(),
+                    reason: "These models are not available: model-a.".to_owned(),
                 })
             })
         }
@@ -11727,7 +11725,7 @@ mod webhook_tests {
         );
         assert_eq!(
             response.result.message,
-            "AgentRuntime inference configuration validation failed closed: models are absent from the priced inference catalog: provider-a/model-a"
+            "AgentRuntime inference configuration validation failed closed: These models are not available: model-a."
         );
         Ok(())
     }

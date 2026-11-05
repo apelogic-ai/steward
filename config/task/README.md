@@ -87,6 +87,10 @@ config:
           available: true
 ```
 
+Each `model` is the exact model ID or alias sent to the configured inference gateway. The
+`provider` is a separate catalog and coding-agent compatibility identity; Steward does not prepend
+it to `model`.
+
 Template-free requests always require administrator approval. Requests above a template's limits
 also require approval and must include a justification. Steward checks the reviewed request's
 model, tool, and workspace capabilities when it is created and checks them again immediately
