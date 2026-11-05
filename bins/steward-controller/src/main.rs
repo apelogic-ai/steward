@@ -62,6 +62,13 @@ impl InferencePlane for DeploymentInferencePlane {
         }
     }
 
+    fn usage_report_timeout(&self) -> Duration {
+        match self {
+            Self::Stock(plane) => plane.usage_report_timeout(),
+            Self::Managed(plane) => plane.usage_report_timeout(),
+        }
+    }
+
     async fn validate_configuration(
         &self,
         models: &[steward_types::ModelRef],
@@ -826,8 +833,7 @@ mod tests {
 
     use super::{
         DeploymentInferencePlane, GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE,
-        TlsListener,
-        bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
+        TlsListener, bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
         connections_bridge_startup_log, decode_tls_material, openshell_task_log_mode,
         parse_inference_mode, parse_litellm_spend_log_timeout, parse_runtime_controller_config,
         rustls_crypto_provider, verify_bridge_image_provenance,
