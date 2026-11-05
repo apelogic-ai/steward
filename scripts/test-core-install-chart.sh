@@ -11,6 +11,8 @@ mint_route_disabled_rendered="$(mktemp)"
 mint_route_enabled_rendered="$(mktemp)"
 compatibility_directory="$(mktemp -d)"
 inline_config_directory="$(mktemp -d)"
+reused_values_chart="$(mktemp -d)"
+reused_values_rendered="$(mktemp)"
 missing_namespace_error="$(mktemp)"
 receiver_startup_config="$(mktemp)"
 receiver_startup_output="$(mktemp)"
@@ -33,9 +35,10 @@ cleanup() {
     "${http_route_timeout_rendered}" "${mint_route_default_rendered}" \
     "${mint_route_disabled_rendered}" "${mint_route_enabled_rendered}" \
     "${missing_namespace_error}" "${receiver_startup_config}" "${receiver_startup_output}" \
-    "${receiver_stub_port}" "${receiver_stub_kubeconfig}"
+    "${receiver_stub_port}" "${receiver_stub_kubeconfig}" "${reused_values_rendered}"
   find "${compatibility_directory}" -depth -delete
   find "${inline_config_directory}" -depth -delete
+  find "${reused_values_chart}" -depth -delete
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -1051,5 +1054,41 @@ helm_template "${governed_inputs[@]}" \
   --set-string config.mint.openshellNamespace=customer-openshell > "${rendered}"
 grep -qF 'kind: ClusterSPIFFEID' "${rendered}"
 grep -qF 'name: steward-mint' "${rendered}"
+if ! awk '
+  $1 == "litellmSpendLogTimeoutSeconds:" { found = ($2 == 10) }
+  END { exit !found }
+' "${root}/charts/steward/values.yaml"; then
+  echo 'the chart LiteLLM spend-log timeout must default to 10 seconds' >&2
+  exit 1
+fi
+cp -R "${root}/charts/steward/." "${reused_values_chart}/"
+awk '$1 != "litellmSpendLogTimeoutSeconds:"' \
+  "${root}/charts/steward/values.yaml" > "${reused_values_chart}/values.yaml"
+if ! helm template steward "${reused_values_chart}" --namespace steward \
+  "${customer_images[@]}" "${governed_inputs[@]}" \
+  --set-string config.mint.issuer=https://mint.example.test \
+  --set-string config.mint.spiffeTrustDomain=customer.example.test \
+  --set-string config.mint.openshellNamespace=customer-openshell > "${reused_values_rendered}"; then
+  echo 'the chart must render when reused upgrade values omit the LiteLLM spend-log timeout' >&2
+  exit 1
+fi
+if grep -qF 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${reused_values_rendered}"; then
+  echo 'a missing LiteLLM spend-log timeout must use the controller default' >&2
+  exit 1
+fi
+if grep -qF 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}"; then
+  echo 'the default LiteLLM spend-log timeout must preserve the existing controller render' >&2
+  exit 1
+fi
+helm_template "${governed_inputs[@]}" \
+  --set-string config.mint.issuer=https://mint.example.test \
+  --set-string config.mint.spiffeTrustDomain=customer.example.test \
+  --set-string config.mint.openshellNamespace=customer-openshell \
+  --set config.controller.litellmSpendLogTimeoutSeconds=17 > "${rendered}"
+if ! grep -A1 -F 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}" |
+  grep -qF 'value: "17"'; then
+  echo 'the controller must receive the configured LiteLLM spend-log timeout' >&2
+  exit 1
+fi
 
 echo 'core-only chart dependency boundary passed'

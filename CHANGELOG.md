@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Agent Runs now derives run spend and optional total tokens from LiteLLM request logs, including
+  hosted deployments whose virtual-key spend counter is stale. The LiteLLM management credential
+  must be allowed to read request logs for runtime key hashes. If that read is refused, budget
+  enforcement continues but Agent Runs shows spend and tokens as `Not reported` instead of showing
+  the key counter as run spend. Migration 0076 adds these fields without rewriting historical
+  rows; earlier key-counter observations also display as `Not reported` because they cannot be
+  proven to be per-run request usage. Request-log reads default to a 10-second deadline; operators
+  can change it with `config.controller.litellmSpendLogTimeoutSeconds`.
+
 ### Fixed
 
 - Governed Codex and Claude Code runs now send LiteLLM the exact model ID or alias configured in

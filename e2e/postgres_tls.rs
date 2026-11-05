@@ -396,12 +396,12 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     );
     assert_api_origin_upgrade_result(&store).await?;
     let historical_before_caller_reference = historical_task_identity_snapshot(&store).await?;
-    migration_set(None)
+    migration_set(Some(75))
         .run(store.pool())
         .await
         .map_err(|error| {
             io::Error::other(format!(
-                "Steward caller-reference migration must complete over the required TLS session: {error}"
+                "Steward pre-agent-run-usage migrations must complete over the required TLS session: {error}"
             ))
         })?;
     assert_eq!(
@@ -409,6 +409,16 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         historical_before_caller_reference,
         "migration 0073 must not update historical Tasks, runs, or canonical identities"
     );
+    let historical_spend_runtime = seed_agent_run_usage_upgrade_fixture(&store).await?;
+    migration_set(None)
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward agent-run usage migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    assert_agent_run_usage_upgrade_result(&store, &historical_spend_runtime).await?;
     assert_task_caller_reference_upgrade_result(&store, historical_task_count).await?;
     verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
@@ -811,6 +821,47 @@ async fn assert_api_origin_upgrade_result(store: &PgStore) -> Result<(), Box<dyn
     assert!(
         mutation.is_err(),
         "migration 0072 must not let historical rows bypass origin immutability"
+    );
+    Ok(())
+}
+
+async fn seed_agent_run_usage_upgrade_fixture(store: &PgStore) -> Result<String, Box<dyn Error>> {
+    let runtime_uid = "historical-runtime-usage".to_owned();
+    sqlx::query(
+        "INSERT INTO spend_observations \
+         (runtime_uid, observed_amount, currency, exhausted) \
+         VALUES ($1, 7.25, 'USD', false)",
+    )
+    .bind(&runtime_uid)
+    .execute(store.pool())
+    .await?;
+    Ok(runtime_uid)
+}
+
+async fn assert_agent_run_usage_upgrade_result(
+    store: &PgStore,
+    runtime_uid: &str,
+) -> Result<(), Box<dyn Error>> {
+    let historical = sqlx::query_as::<_, (String, bool, Option<String>, Option<i64>)>(
+        "SELECT observed_amount::text, usage_reported, reported_amount::text, total_tokens \
+         FROM spend_observations WHERE runtime_uid = $1",
+    )
+    .bind(runtime_uid)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        historical,
+        ("7.25".to_owned(), false, None, None),
+        "migration 0076 must retain the enforcement counter without relabelling it as request usage"
+    );
+    let mutation =
+        sqlx::query("UPDATE spend_observations SET usage_reported = true WHERE runtime_uid = $1")
+            .bind(runtime_uid)
+            .execute(store.pool())
+            .await;
+    assert!(
+        mutation.is_err(),
+        "migration 0076 must leave historical spend observations append-only"
     );
     Ok(())
 }

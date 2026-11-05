@@ -2854,6 +2854,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             observed_amount: spend.observed_amount,
             currency: spend.currency,
             exhausted: spend.exhausted || spending_limit_reached,
+            total_tokens: spend.total_tokens,
         }),
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
@@ -3704,6 +3705,7 @@ mod tests {
                 currency: "USD".to_owned(),
                 exhausted: false,
                 observed_at: "2026-08-17T00:00:00.000000Z".to_owned(),
+                total_tokens: Some(250),
             }),
             history_partial: false,
             direct_task_evidence: None,

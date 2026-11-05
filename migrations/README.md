@@ -226,3 +226,10 @@ and already provisioned Envelopes remain immutable and are not rewritten. If a
 one-boundary binary creates a threshold-free default-template revision, disable
 default-template seeding before rolling back to v0.3.15 because that binary
 requires an equal threshold on the configured revision.
+
+Migration 0076 adds request-log availability and optional total-token usage to
+append-only spend observations. Existing observations remain readable but are
+not labelled as reported request usage and have no token total; the migration
+does not update historical rows. A new observation may retain a virtual-key
+counter for budget enforcement while marking usage as unreported, so Agent Runs
+never presents that counter as request spend.

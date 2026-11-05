@@ -113,6 +113,7 @@ export type AgentRunSpendView = {
     currency: string;
     exhausted: boolean;
     observedAmount: string;
+    totalTokens?: number | null;
 };
 
 export type AgentRunTimelineEventView = {

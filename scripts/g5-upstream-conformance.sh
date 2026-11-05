@@ -184,6 +184,25 @@ for attempt in {1..20}; do
   sleep 1
 done
 
+budget_key_hash="$(
+  jq -er '.keys | select(length == 1) | .[0].token | select(type == "string" and length > 0)' \
+    <<<"${key_list}"
+)"
+spend_logs="$(
+  curl -fsS -G \
+    -H "Authorization: Bearer ${master_key}" \
+    --data-urlencode "api_key=${budget_key_hash}" \
+    "${base_url}/spend/logs"
+)"
+if ! jq -e --arg key_hash "${budget_key_hash}" '
+  (if type == "array" then . elif (.data | type) == "array" then .data else error("missing request logs") end)
+  | map(select(.api_key == $key_hash))
+  | length > 0 and all(.[]; (.spend | tonumber) >= 0 and (.total_tokens | tonumber) >= 0)
+' <<<"${spend_logs}" >/dev/null; then
+  echo "G-5 LiteLLM did not return complete request logs for the runtime key hash" >&2
+  exit 1
+fi
+
 budget_response="${RUN_DIR}/budget-denied.json"
 budget_status="$(
   curl -sS \

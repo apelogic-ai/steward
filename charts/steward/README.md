@@ -730,9 +730,6 @@ Steward release namespace also creates `steward-workflows`.
             available: true
   ```
 
-  Each `model` is the exact model ID or alias sent to the configured inference gateway. The
-  separate `provider` selects compatible coding-agent bindings and is not prepended to `model`.
-
   Tool access classes, optional provider `displayName`, and provider catalog availability are
   display metadata. Each distinct available provider under `catalogs` gets one connection-status
   read through the gateway's version-2 provider route; failures are isolated to that provider.
