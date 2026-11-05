@@ -309,9 +309,7 @@ mod tests {
         assert!(shell.contains("exit \"$status\""));
         assert!(shell.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"));
         assert_eq!(plan.command[4], "Review the repository state.");
-        // LiteLLM grants the runtime key the provider-qualified model group.
-        // Claude must request that same exact group, not its bare model name.
-        assert_eq!(plan.command[5], "anthropic/claude-sonnet-example");
+        assert_eq!(plan.command[5], "claude-sonnet-example");
         assert_eq!(plan.command[6], "http://inference.example.test:4000");
         assert_eq!(plan.command[8], "/sandbox/steward-claude");
         assert_eq!(plan.command[9], binding.executable);
@@ -509,6 +507,29 @@ mod tests {
         assert!(plan.command.iter().all(|argument| !argument.is_empty()));
         assert!(!plan.command[7].contains("mcpServers"));
         assert!(!plan.command[2].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_an_explicitly_qualified_model_alias_exact() -> Result<(), String> {
+        let adapter =
+            ClaudeCodeTaskExecutionAdapter::new("https://inference.example.test".to_owned())
+                .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        let plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &ModelRef {
+                    provider: "anthropic".to_owned(),
+                    model: "anthropic/legacy-alias".to_owned(),
+                },
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render adapter plan: {error:?}"))?;
+
+        assert_eq!(plan.command[5], "anthropic/legacy-alias");
         Ok(())
     }
 

@@ -567,6 +567,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn priced_hosted_alias_is_found_without_deriving_a_provider_prefix() {
+        let requested = vec![ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "hosted-alias".to_owned(),
+        }];
+        let catalog = json!({
+            "data": [{
+                "model_name": "hosted-alias",
+                "model_info": {
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000002
+                },
+                "unknown_hosted_field": {"ignored": true}
+            }]
+        });
+
+        assert!(
+            unpriced_models(&catalog, &requested).is_empty(),
+            "the configured model alias must be compared exactly while unknown response fields are ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_hosted_alias_is_rejected_with_a_plain_named_error() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"data":[{"model_name":"other-alias","model_info":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002},"unknown_hosted_field":true}]}"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("configure hosted fake adapter: {error:?}"))?;
+        let models = [ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "unknown-alias".to_owned(),
+        }];
+        let budget = Budget {
+            monthly_limit: "1.00".to_owned(),
+            single_run_limit: None,
+            currency: "USD".to_owned(),
+        };
+
+        assert_eq!(
+            adapter.validate_configuration(&models, &budget).await,
+            Err(PortError::Rejected {
+                reason: "These models are not available: unknown-alias.".to_owned(),
+            })
+        );
+        let requests = server.finish()?;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("authorization: Bearer fixture-management-value"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn non_usd_budget_fails_configuration_validation() -> Result<(), String> {
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
