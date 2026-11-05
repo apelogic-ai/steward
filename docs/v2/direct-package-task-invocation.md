@@ -96,8 +96,9 @@ The fields have these meanings:
 - optional `envelope` is a temporary compatibility selector for an exact approved
   digest; omit it in new product configuration so Steward resolves the authenticated
   user's unique active provisioned Envelope.
-- `diagnostics.executionLog` is optional. Missing means `off`; `full` requests the
-  successful-run transcript described below.
+- `diagnostics.executionLog` is optional compatibility data. Its value does not disable bounded
+  stdout and stderr retention; `full` also requests reserved diagnostic files in the legacy output
+  archive.
 
 The GHA workflow supplies per-run inputs separately through the existing Task input
 archive flow. Runtime input is not portable package content and is not part of the
@@ -214,26 +215,23 @@ MCP-GW enforcement.
 
 ## P0 execution transcript
 
-For the initial demo, `diagnostics.executionLog: full` requests a successful-run
-transcript. The coding-agent process's original stdout and stderr are captured as
-separate, durable server-owned streams. After successful execution, `steward-run`
-downloads them as `.steward/diagnostics/stdout.log` and `stderr.log` inside the
-authenticated output archive and replays them verbatim into clearly labelled GitHub
-Actions log groups. Steward 0.3.11 and 0.3.12 omitted these entries, which failed every
-`execution-log: full` run after its Task succeeded; Steward 0.3.13 restores them.
+Every ordinary Agent Task captures the coding-agent process's original stdout and stderr as
+separate, bounded server-owned streams after the process starts. The authenticated submitter can
+read those streams while the Task runs and after success or failure. For compatibility,
+`diagnostics.executionLog: full` also places `.steward/diagnostics/stdout.log` and `stderr.log`
+inside the authenticated output archive after successful execution.
 
 Before replay, `steward-run` emits the documented sensitive-output warning. The
 transcript may reproduce prompts, repository data, model output, and MCP results. It
 must never include injected credentials, bearer tokens, private keys, or provider
 authorization material. Provider-control executions remain structurally excluded.
 
-Missing diagnostics or `executionLog: off` captures no caller-visible transcript, including
-when execution fails. A failed Task can still return validated partial `out/` files; with no
-partial output it returns `204 No Content`. The diagnostic selection is snapshotted with the
-Task.
+Missing diagnostics or `executionLog: off` does not suppress the authenticated Task or Agent Runs
+stream endpoints. A failed Task can still return validated partial `out/` files; with no partial
+output or requested archive diagnostics it returns `204 No Content`. The compatibility diagnostic
+selection remains snapshotted with the Task.
 
-Beginning with Steward 0.3.16, for a started OpenShell Agent attempt with full
-diagnostics, Steward retains bounded live stdout and stderr snapshots while the
+For every started OpenShell Agent attempt, Steward retains bounded live stdout and stderr snapshots while the
 process runs and exposes them to the Task owner and administrators through the Run
 execution-log routes. Successful and failed attempts persist their final streams; a
 cancelled or outcome-unknown Task without a saved final transcript returns the last

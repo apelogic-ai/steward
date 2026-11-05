@@ -91,7 +91,7 @@ Actions and sights that are the same on every screen.
 
 | Pattern | Parameters | Meaning | Files | Uses | Used in |
 |---|---|---|---|---|---|
-| `{actor} start(s) a Hello world run with the Envelope from the template {string}` | who; template placeholder | Short for J2 steps 6 and 7: Runs, Run now, that Envelope, "Inline package", the Hello world prompt, "Capture execution log" ticked, Run now. | 3 | 4 | J2, J3, J10 |
+| `{actor} start(s) a Hello world run with the Envelope from the template {string}` | who; template placeholder | Short for J2 steps 6 and 7: Runs, Run now, that Envelope, "Inline package", the Hello world prompt, Run now. | 3 | 4 | J2, J3, J10 |
 | `the run ends as {string} within {int} min` | status word; minutes | Waits for the run that was just started. | 9 | 17 | J2, J3, J4, J5, J6, J7, J8, J10, J11 |
 | `the run output contains {string}` | text | The output shown on the Run page contains the text. | 4 | 4 | J2, J4, J5, J11 |
 | `the spend of the run is above 0.00 USD` | none | "Spend" on the Run page. | 3 | 3 | J2, J7, J9 |

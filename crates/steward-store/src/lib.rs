@@ -5198,6 +5198,34 @@ impl PgStore {
         owner_user_id: Option<&str>,
         stream: AgentRunLogStream,
     ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
+        self.scoped_task_execution_log(task_uid, owner_user_id, None, stream)
+            .await
+    }
+
+    /// Return one bounded execution stream only to the Task's exact submitter and owner.
+    pub async fn task_execution_log_for_submitter(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        owner_user_id: &str,
+        stream: AgentRunLogStream,
+    ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
+        self.scoped_task_execution_log(
+            task_uid,
+            Some(owner_user_id),
+            Some(submitter_service),
+            stream,
+        )
+        .await
+    }
+
+    async fn scoped_task_execution_log(
+        &self,
+        task_uid: Uuid,
+        owner_user_id: Option<&str>,
+        submitter_service: Option<&str>,
+        stream: AgentRunLogStream,
+    ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
         let mut statement = QueryBuilder::<Postgres>::new("SELECT ");
         statement.push(match stream {
             AgentRunLogStream::Stdout => {
@@ -5229,6 +5257,18 @@ impl PgStore {
             statement.push(" AND tasks.owner_user_id = ");
             statement.push_bind(owner_user_id);
         }
+        if let Some(submitter_service) = submitter_service {
+            statement.push(" AND tasks.submitter_service = ");
+            statement.push_bind(submitter_service);
+        }
+        statement.push(match stream {
+            AgentRunLogStream::Stdout => {
+                " AND COALESCE(attempts.execution_stdout, attempts.live_execution_stdout) IS NOT NULL"
+            }
+            AgentRunLogStream::Stderr => {
+                " AND COALESCE(attempts.execution_stderr, attempts.live_execution_stderr) IS NOT NULL"
+            }
+        });
         statement
             .build()
             .fetch_optional(&self.pool)

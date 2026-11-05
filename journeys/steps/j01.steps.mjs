@@ -928,7 +928,7 @@ When("I state a per-run budget of zero", async ({ journey, page }) => {
 
 Given("the installation keeps execution logs", async ({ page }) => {
   await page.goto("/runs/new");
-  await expect(checkboxLocator(page, "Capture execution log")).toBeEnabled();
+  await expect(page.getByText("Sensitive output warning", { exact: true })).toBeVisible();
 });
 
 Then("the log holds every line printed before the run ended", async ({ journey, page }) => {

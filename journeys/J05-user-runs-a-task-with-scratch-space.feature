@@ -27,7 +27,7 @@ Feature: J5 - User runs a Task with scratch space
     And I press "Save version 1"
     And I press "Run"
     And I choose "standard" in "Envelope"
-    And I tick "Capture execution log"
+    And I see "Sensitive output warning"
     And I press "Run now"
     Then I do not see "The run request was rejected."
     # The Task gets the whole fixed volume.

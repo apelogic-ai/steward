@@ -276,6 +276,14 @@ web_route="$(awk '
 ' "${http_route_timeout_rendered}")"
 grep -Fq 'request: "90s"' <<<"${api_route}"
 grep -Fq 'backendRequest: "85s"' <<<"${api_route}"
+grep -Fq 'path: { type: PathPrefix, value: "/app/api" }' <<<"${api_route}" || {
+  echo 'the shipped chart must route the Agent Runs log API to the apiserver' >&2
+  exit 1
+}
+grep -Fq 'path: { type: PathPrefix, value: "/v1" }' <<<"${api_route}" || {
+  echo 'the shipped chart must route task-authenticated logs to the apiserver' >&2
+  exit 1
+}
 grep -Fq 'request: "30s"' <<<"${web_route}"
 grep -Fq 'backendRequest: "25s"' <<<"${web_route}"
 

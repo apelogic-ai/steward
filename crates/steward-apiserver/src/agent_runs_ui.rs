@@ -830,7 +830,7 @@ pub(crate) struct BrowserRunEventSnapshot {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BrowserExecutionLogQuery {
-    after: Option<usize>,
+    pub(crate) after: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -2538,7 +2538,7 @@ where
     }
 }
 
-fn execution_log_body(
+pub(crate) fn execution_log_body(
     stream: &str,
     log: AgentRunExecutionLog,
     after: usize,
@@ -2748,17 +2748,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                 })
         })
         .flatten();
-    let execution_log = record
-        .direct_task_evidence
-        .as_ref()
-        .map(|evidence| evidence.diagnostics.execution_log)
-        .or_else(|| {
-            record
-                .browser_task_evidence
-                .as_ref()
-                .map(|evidence| evidence.diagnostics.execution_log)
-        })
-        .unwrap_or(ExecutionLogMode::Off);
+    let execution_log = ExecutionLogMode::Full;
     let stages = browser_run_stages(
         phase,
         record.runtime_uid.is_some(),
@@ -4083,6 +4073,12 @@ mod tests {
         assert_eq!(view.stages[0].display_name, "Pre-run checks");
         assert_eq!(view.stages[2].id, BrowserRunStageId::AgentExecution);
         assert_eq!(view.stages[2].state, BrowserRunStageState::Running);
+        assert_eq!(
+            view.stages[2].steps[0].log_streams,
+            vec!["stdout", "stderr"],
+            "Agent Runs must expose both streams for legacy workflow Tasks"
+        );
+        assert_eq!(view.execution_log, ExecutionLogMode::Full);
         Ok(())
     }
 
