@@ -680,15 +680,21 @@ preserve the same immutable coordinates and cross-component relationships.
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
-   `config.controller.litellmUrl` is the LiteLLM management API base URL. The
-   controller appends `/key/delete`, `/key/list`, `/key/generate`, and
-   `/v1/model/info`; do not add an operation path to that value.
+   `config.controller.litellmUrl` is the LiteLLM management API base URL. In
+   Steward 0.3.27, the controller appends `/key/delete`, `/key/list`,
+   `/key/generate`, and `/v1/model/info`; do not add an operation path to that
+   value. Beginning with the next release, it also appends `/spend/logs`. The
+   LiteLLM management credential must be allowed to read request logs for
+   runtime key hashes. If LiteLLM refuses that read, budget enforcement
+   continues but Agent Runs shows spend and tokens as `Not reported`.
 
    Every model admitted by the capability catalog must have pricing configured
-   in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,
-   including its provider prefix (for example `openai/model-name`). In this
-   contract, “provider-qualified” means that exact catalog string and routing
-   alias; Steward does not strip, add, or remap the prefix.
+   in LiteLLM. In Steward 0.3.27, LiteLLM `model_name` must equal the exact
+   provider-qualified catalog model string (for example `openai/model-name`).
+   Beginning with the next release, `model_name` must instead equal the exact
+   capability-catalog `model`, which may be a deployment-defined alias with no
+   provider prefix. Steward sends that alias unchanged; the separate catalog
+   `provider` selects compatible execution bindings.
 
    Governed dependencies remain platform-owned. Set resource requests and
    limits for the OpenShell gateway, sandbox workloads, SPIRE components, and
