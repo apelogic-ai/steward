@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.27] - 2026-11-05
+
+Steward v0.3.27 retains agent output for every governed run, adds a task-authenticated API for
+reading each output stream, and refreshes release dependencies and both governed reference
+runtimes to remove known security vulnerabilities.
+
 ### Changed
 
 - Every governed agent run now retains bounded stdout and stderr and exposes them while the run is
@@ -18,9 +24,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Security
 
+- Updated `pulldown-cmark` to 0.13.6 to resolve RUSTSEC-2026-0414 and RUSTSEC-2026-0433.
 - The Codex and Claude Code reference runtimes now replace the sandbox base's inherited `uv` with
   checksum-verified `uv` 0.11.15, the first release that removes the vulnerable Rust `zip` 8.1.0
-  dependency.
+  dependency and resolves CVE-2026-115905.
+
+### Upgrade and rollback
+
+- No database or configuration migration is required when upgrading from v0.3.26. Existing
+  `diagnostics.executionLog` values remain accepted, but `off` no longer disables bounded stream
+  retention. Deploy the chart, component images, and reference runtimes as one release unit, then
+  update mirrored runtime digests and execution bindings to the v0.3.27 artifacts.
+- Rolling back to v0.3.26 removes the task log endpoint and always-on stream retention and restores
+  the earlier dependency and reference-runtime images, including the vulnerabilities corrected in
+  v0.3.27. Previously retained output remains in existing task data; no database rollback is
+  required.
 
 ## [0.3.26] - 2026-10-26
 
@@ -1689,7 +1707,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.26...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.27...HEAD
+[0.3.27]: https://github.com/apelogic-ai/steward/compare/v0.3.26...v0.3.27
 [0.3.26]: https://github.com/apelogic-ai/steward/compare/v0.3.25...v0.3.26
 [0.3.25]: https://github.com/apelogic-ai/steward/compare/v0.3.24...v0.3.25
 [0.3.24]: https://github.com/apelogic-ai/steward/compare/v0.3.23...v0.3.24
