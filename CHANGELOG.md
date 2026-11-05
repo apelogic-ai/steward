@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Security
+
+- The Codex and Claude Code reference runtimes now replace the sandbox base's inherited `uv` with
+  checksum-verified `uv` 0.11.15, the first release that removes the vulnerable Rust `zip` 8.1.0
+  dependency.
+
 ## [0.3.26] - 2026-10-26
 
 Steward v0.3.26 adds an optional Mint `HTTPRoute` to the Steward chart so installations can publish
