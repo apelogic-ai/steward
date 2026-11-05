@@ -8527,6 +8527,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum FinalSpendObservationBehavior {
+        CompleteAfter(StdDuration),
         Fail,
         Pending,
     }
@@ -8570,6 +8571,17 @@ mod tests {
             _request: &InferenceRequest,
         ) -> Result<InferenceObservation, PortError> {
             match self.behavior {
+                FinalSpendObservationBehavior::CompleteAfter(delay) => {
+                    tokio::time::sleep(delay).await;
+                    Ok(InferenceObservation::Active {
+                        reference: "runtime-key".to_owned(),
+                        spend: steward_types::SpendSummary {
+                            observed_amount: "0.25".to_owned(),
+                            currency: "USD".to_owned(),
+                        },
+                        usage: None,
+                    })
+                }
                 FinalSpendObservationBehavior::Fail => Err(PortError::Failed {
                     reason: "fixture final spend observation failure".to_owned(),
                 }),
@@ -8581,6 +8593,53 @@ mod tests {
             self.revocations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_usage_report_timeout_is_not_cut_short_by_final_capture()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: Some("key-a".to_owned()),
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        let request = super::inference_request(&runtime)
+            .map_err(|error| format!("fixture inference request must be valid: {error}"))?;
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
+        let configured_timeout = StdDuration::from_secs(17);
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let inference = FinalSpendObservationInference {
+            behavior: FinalSpendObservationBehavior::CompleteAfter(configured_timeout),
+            revocations,
+        };
+        let started_at = tokio::time::Instant::now();
+
+        super::finalize_inference_if_required(
+            &runtime,
+            &inference,
+            &request,
+            Some(&authority),
+            super::FinalSpendCapture::AfterSettlement,
+        )
+        .await
+        .map_err(|error| format!("configured usage report must remain best effort: {error}"))?;
+
+        assert_eq!(
+            started_at.elapsed(),
+            super::FINAL_SPEND_SETTLEMENT_DELAY + configured_timeout,
+            "final capture must allow the configured usage-report deadline after settlement"
+        );
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
