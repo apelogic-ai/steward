@@ -2010,6 +2010,52 @@ mod tests {
     }
 
     #[test]
+    fn reference_runtimes_pin_fixed_uv_release() -> Result<(), String> {
+        let runtimes = [
+            (
+                "Codex",
+                "build/codex-reference.Dockerfile",
+                "docs/installation/codex-reference-runtime.md",
+            ),
+            (
+                "Claude Code",
+                "build/claude-code-reference.Dockerfile",
+                "docs/installation/claude-code-reference-runtime.md",
+            ),
+        ];
+
+        for (name, container_path, documentation_path) in runtimes {
+            let container = fs::read_to_string(root().join(container_path))
+                .map_err(|error| format!("{name} reference runtime build is required: {error}"))?;
+            let documentation = fs::read_to_string(root().join(documentation_path)).map_err(
+                |error| format!("{name} reference runtime documentation is required: {error}"),
+            )?;
+
+            for required in [
+                "UV_VERSION=0.11.15",
+                "UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7",
+                "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz",
+                "sha256sum --check --strict",
+                "/usr/local/bin/uv",
+                "/usr/local/bin/uvx",
+                "test \"$(uv --version)\" = \"uv ${UV_VERSION}\"",
+                "test \"$(uvx --version)\" = \"uvx ${UV_VERSION}\"",
+            ] {
+                assert!(
+                    container.contains(required),
+                    "{name} reference runtime must install and verify {required}"
+                );
+            }
+            assert!(
+                documentation.contains("| `uv` | 0.11.15 |"),
+                "{name} reference runtime documentation must list the pinned uv release"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn claude_code_reference_runtime_is_fail_closed_and_released() -> Result<(), String> {
         let container = fs::read_to_string(root().join("build/claude-code-reference.Dockerfile"))
             .map_err(|error| {
