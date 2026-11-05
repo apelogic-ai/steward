@@ -1,6 +1,7 @@
 //! LiteLLM implementation of Steward's inference enforcement plane.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use steward_ports::{
 use steward_types::{Budget, ModelRef, SpendSummary};
 
 pub const IMPLEMENTED_PORTS: [&str; 1] = ["InferencePlane"];
+const SPEND_LOG_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct LiteLlmConfig {
     pub base_url: String,
@@ -103,11 +105,18 @@ impl LiteLlmAdapter {
             .get(format!("{}/spend/logs", self.base_url))
             .bearer_auth(&self.master_key)
             .query(&[("api_key", key_hash)])
+            .timeout(SPEND_LOG_TIMEOUT)
             .send()
-            .await
-            .map_err(|_| PortError::Failed {
-                reason: "inference usage report was unavailable".to_owned(),
-            })?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => return Ok(None),
+            Err(_) => {
+                return Err(PortError::Failed {
+                    reason: "inference usage report was unavailable".to_owned(),
+                });
+            }
+        };
         if matches!(
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
@@ -123,7 +132,7 @@ impl LiteLlmAdapter {
         if truncated {
             return Ok(None);
         }
-        reported_usage(&body)
+        reported_usage(&body, key_hash)
     }
 }
 
@@ -465,7 +474,7 @@ fn key_hash_from_key_list(response: &Value) -> Result<KeyHash, PortError> {
         .map_or(KeyHash::Unavailable, KeyHash::Available))
 }
 
-fn reported_usage(response: &Value) -> Result<Option<ReportedUsage>, PortError> {
+fn reported_usage(response: &Value, key_hash: &str) -> Result<Option<ReportedUsage>, PortError> {
     let logs = response
         .as_array()
         .or_else(|| response.get("data").and_then(Value::as_array))
@@ -484,6 +493,13 @@ fn reported_usage(response: &Value) -> Result<Option<ReportedUsage>, PortError> 
         if incomplete_total || multiple_pages {
             return Ok(None);
         }
+    }
+    let logs = logs
+        .iter()
+        .filter(|log| log.get("api_key").and_then(Value::as_str) == Some(key_hash))
+        .collect::<Vec<_>>();
+    if logs.is_empty() {
+        return Ok(None);
     }
     let mut spend = "0".to_owned();
     let mut total_tokens = Some(0_i64);
@@ -512,12 +528,74 @@ fn reported_usage(response: &Value) -> Result<Option<ReportedUsage>, PortError> 
 
 fn value_decimal(value: &Value) -> Option<String> {
     match value {
-        Value::String(value) => decimal_parts(value).map(|_| value.clone()),
+        Value::String(value) => normalize_decimal(value),
         Value::Number(value) => {
             let value = value.to_string();
-            decimal_parts(&value).is_some().then_some(value)
+            normalize_decimal(&value)
         }
         _ => None,
+    }
+}
+
+fn normalize_decimal(value: &str) -> Option<String> {
+    let exponent_separator = value.find(['e', 'E']);
+    let (mantissa, exponent) = if let Some(separator) = exponent_separator {
+        let (mantissa, exponent) = value.split_at(separator);
+        if exponent[1..].contains(['e', 'E']) {
+            return None;
+        }
+        (mantissa, exponent[1..].parse::<i64>().ok()?)
+    } else {
+        (value, 0)
+    };
+    let (integer, fractional) = decimal_parts(mantissa)?;
+    let digits = format!("{integer}{fractional}");
+    let decimal_position = i128::try_from(integer.len())
+        .ok()?
+        .checked_add(i128::from(exponent))?;
+    let digit_count = i128::try_from(digits.len()).ok()?;
+    let mut expanded = String::new();
+    if decimal_position <= 0 {
+        expanded.try_reserve(2).ok()?;
+        expanded.push_str("0.");
+        push_zeros(
+            &mut expanded,
+            usize::try_from(decimal_position.checked_neg()?).ok()?,
+        )?;
+        expanded.try_reserve(digits.len()).ok()?;
+        expanded.push_str(&digits);
+    } else if decimal_position >= digit_count {
+        expanded.try_reserve(digits.len()).ok()?;
+        expanded.push_str(&digits);
+        push_zeros(
+            &mut expanded,
+            usize::try_from(decimal_position.checked_sub(digit_count)?).ok()?,
+        )?;
+    } else {
+        let decimal_position = usize::try_from(decimal_position).ok()?;
+        expanded.try_reserve(digits.len().checked_add(1)?).ok()?;
+        expanded.push_str(&digits[..decimal_position]);
+        expanded.push('.');
+        expanded.push_str(&digits[decimal_position..]);
+    }
+    canonical_decimal(&expanded)
+}
+
+fn push_zeros(value: &mut String, count: usize) -> Option<()> {
+    value.try_reserve(count).ok()?;
+    value.extend(std::iter::repeat_n('0', count));
+    Some(())
+}
+
+fn canonical_decimal(value: &str) -> Option<String> {
+    let (integer, fractional) = decimal_parts(value)?;
+    let integer = integer.trim_start_matches('0');
+    let fractional = fractional.trim_end_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    if fractional.is_empty() {
+        Some(integer.to_owned())
+    } else {
+        Some(format!("{integer}.{fractional}"))
     }
 }
 
@@ -699,9 +777,7 @@ mod tests {
             Self::start_with_response_delays(
                 responses
                     .into_iter()
-                    .map(|(status, body, headers)| {
-                        (status, body, headers, Duration::from_secs(0))
-                    })
+                    .map(|(status, body, headers)| (status, body, headers, Duration::from_secs(0)))
                     .collect(),
                 request_timeout,
             )
@@ -970,8 +1046,8 @@ mod tests {
         })
         .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
 
-        let observed = tokio::time::timeout(Duration::from_millis(2_100), adapter.observe(&request()))
-            .await;
+        let observed =
+            tokio::time::timeout(Duration::from_millis(2_100), adapter.observe(&request())).await;
         let server_result = server.finish();
         let observation = observed
             .map_err(|_| "slow usage reporting delayed budget enforcement".to_owned())?
