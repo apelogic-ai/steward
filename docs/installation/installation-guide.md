@@ -685,10 +685,15 @@ preserve the same immutable coordinates and cross-component relationships.
    `/v1/model/info`; do not add an operation path to that value.
 
    Every model admitted by the capability catalog must have pricing configured
-   in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,
-   including its provider prefix (for example `openai/model-name`). In this
-   contract, “provider-qualified” means that exact catalog string and routing
-   alias; Steward does not strip, add, or remap the prefix.
+   in LiteLLM. LiteLLM `model_name` must equal the capability catalog's exact
+   `model` value. Steward passes that value unchanged and never adds the separate
+   `provider` value. A provider-qualified alias remains supported when the full
+   qualified alias is configured in `model`.
+
+   Before upgrading an installation that relied on Steward to add the provider
+   prefix, add the bare capability-catalog `model` value as a LiteLLM alias.
+   Retain the prior provider-qualified alias until every older Steward process
+   and active run has finished, so both versions resolve during the rollout.
 
    Governed dependencies remain platform-owned. Set resource requests and
    limits for the OpenShell gateway, sandbox workloads, SPIRE components, and

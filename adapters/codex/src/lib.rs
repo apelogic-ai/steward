@@ -65,7 +65,7 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 reason: "tool-bearing Codex execution requires a governed tool endpoint".to_owned(),
             });
         }
-        let model = format!("{}/{}", request.model.provider, request.model.model);
+        let model = request.model.model.clone();
         let mut adapter_config = format!(
             concat!(
                 "model_provider = \"litellm\"\n",

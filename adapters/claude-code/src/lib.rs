@@ -114,7 +114,7 @@ impl ClaudeCodeTaskExecutionAdapter {
             shell_command,
             "steward-workflow".to_owned(),
             request.workflow_prompt.to_owned(),
-            format!("{}/{}", request.model.provider, request.model.model),
+            request.model.model.clone(),
             self.inference_endpoint.clone(),
             mcp_config,
             config_dir.to_owned(),

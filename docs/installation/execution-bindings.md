@@ -90,10 +90,10 @@ also supply `/bin/sh`, `id`, `mkdir`, `ln`, `tee`, and `cat`, declare a non-root
 remain non-root when OpenShell starts the Task. Claude Code refuses `bypassPermissions` as root, so
 the adapter checks the effective UID and fails closed before its version probe or inference call.
 Image conformance must exercise that non-root entrypoint; a root-only image is not compatible with
-`claude-code-v1`. The adapter passes the admitted provider-qualified model group to match the
-runtime-scoped inference key; it does not select or remap a model. The binding decides which
-providers are compatible. The deployment configures the Anthropic-compatible API base URL independently from
-Codex's OpenAI-compatible Responses endpoint.
+`claude-code-v1`. The adapter passes the admitted `model` value exactly as the inference-gateway
+model ID or alias; it does not add the `provider`, select another model, or remap the value. The
+binding uses `provider` only to decide compatibility. The deployment configures the
+Anthropic-compatible API base URL independently from Codex's OpenAI-compatible Responses endpoint.
 
 Before launch, the adapter removes inherited Claude cloud-provider selectors and alternate
 authentication or custom-header variables, then supplies only the governed Anthropic-compatible
@@ -108,13 +108,15 @@ needed only for a new adapter or binding schema.
 
 ## Adding a model
 
-Add the exact `<provider>/<model>` name and pricing to the inference proxy, add the same model to
-the Steward capability catalog, and make it available through the relevant Envelope Template.
-No Steward release is required. The model is selectable for an agent when its provider appears in
-that execution binding's `models.providers`. Adding another model under an already-listed provider
-requires no binding change; adding a provider requires a reviewed binding update and a new derived
-binding digest. A Task is rejected before reservation when the selected agent does not advertise
-the selected model provider.
+Add the exact inference-gateway model ID or alias and pricing to the inference proxy, put that same
+exact value in the Steward capability catalog's `model` field, and make it available through the
+relevant Envelope Template. If the alias is provider-qualified, include that full qualified value
+in `model`; Steward never adds the catalog's separate `provider` value. No Steward release is
+required. The model is selectable for an agent when its provider appears in that execution
+binding's `models.providers`. Adding another model under an already-listed provider requires no
+binding change; adding a provider requires a reviewed binding update and a new derived binding
+digest. A Task is rejected before reservation when the selected agent does not advertise the
+selected model provider.
 
 ## OpenShell provider profiles
 

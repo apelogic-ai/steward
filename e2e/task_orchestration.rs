@@ -206,7 +206,7 @@ impl TaskExecutionAdapter for PublishedWorkflowExecutionAdapter {
             command: vec![
                 "example-agent".to_owned(),
                 request.workflow_prompt.to_owned(),
-                format!("{}/{}", request.model.provider, request.model.model),
+                request.model.model.clone(),
             ],
         })
     }

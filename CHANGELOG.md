@@ -13,6 +13,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   checksum-verified `uv` 0.11.15, the first release that removes the vulnerable Rust `zip` 8.1.0
   dependency.
 
+### Fixed
+
+- Governed Codex and Claude Code runs now send LiteLLM the exact model ID or alias configured in
+  the capability catalog instead of adding the separate provider value. LiteLLM pricing checks and
+  runtime-key model restrictions use that same exact alias, so customer-hosted LiteLLM aliases work
+  for both launchers. Explicitly provider-qualified aliases remain unchanged.
+
+### Upgrade and rollback
+
+- Before upgrading an installation that relied on Steward to add the provider prefix, add each
+  capability-catalog `model` value as an exact LiteLLM alias with pricing. Keep the existing
+  provider-qualified alias through the rollout so older and newer Steward processes can both
+  resolve the model. No database migration is required. Keep both aliases until rollback is no
+  longer needed and every run started by the older version has finished.
+
 ## [0.3.26] - 2026-10-26
 
 Steward v0.3.26 adds an optional Mint `HTTPRoute` to the Steward chart so installations can publish
