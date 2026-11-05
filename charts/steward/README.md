@@ -906,6 +906,9 @@ Steward release namespace also creates `steward-workflows`.
   accepts `12` through `60`. It controls how often a running inference-backed
   runtime refreshes observed spend; Steward refuses values shorter than the
   initial final-spend delay or longer than the controller's requeue ceiling.
+- `config.controller.litellmSpendLogTimeoutSeconds` defaults to `10` and
+  controls how long each request-log report may take. A timeout leaves Agent
+  Runs usage as **Not reported** without delaying key-counter budget enforcement.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

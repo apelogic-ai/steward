@@ -608,6 +608,7 @@ preserve the same immutable coordinates and cross-component relationships.
        workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
        workloadExchangeServerName: identity.example.test
        litellmUrl: http://litellm.litellm.svc:4000
+       litellmSpendLogTimeoutSeconds: 10
      mint:
        issuer: https://mint.example.test
        audience: steward-mcp
@@ -687,6 +688,8 @@ preserve the same immutable coordinates and cross-component relationships.
    for the runtime key hash returned by `/key/list`. If LiteLLM refuses that
    read, Steward continues to enforce the key budget but Agent Runs shows spend
    and tokens as `Not reported`; it never substitutes the key budget counter.
+   `config.controller.litellmSpendLogTimeoutSeconds` controls the request-log
+   read deadline and defaults to 10 seconds.
 
    Every model admitted by the capability catalog must have pricing configured
    in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,

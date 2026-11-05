@@ -14,7 +14,7 @@ use steward_ports::{
 use steward_types::{Budget, ModelRef, SpendSummary};
 
 pub const IMPLEMENTED_PORTS: [&str; 1] = ["InferencePlane"];
-const SPEND_LOG_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_SPEND_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct LiteLlmConfig {
     pub base_url: String,
@@ -26,20 +26,34 @@ pub struct LiteLlmAdapter {
     base_url: String,
     client: Client,
     master_key: String,
+    spend_log_timeout: Duration,
 }
 
 impl LiteLlmAdapter {
     pub fn new(config: LiteLlmConfig) -> Result<Self, PortError> {
+        Self::new_with_spend_log_timeout(config, DEFAULT_SPEND_LOG_TIMEOUT)
+    }
+
+    pub fn new_with_spend_log_timeout(
+        config: LiteLlmConfig,
+        spend_log_timeout: Duration,
+    ) -> Result<Self, PortError> {
         let base_url = config.base_url.trim_end_matches('/').to_owned();
         if base_url.is_empty() || config.master_key.is_empty() {
             return Err(PortError::Rejected {
                 reason: "inference endpoint and management credential are required".to_owned(),
             });
         }
+        if spend_log_timeout.is_zero() {
+            return Err(PortError::Rejected {
+                reason: "inference usage report timeout must be positive".to_owned(),
+            });
+        }
         Ok(Self {
             base_url,
             client: Client::new(),
             master_key: config.master_key,
+            spend_log_timeout,
         })
     }
 
@@ -105,7 +119,7 @@ impl LiteLlmAdapter {
             .get(format!("{}/spend/logs", self.base_url))
             .bearer_auth(&self.master_key)
             .query(&[("api_key", key_hash)])
-            .timeout(SPEND_LOG_TIMEOUT)
+            .timeout(self.spend_log_timeout)
             .send()
             .await;
         let response = match response {
@@ -1045,19 +1059,22 @@ mod tests {
                     200,
                     r#"[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}]"#,
                     "",
-                    Duration::from_millis(2_200),
+                    Duration::from_millis(100),
                 ),
             ],
             MOCK_REQUEST_TIMEOUT,
         )?;
-        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
-            base_url: server.base_url.clone(),
-            master_key: "fixture-management-value".to_owned(),
-        })
+        let adapter = LiteLlmAdapter::new_with_spend_log_timeout(
+            LiteLlmConfig {
+                base_url: server.base_url.clone(),
+                master_key: "fixture-management-value".to_owned(),
+            },
+            Duration::from_millis(50),
+        )
         .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
 
         let observed =
-            tokio::time::timeout(Duration::from_millis(2_100), adapter.observe(&request())).await;
+            tokio::time::timeout(Duration::from_millis(80), adapter.observe(&request())).await;
         let server_result = server.finish();
         let observation = observed
             .map_err(|_| "slow usage reporting delayed budget enforcement".to_owned())?

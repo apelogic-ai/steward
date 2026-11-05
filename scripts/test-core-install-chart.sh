@@ -1051,9 +1051,15 @@ helm_template "${governed_inputs[@]}" \
   --set-string config.mint.openshellNamespace=customer-openshell > "${rendered}"
 grep -qF 'kind: ClusterSPIFFEID' "${rendered}"
 grep -qF 'name: steward-mint' "${rendered}"
-if ! grep -A1 -F 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}" |
-  grep -qF 'value: "10"'; then
-  echo 'the LiteLLM spend-log timeout must default to 10 seconds' >&2
+if ! awk '
+  $1 == "litellmSpendLogTimeoutSeconds:" { found = ($2 == 10) }
+  END { exit !found }
+' "${root}/charts/steward/values.yaml"; then
+  echo 'the chart LiteLLM spend-log timeout must default to 10 seconds' >&2
+  exit 1
+fi
+if grep -qF 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}"; then
+  echo 'the default LiteLLM spend-log timeout must preserve the existing controller render' >&2
   exit 1
 fi
 helm_template "${governed_inputs[@]}" \
