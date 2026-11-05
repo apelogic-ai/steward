@@ -196,6 +196,9 @@ jobs:
       - name: Run pinned upstream conformance
         run: cargo xtask conformance --pinned
 
+      - name: Verify exact hosted LiteLLM aliases
+        run: cargo xtask e2e-hosted-litellm-aliases
+
   openshell-adapter:
     name: integration / OpenShell 0.0.98 adapter
     needs: changes
