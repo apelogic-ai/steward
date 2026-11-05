@@ -539,6 +539,7 @@ fn value_decimal(value: &Value) -> Option<String> {
 
 fn normalize_decimal(value: &str) -> Option<String> {
     let exponent_separator = value.find(['e', 'E']);
+    let has_exponent = exponent_separator.is_some();
     let (mantissa, exponent) = if let Some(separator) = exponent_separator {
         let (mantissa, exponent) = value.split_at(separator);
         if exponent[1..].contains(['e', 'E']) {
@@ -550,6 +551,15 @@ fn normalize_decimal(value: &str) -> Option<String> {
     };
     let (integer, fractional) = decimal_parts(mantissa)?;
     let digits = format!("{integer}{fractional}");
+    if digits.bytes().all(|digit| digit == b'0') {
+        return Some("0".to_owned());
+    }
+    if has_exponent {
+        let finite_value = value.parse::<f64>().ok()?;
+        if !finite_value.is_finite() || finite_value == 0.0 {
+            return None;
+        }
+    }
     let decimal_position = i128::try_from(integer.len())
         .ok()?
         .checked_add(i128::from(exponent))?;
