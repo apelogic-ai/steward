@@ -2027,9 +2027,10 @@ mod tests {
         for (name, container_path, documentation_path) in runtimes {
             let container = fs::read_to_string(root().join(container_path))
                 .map_err(|error| format!("{name} reference runtime build is required: {error}"))?;
-            let documentation = fs::read_to_string(root().join(documentation_path)).map_err(
-                |error| format!("{name} reference runtime documentation is required: {error}"),
-            )?;
+            let documentation =
+                fs::read_to_string(root().join(documentation_path)).map_err(|error| {
+                    format!("{name} reference runtime documentation is required: {error}")
+                })?;
 
             for required in [
                 "UV_VERSION=0.11.15",
@@ -2038,8 +2039,8 @@ mod tests {
                 "sha256sum --check --strict",
                 "/usr/local/bin/uv",
                 "/usr/local/bin/uvx",
-                "test \"$(uv --version)\" = \"uv ${UV_VERSION}\"",
-                "test \"$(uvx --version)\" = \"uvx ${UV_VERSION}\"",
+                "test \"$(uv --version | cut -d ' ' -f 1-2)\" = \"uv ${UV_VERSION}\"",
+                "test \"$(uvx --version | cut -d ' ' -f 1-2)\" = \"uvx ${UV_VERSION}\"",
             ] {
                 assert!(
                     container.contains(required),
