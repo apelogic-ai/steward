@@ -7,6 +7,9 @@ persist. The browser must never fill an unavailable field from a heuristic.
 
 Applies to Steward 0.3.26.
 
+The always-visible execution-log additions described below apply to the next release after
+0.3.26.
+
 ## Authority and privacy boundary
 
 User operations are below `/app/api/v1/runs`; reads are restricted to the exact
@@ -125,6 +128,11 @@ Beginning with Steward 0.3.16, a live OpenShell transcript is readable before
 the Task becomes terminal, and terminal captured output remains readable
 afterward.
 
+Every ordinary Agent Task now retains its bounded streams after the process starts. The
+snapshotted compatibility value `executionLog: off` does not suppress capture or hide streams in
+Agent Runs. Provider-control operations remain structurally excluded, and a pre-execution
+rejection has no process output.
+
 `GET .../{taskUid}/logs/{stream}?after={byteOffset}` accepts only `stdout` or
 `stderr`. It returns
 `{ stream, content, truncated, sizeBytes, complete, partial }` and at most 64
@@ -138,6 +146,11 @@ For compatibility with the original endpoint, a request that omits `after`
 receives the complete captured stream as `text/plain; charset=utf-8`. Both
 representations are `no-store` and `nosniff`; new clients use the bounded JSON
 representation with an explicit byte offset.
+
+The task-authenticated alias
+`GET /v1/tasks/{taskUid}/logs/{stream}?after={byteOffset}` returns the same bounded JSON shape.
+It requires the Task bearer identity's exact submitter service and canonical owner; a mismatch is
+indistinguishable from an absent Task. It does not grant browser or administrator authority.
 
 ### Cancel and re-run
 

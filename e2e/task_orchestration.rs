@@ -930,12 +930,19 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         started_index < ended_index,
         "a synchronous terminal result must record executionStarted before executionEnded"
     );
-    assert!(
-        store
-            .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
-            .await?
-            .is_none(),
-        "execution-log: off must not persist a failed-run transcript"
+    let failed_transcript = store
+        .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("failed-run transcript is absent"))?;
+    assert_eq!(
+        failed_transcript.execution_stdout.as_deref(),
+        Some(b"failed task stdout".as_slice()),
+        "the compatibility off value must not hide an ordinary agent's stdout"
+    );
+    assert_eq!(
+        failed_transcript.execution_stderr.as_deref(),
+        Some(b"failed task stderr".as_slice()),
+        "the compatibility off value must not hide an ordinary agent's stderr"
     );
     let owner_log = store
         .agent_run_execution_log(
@@ -945,18 +952,12 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         )
         .await?
         .ok_or_else(|| io::Error::other("owner log status is absent"))?;
-    assert!(
-        owner_log.content.is_empty(),
-        "the owner log route must not expose a transcript when diagnostics are off"
-    );
+    assert_eq!(owner_log.content, b"failed task stdout");
     let admin_log = store
         .agent_run_execution_log(failed_task_uid, None, AgentRunLogStream::Stderr)
         .await?
         .ok_or_else(|| io::Error::other("administrator log status is absent"))?;
-    assert!(
-        admin_log.content.is_empty(),
-        "the administrator log route must not expose a transcript when diagnostics are off"
-    );
+    assert_eq!(admin_log.content, b"failed task stderr");
     let failed_outputs = task_api_request(
         &app,
         Method::GET,
@@ -5498,6 +5499,28 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         assert_eq!(log.content, expected);
         assert!(log.complete);
     }
+    let runner_stdout = store
+        .task_execution_log_for_submitter(
+            successful_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("submitter-scoped execution log is absent"))?;
+    assert_eq!(runner_stdout.content, b"successful task stdout");
+    assert!(
+        store
+            .task_execution_log_for_submitter(
+                successful_task_uid,
+                "other-service",
+                identity.user_id.as_str(),
+                AgentRunLogStream::Stdout,
+            )
+            .await?
+            .is_none(),
+        "the same owner through another service must not read the Task log"
+    );
     let runner_transcript = store
         .task_output_transcript_for_submitter(
             successful_task_uid,

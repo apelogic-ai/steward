@@ -62,7 +62,7 @@ Feature: J2 - New user gets going
     And I press "Run now"
     And I choose "standard" in "Envelope"
     And I choose "Inline package" in "Package source"
-    And I tick "Capture execution log"
+    And I see "Sensitive output warning"
     # A coding agent and a model that this Envelope allows are selected.
     Then "Run now" is enabled
     When I press "Run now"

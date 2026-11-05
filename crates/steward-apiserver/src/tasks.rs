@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -1735,6 +1735,14 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<TaskOutputTranscript>, StoreError>>;
 
+    fn task_execution_log<'a>(
+        &'a self,
+        task_uid: Uuid,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        stream: steward_store::AgentRunLogStream,
+    ) -> BoxFuture<'a, Result<Option<steward_store::AgentRunExecutionLog>, StoreError>>;
+
     fn request_task_finalization<'a>(
         &'a self,
         task_uid: Uuid,
@@ -1885,6 +1893,25 @@ impl TaskSubmissionLedger for PgStore {
                 task_uid,
                 submitter_service,
                 owner_user_id,
+            )
+            .await
+        })
+    }
+
+    fn task_execution_log<'a>(
+        &'a self,
+        task_uid: Uuid,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        stream: steward_store::AgentRunLogStream,
+    ) -> BoxFuture<'a, Result<Option<steward_store::AgentRunExecutionLog>, StoreError>> {
+        Box::pin(async move {
+            PgStore::task_execution_log_for_submitter(
+                self,
+                task_uid,
+                submitter_service,
+                owner_user_id,
+                stream,
             )
             .await
         })
@@ -2395,6 +2422,10 @@ where
             get(get_task_outputs::<L, I>),
         )
         .route(
+            "/v1/tasks/{task_uid}/logs/{stream}",
+            get(get_task_execution_log::<L, I>),
+        )
+        .route(
             "/v1/tasks/{task_uid}",
             get(get_task::<L, I>).delete(delete_task::<L, I>),
         )
@@ -2403,6 +2434,47 @@ where
             identities,
             application: TaskApplicationService { ledger, config },
         })
+}
+
+async fn get_task_execution_log<L, I>(
+    State(state): State<TaskApiState<L, I>>,
+    Path((task_uid, stream)): Path<(Uuid, String)>,
+    Query(query): Query<crate::agent_runs_ui::BrowserExecutionLogQuery>,
+    headers: HeaderMap,
+) -> Response
+where
+    L: AdmissionLedger + TaskSubmissionLedger,
+    I: TaskIdentityResolver,
+{
+    let identity = match resolve_task_identity(&state.identities, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    let stream_kind = match stream.as_str() {
+        "stdout" => steward_store::AgentRunLogStream::Stdout,
+        "stderr" => steward_store::AgentRunLogStream::Stderr,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match state
+        .application
+        .ledger
+        .task_execution_log(
+            task_uid,
+            &identity.service,
+            identity.canonical_user_id.as_str(),
+            stream_kind,
+        )
+        .await
+    {
+        Ok(Some(log)) => crate::agent_runs_ui::execution_log_body(
+            &stream,
+            log,
+            query.after.unwrap_or(0),
+            query.after.is_some(),
+        ),
+        Ok(None) => ApiError::Store(StoreError::TaskNotFound).into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
 }
 
 async fn get_task_outputs<L, I>(

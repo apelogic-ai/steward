@@ -408,7 +408,7 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
         package: { source: "inline", path: data.starterTask.packagePath, files: effectiveFiles },
         envelopeDigest,
         inputs: inputObject(inputs),
-        diagnostics: { executionLog: data.starterTask.executionLog },
+        diagnostics: { executionLog: "full" },
       },
       cache: "no-store",
       credentials: "same-origin",
@@ -561,7 +561,6 @@ function RunLogExcerpt({ run }: Readonly<{ run: BrowserRunView }>) {
   const [excerpt, setExcerpt] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    if (run.executionLog !== "full") return () => { active = false; };
     void myRunExecutionLog({
       cache: "no-store",
       credentials: "same-origin",
@@ -572,8 +571,7 @@ function RunLogExcerpt({ run }: Readonly<{ run: BrowserRunView }>) {
       if (active) setExcerpt(result.data?.content.slice(0, 1_200) || "");
     });
     return () => { active = false; };
-  }, [run.executionLog, run.taskUid]);
-  if (run.executionLog !== "full") return <p className="text-xs text-muted-ink">No execution log was captured for this run.</p>;
+  }, [run.taskUid]);
   if (excerpt === null) return <p className="text-xs text-muted-ink">Loading execution log excerpt…</p>;
   return <div className="space-y-1"><pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-control bg-code p-3 text-xs text-code-ink">{excerpt || "Execution log is empty."}</pre><p className="text-[11px] text-muted-ink">Captured output may contain sensitive data.</p></div>;
 }
