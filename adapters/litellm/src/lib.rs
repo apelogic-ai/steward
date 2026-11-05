@@ -470,6 +470,13 @@ mod tests {
 
     impl MockLiteLlm {
         fn start(responses: Vec<&str>) -> Result<Self, String> {
+            Self::start_with_timeout(responses, MOCK_REQUEST_TIMEOUT)
+        }
+
+        fn start_with_timeout(
+            responses: Vec<&str>,
+            request_timeout: Duration,
+        ) -> Result<Self, String> {
             let listener = TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|error| format!("failed to bind mock LiteLLM: {error}"))?;
             listener
@@ -483,7 +490,7 @@ mod tests {
             let responses = responses.into_iter().map(str::to_owned).collect::<Vec<_>>();
             let server = thread::spawn(move || {
                 for response_body in responses {
-                    let deadline = Instant::now() + MOCK_REQUEST_TIMEOUT;
+                    let deadline = Instant::now() + request_timeout;
                     let (mut stream, _) = loop {
                         match listener.accept() {
                             Ok(connection) => break connection,
@@ -527,6 +534,66 @@ mod tests {
                 .map_err(|_| "mock LiteLLM request lock was poisoned".to_owned())
                 .map(|requests| requests.clone())
         }
+    }
+
+    async fn assert_request_logs_supply_run_spend(spend_logs: &str) -> Result<(), String> {
+        let server = MockLiteLlm::start_with_timeout(
+            vec![
+                r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false,"hosted_extension":"ignored"}]}"#,
+                spend_logs,
+            ],
+            Duration::from_millis(500),
+        )?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("hosted spend observation failed: {error:?}"))?;
+        let requests = server.finish()?;
+
+        assert_eq!(requests.len(), 2, "one exact key lookup and one spend-log read are required");
+        assert!(requests[0].starts_with("GET /key/list?"));
+        assert!(requests[1].starts_with("GET /spend/logs?api_key=fixture-token-hash "));
+        assert!(requests[1].contains("authorization: Bearer fixture-management-value"));
+        assert_eq!(
+            observation,
+            InferenceObservation::Active {
+                reference: super::runtime_alias("runtime-a"),
+                spend: SpendSummary {
+                    observed_amount: "0.02".to_owned(),
+                    currency: "USD".to_owned(),
+                },
+            },
+            "request-level logs must replace a stale hosted key counter"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flat_request_logs_supply_hosted_run_spend() -> Result<(), String> {
+        assert_request_logs_supply_run_spend(
+            r#"[
+                {"spend":0.0125,"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"hosted_extension":"ignored"},
+                {"spend":0.0075,"prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"hosted_extension":"ignored"}
+            ]"#,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn data_envelope_request_logs_supply_bundled_run_spend() -> Result<(), String> {
+        assert_request_logs_supply_run_spend(
+            r#"{"data":[
+                {"spend":"0.0125","prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"bundled_extension":true},
+                {"spend":"0.0075","prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"bundled_extension":true}
+            ],"total":2,"page":1,"page_size":50,"total_pages":1}"#,
+        )
+        .await
     }
 
     fn request() -> InferenceRequest {
