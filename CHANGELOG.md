@@ -7,33 +7,49 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.28] - 2026-11-05
+
+Steward v0.3.28 preserves deployment-configured LiteLLM model aliases exactly and reports each
+governed run's spend and token usage from LiteLLM request logs, including with externally operated
+LiteLLM deployments.
+
 ### Changed
 
-- Agent Runs now derives run spend and optional total tokens from LiteLLM request logs, including
-  hosted deployments whose virtual-key spend counter is stale. The LiteLLM management credential
-  must be allowed to read request logs for runtime key hashes. If that read is refused, budget
-  enforcement continues but Agent Runs shows spend and tokens as `Not reported` instead of showing
-  the key counter as run spend. Migration 0076 adds these fields without rewriting historical
-  rows; earlier key-counter observations also display as `Not reported` because they cannot be
-  proven to be per-run request usage. Request-log reads default to a 10-second deadline; operators
-  can change it with `config.controller.litellmSpendLogTimeoutSeconds`.
-
-### Fixed
-
-- Governed Codex and Claude Code runs now send LiteLLM the exact model ID or alias configured in
-  the capability catalog instead of adding the separate provider value. LiteLLM pricing checks and
-  runtime-key model restrictions use that same exact alias, so customer-hosted LiteLLM aliases work
-  for both launchers. Explicitly provider-qualified aliases remain unchanged.
+- Codex and Claude Code now send each configured LiteLLM model ID or alias unchanged. Steward uses
+  the same exact value for model checks, pricing, and runtime-key allowlists, so bare deployment
+  aliases work without an added provider prefix and already-qualified aliases remain compatible.
+- Agent Runs now derives per-run spend from the runtime key's LiteLLM request logs instead of the
+  key budget counter. The run list and detail show total tokens when LiteLLM reports them and show
+  `Not reported` when request logs cannot prove spend or token usage. The LiteLLM management
+  credential must be able to read request logs for runtime key hashes. Budget enforcement continues
+  if that read is refused, but spend and tokens show as `Not reported`. Reads use a 10-second
+  deadline by default; operators can change it with
+  `config.controller.litellmSpendLogTimeoutSeconds`. Agent Runs API responses add the optional
+  `observedSpend.totalTokens` field; historical rows no longer present a key budget counter as
+  `observedSpend`.
+- The pinned upstream CI lane now proves hosted aliases against digest-pinned LiteLLM v1.93.0 and
+  PostgreSQL services. It provisions separate runtime keys through Steward, sends requests using
+  the exact Claude Code and Codex launch plans, refuses cross-alias key use, verifies spend logs,
+  and checks cleanup.
 
 ### Upgrade and rollback
 
-- Before upgrading an installation that relied on Steward to add the provider prefix, add each
-  capability-catalog `model` value as an exact LiteLLM alias with pricing. Keep the existing
-  provider-qualified alias for rollback. Stop new Task submissions and let every Task created by
-  the older Steward version finish before upgrading; otherwise re-create those Tasks after the
-  upgrade. A new controller can replace an existing runtime key's model restriction with the bare
-  alias, so retaining both LiteLLM aliases does not make an older Task safe to resume. No database
-  migration is required. Keep both aliases until rollback is no longer needed.
+- Before upgrading, back up the database and add every bare alias used by the Steward model catalog
+  to LiteLLM with pricing while keeping the existing qualified aliases available for rollback. Stop
+  new Task submissions, then let every Task created before the upgrade finish or re-create it after
+  the upgrade before resuming submissions. Deploy the chart, component images, and reference
+  runtimes as one release unit, then update mirrored runtime digests and execution bindings to the
+  v0.3.28 artifacts.
+- Steward automatically applies additive migration 0076, which records request-log spend and
+  nullable token usage on new spend observations. Historical rows remain readable and report spend
+  and token usage as unavailable rather than presenting a virtual-key counter as per-run usage. No
+  manual data migration is required.
+- Before rolling back to v0.3.27, stop submissions and finish or re-create active Tasks against the
+  restored model names. Remove `config.controller.litellmSpendLogTimeoutSeconds` from Helm values
+  and keep the qualified LiteLLM aliases available until rollback is complete. Steward v0.3.27 does
+  not recognize migration 0076, so restore the pre-upgrade database backup to a new database target
+  and point v0.3.27 at that target before starting it. Records written after the upgrade are not in
+  the backup; preserve any audit or decision records that must be retained before rolling back.
 
 ## [0.3.27] - 2026-11-05
 
@@ -1735,7 +1751,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.27...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.28...HEAD
+[0.3.28]: https://github.com/apelogic-ai/steward/compare/v0.3.27...v0.3.28
 [0.3.27]: https://github.com/apelogic-ai/steward/compare/v0.3.26...v0.3.27
 [0.3.26]: https://github.com/apelogic-ai/steward/compare/v0.3.25...v0.3.26
 [0.3.25]: https://github.com/apelogic-ai/steward/compare/v0.3.24...v0.3.25

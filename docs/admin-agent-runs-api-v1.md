@@ -5,10 +5,10 @@ contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
-Applies to Steward 0.3.27.
+Applies to Steward 0.3.28.
 
 The always-visible execution-log additions described below are part of Steward
-0.3.27. The inference-usage additions apply to the next release after 0.3.27.
+0.3.27. The inference-usage additions are part of Steward 0.3.28.
 
 ## Authority and privacy boundary
 

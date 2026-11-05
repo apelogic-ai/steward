@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.27"
+          test "$version" = "0.3.28"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -961,7 +961,8 @@ jobs:
                 "0072_api_task_origin.sql",
                 "0073_task_caller_reference.sql",
                 "0074_personal_agents.sql",
-                "0075_personal_agent_claim_attempts.sql"
+                "0075_personal_agent_claim_attempts.sql",
+                "0076_agent_run_token_usage.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -969,18 +970,20 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.27 retains bounded stdout and stderr for every governed agent run and adds a task-authenticated GET /v1/tasks/{taskUid}/logs/{stream} endpoint for reading either stream while the run is active or after it ends. Existing execution-log off values remain accepted but no longer disable retention. Output beyond 4 MiB per stream keeps its bounded tail without changing the run exit status.\n\n'
-            printf 'This release also updates pulldown-cmark to 0.13.6 to resolve RUSTSEC-2026-0414 and RUSTSEC-2026-0433. The Codex and Claude Code reference runtimes install checksum-verified uv 0.11.15, which removes the vulnerable Rust zip 8.1.0 dependency and resolves CVE-2026-115905.\n\n'
+            printf 'Steward v0.3.28 sends deployment-configured LiteLLM model IDs and aliases unchanged through Codex, Claude Code, model checks, pricing, and runtime-key allowlists. Bare deployment aliases work without an added provider prefix, while already-qualified aliases remain compatible.\n\n'
+            printf 'Agent Runs now derives each run\x27s spend from the runtime key\x27s LiteLLM request logs instead of its key budget counter. The run list and detail show total tokens when LiteLLM reports them and show Not reported when request logs cannot prove spend or token usage. The LiteLLM management credential must be able to read logs for runtime key hashes. Budget enforcement continues if that read is refused, but spend and tokens show as Not reported. Reads default to a 10-second deadline configurable through config.controller.litellmSpendLogTimeoutSeconds.\n\n'
+            printf 'The pinned upstream lane now proves bare aliases against digest-pinned LiteLLM v1.93.0 and PostgreSQL services using separate Steward-provisioned Claude Code and Codex runtime keys, reciprocal cross-alias refusals, request-log evidence, revocation, and owned-resource cleanup.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'No database or configuration migration is required when upgrading from v0.3.26. Deploy the chart, component images, and reference runtimes as one release unit, then update mirrored runtime digests and execution bindings to the v0.3.27 artifacts.\n\n'
-            printf 'Rolling back to v0.3.26 removes the task log endpoint and always-on stream retention and restores the earlier dependency and reference-runtime images, including the vulnerabilities corrected in v0.3.27. No database rollback is required.\n\n'
+            printf 'Before upgrading, back up the database and add every bare alias used by the Steward model catalog to LiteLLM with pricing while keeping the existing qualified aliases available for rollback. Stop new Task submissions, then let every Task created before the upgrade finish or re-create it after the upgrade before resuming submissions. Deploy the chart, component images, and reference runtimes as one release unit, then update mirrored runtime digests and execution bindings to the v0.3.28 artifacts.\n\n'
+            printf 'Steward automatically applies additive migration 0076 for request-log spend and nullable token usage on new spend observations. Historical rows remain readable and show unavailable spend and token usage instead of presenting virtual-key counters as per-run usage; no manual data migration is required.\n\n'
+            printf 'Before rolling back to v0.3.27, stop submissions and finish or re-create active Tasks against the restored model names. Remove config.controller.litellmSpendLogTimeoutSeconds from Helm values and keep qualified LiteLLM aliases available until rollback is complete. Steward v0.3.27 does not recognize migration 0076, so restore the pre-upgrade database backup to a new database target and point v0.3.27 at that target before starting it. Records written after the upgrade are not in the backup; preserve any audit or decision records that must be retained before rolling back.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
             printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
-            printf 'Replace mirrored v0.3.26 reference runtimes with the v0.3.27 digests and update execution bindings before starting new governed runs. No configuration change is required. Installations that previously selected execution-log off should review access to retained task output because that value is now a compatibility no-op.\n\n'
+            printf 'Back up the database before upgrading. Add bare LiteLLM aliases with pricing, retain qualified aliases for rollback, confirm the management credential can read request logs, and adjust config.controller.litellmSpendLogTimeoutSeconds only if the default 10-second deadline is unsuitable. Stop new Task submissions and finish or re-create every pre-upgrade Task. After deployment, update mirrored v0.3.27 reference runtimes and execution bindings to the v0.3.28 artifacts before resuming governed runs.\n\n'
             printf '## Acceptance\n\n'
-            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
+            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job. Pinned CI separately exercises the real LiteLLM alias, key-isolation, and spend proof.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
             for component in apiserver controller mint trigger-receiver bridge web; do
               printf '| %s | %s:%s-%s | %s |\n' \
@@ -1058,7 +1061,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.27.json
+          subject-path: dist/steward-product-compatibility-0.3.28.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1068,7 +1071,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.27.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.28.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

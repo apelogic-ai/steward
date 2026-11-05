@@ -1,6 +1,6 @@
 # Execution bindings
 
-Status: current Steward 0.3.27 installation contract
+Status: current Steward 0.3.28 installation contract
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding
@@ -90,10 +90,10 @@ also supply `/bin/sh`, `id`, `mkdir`, `ln`, `tee`, and `cat`, declare a non-root
 remain non-root when OpenShell starts the Task. Claude Code refuses `bypassPermissions` as root, so
 the adapter checks the effective UID and fails closed before its version probe or inference call.
 Image conformance must exercise that non-root entrypoint; a root-only image is not compatible with
-`claude-code-v1`. In Steward 0.3.27, the adapter passes the admitted provider-qualified model group
-to match the runtime-scoped inference key; it does not select or remap a model. The binding decides
-which providers are compatible. The deployment configures the Anthropic-compatible API base URL
-independently from Codex's OpenAI-compatible Responses endpoint.
+`claude-code-v1`. Beginning with Steward 0.3.28, the adapter passes the exact admitted model ID or
+alias unchanged to match the runtime-scoped inference key; it does not add, remove, or remap a
+provider prefix. The binding decides which providers are compatible. The deployment configures the
+Anthropic-compatible API base URL independently from Codex's OpenAI-compatible Responses endpoint.
 
 Before launch, the adapter removes inherited Claude cloud-provider selectors and alternate
 authentication or custom-header variables, then supplies only the governed Anthropic-compatible
@@ -112,7 +112,7 @@ For Steward 0.3.27, add the exact `<provider>/<model>` name and pricing to the i
 the same model to the Steward capability catalog, and make it available through the relevant
 Envelope Template.
 
-Beginning with the next release, the capability-catalog `model` is instead the exact model ID or
+Beginning with Steward 0.3.28, the capability-catalog `model` is instead the exact model ID or
 alias sent to the inference proxy. It may be a deployment-defined alias with no provider prefix.
 The separate capability-catalog `provider` selects compatible execution bindings and is never
 added to or removed from `model`. Configure pricing under that exact alias.
