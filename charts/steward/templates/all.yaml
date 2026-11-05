@@ -770,8 +770,9 @@ spec:
 {{- if eq .Values.inference.mode "stock" }}
             - { name: STEWARD_LITELLM_MASTER_KEY, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.litellm.name }}, key: {{ .Values.secrets.litellm.key }} } } }
             - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
-{{- if ne (int .Values.config.controller.litellmSpendLogTimeoutSeconds) 10 }}
-            - { name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS, value: {{ .Values.config.controller.litellmSpendLogTimeoutSeconds | quote }} }
+{{- $litellmSpendLogTimeoutSeconds := default 10 .Values.config.controller.litellmSpendLogTimeoutSeconds }}
+{{- if ne (int $litellmSpendLogTimeoutSeconds) 10 }}
+            - { name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS, value: {{ $litellmSpendLogTimeoutSeconds | quote }} }
 {{- end }}
 {{- end }}
             - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }

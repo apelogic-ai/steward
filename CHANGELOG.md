@@ -15,7 +15,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   enforcement continues but Agent Runs shows spend and tokens as `Not reported` instead of showing
   the key counter as run spend. Migration 0076 adds these fields without rewriting historical
   rows; earlier key-counter observations also display as `Not reported` because they cannot be
-  proven to be per-run request usage.
+  proven to be per-run request usage. Request-log reads default to a 10-second deadline; operators
+  can change it with `config.controller.litellmSpendLogTimeoutSeconds`.
 
 ## [0.3.27] - 2026-11-05
 

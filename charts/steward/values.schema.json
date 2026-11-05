@@ -1173,8 +1173,7 @@
             "inferenceObservationIntervalSeconds",
             "workloadExchangeEndpoint",
             "workloadExchangeServerName",
-            "litellmUrl",
-            "litellmSpendLogTimeoutSeconds"
+            "litellmUrl"
           ],
           "properties": {
             "openshellEndpoint": {"type": "string", "pattern": "^$|^https://"},

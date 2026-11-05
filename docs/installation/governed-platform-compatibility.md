@@ -140,9 +140,7 @@ keys remain the inference authority. The target installation must prove the
 real HTTP operation for each admitted model. The management credential must
 also read `/spend/logs` for a runtime key hash. When that read is refused,
 budget enforcement continues from the key counter but Agent Runs reports spend
-and tokens as `Not reported`. The request uses the configured
-`config.controller.litellmSpendLogTimeoutSeconds` deadline, which defaults to
-10 seconds.
+and tokens as `Not reported`.
 
 ### MCP-GW authority
 
