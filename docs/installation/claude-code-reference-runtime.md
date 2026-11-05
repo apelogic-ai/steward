@@ -40,6 +40,7 @@ The non-root `sandbox` user can use these pinned tools:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
+| `uv` | 0.11.15 | Python project and package management |
 
 ## Mirror the exact manifest
 

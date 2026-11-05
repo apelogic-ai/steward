@@ -13,9 +13,14 @@ ARG FD_FIND_VERSION=9.0.0-1
 ARG FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e6672d
 ARG TREE_VERSION=2.1.1-2ubuntu3.24.04.2
 ARG TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e
+ARG UV_VERSION=0.11.15
+ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude
 COPY --chmod=0755 build/claude-code-image-state-check.sh /usr/local/libexec/steward/claude-code-image-state-check
 RUN curl --fail --silent --show-error --location \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+        --output /tmp/uv.tar.gz \
+    && curl --fail --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
     && curl --fail --silent --show-error --location \
@@ -39,6 +44,13 @@ RUN curl --fail --silent --show-error --location \
     && printf '%s  %s\n' "${LIBONIG_SHA256}" /tmp/libonig5.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${FD_FIND_SHA256}" /tmp/fd-find.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${TREE_SHA256}" /tmp/tree.deb | sha256sum --check --strict \
+    && printf '%s  %s\n' "${UV_SHA256}" /tmp/uv.tar.gz | sha256sum --check --strict \
+    && mkdir /tmp/uv-release \
+    && tar --extract --gzip --file /tmp/uv.tar.gz --strip-components=1 --directory /tmp/uv-release \
+    && rm -f /usr/local/bin/uv /usr/local/bin/uvx \
+    && install --mode=0755 /tmp/uv-release/uv /usr/local/bin/uv \
+    && install --mode=0755 /tmp/uv-release/uvx /usr/local/bin/uvx \
+    && rm -rf /tmp/uv-release /tmp/uv.tar.gz \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install \
         /tmp/ripgrep.deb \
         /tmp/libonig5.deb \
@@ -58,6 +70,8 @@ RUN curl --fail --silent --show-error --location \
     && test -x /usr/bin/claude \
     && test "$(node --print 'require("/usr/lib/node_modules/tar/package.json").version')" = "7.5.22" \
     && test "$(node --print 'require("/usr/lib/node_modules/npm/node_modules/tar/package.json").version')" = "7.5.22" \
+    && test "$(uv --version | cut -d ' ' -f 1-2)" = "uv ${UV_VERSION}" \
+    && test "$(uvx --version | cut -d ' ' -f 1-2)" = "uvx ${UV_VERSION}" \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin apt-get purge --yes --auto-remove linux-libc-dev
 
 USER sandbox
@@ -66,4 +80,6 @@ RUN test "$(/usr/bin/claude --version)" = "2.1.222 (Claude Code)" \
     && rg --version \
     && jq --version \
     && fd --version \
-    && tree --version
+    && tree --version \
+    && uv --version \
+    && uvx --version
