@@ -24,9 +24,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Before upgrading an installation that relied on Steward to add the provider prefix, add each
   capability-catalog `model` value as an exact LiteLLM alias with pricing. Keep the existing
-  provider-qualified alias through the rollout so older and newer Steward processes can both
-  resolve the model. No database migration is required. Keep both aliases until rollback is no
-  longer needed and every run started by the older version has finished.
+  provider-qualified alias for rollback. Stop new Task submissions and let every Task created by
+  the older Steward version finish before upgrading; otherwise re-create those Tasks after the
+  upgrade. A new controller can replace an existing runtime key's model restriction with the bare
+  alias, so retaining both LiteLLM aliases does not make an older Task safe to resume. No database
+  migration is required. Keep both aliases until rollback is no longer needed.
 
 ## [0.3.26] - 2026-10-26
 

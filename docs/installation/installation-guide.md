@@ -692,8 +692,12 @@ preserve the same immutable coordinates and cross-component relationships.
 
    Before upgrading an installation that relied on Steward to add the provider
    prefix, add the bare capability-catalog `model` value as a LiteLLM alias.
-   Retain the prior provider-qualified alias until every older Steward process
-   and active run has finished, so both versions resolve during the rollout.
+   Retain the prior provider-qualified alias for rollback. Stop new Task
+   submissions and let every Task created by the older Steward version finish
+   before upgrading; otherwise re-create those Tasks after the upgrade. The new
+   controller can replace an existing runtime key's model restriction with the
+   bare alias, so retaining both LiteLLM aliases does not make an older queued,
+   awaiting-approval, or in-flight Task safe to resume.
 
    Governed dependencies remain platform-owned. Set resource requests and
    limits for the OpenShell gateway, sandbox workloads, SPIRE components, and
