@@ -4673,6 +4673,25 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
+    fn oversized_transcript_keeps_the_agent_exit_status_and_tail() {
+        let execution = task_attempt_execution_command(
+            "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef",
+            &["/bin/true".to_owned()],
+            "true",
+            Some("true"),
+            true,
+        );
+
+        assert!(
+            !execution.contains("status=74") && !execution.contains("transcript_too_large"),
+            "log size must never replace the agent's exit status"
+        );
+        assert!(execution.contains(super::EXECUTION_TRANSCRIPT_TRUNCATION_MARKER));
+        assert!(execution.contains("tail -c"));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
     fn successful_task_execution_keeps_transcripts_out_of_the_output_archive() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
         let execution = task_attempt_execution_command(
@@ -4688,11 +4707,6 @@ mod tests {
         assert!(
             execution
                 .contains(&steward_types::direct_package::MAX_EXECUTION_STREAM_BYTES.to_string())
-        );
-        assert!(
-            execution.contains(
-                &steward_types::direct_package::MAX_EXECUTION_TRANSCRIPT_BYTES.to_string()
-            )
         );
         assert!(
             !execution.contains("tar -rf"),

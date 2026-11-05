@@ -5498,6 +5498,28 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         assert_eq!(log.content, expected);
         assert!(log.complete);
     }
+    let runner_stdout = store
+        .task_execution_log_for_submitter(
+            successful_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("submitter-scoped execution log is absent"))?;
+    assert_eq!(runner_stdout.content, b"successful task stdout");
+    assert!(
+        store
+            .task_execution_log_for_submitter(
+                successful_task_uid,
+                "other-service",
+                identity.user_id.as_str(),
+                AgentRunLogStream::Stdout,
+            )
+            .await?
+            .is_none(),
+        "the same owner through another service must not read the Task log"
+    );
     let runner_transcript = store
         .task_output_transcript_for_submitter(
             successful_task_uid,

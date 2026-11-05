@@ -8411,6 +8411,7 @@ mod tests {
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
         fail_task_submission_error: Arc<Mutex<Option<StoreError>>>,
         task_output_transcripts: Arc<Mutex<Vec<(Uuid, steward_store::TaskOutputTranscript)>>>,
+        provider_control_tasks: Arc<Mutex<Vec<Uuid>>>,
         miss_next_task_lookup: Arc<Mutex<bool>>,
         task_operations: Arc<Mutex<Vec<TaskRuntimeOperationRecord>>>,
         task_approval_state: Arc<Mutex<FakeApprovalState>>,
@@ -10432,6 +10433,18 @@ mod tests {
                 let Some(task) = task else {
                     return Ok(None);
                 };
+                if self
+                    .provider_control_tasks
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake provider-control Task ledger lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .contains(&task_uid)
+                {
+                    return Ok(None);
+                }
                 let transcript = self
                     .task_output_transcripts
                     .lock()
@@ -10615,6 +10628,7 @@ mod tests {
             tasks: Arc::new(Mutex::new(Vec::new())),
             fail_task_submission_error: Arc::new(Mutex::new(None)),
             task_output_transcripts: Arc::new(Mutex::new(Vec::new())),
+            provider_control_tasks: Arc::new(Mutex::new(Vec::new())),
             miss_next_task_lookup: Arc::new(Mutex::new(false)),
             task_operations: Arc::new(Mutex::new(Vec::new())),
             task_approval_state: Arc::new(Mutex::new(FakeApprovalState::Pending)),
@@ -14285,19 +14299,23 @@ mod tests {
             Some(strict_transcript(b"agent stdout\n", b"agent stderr\n")),
         )?;
 
-        let request = |assertion: &str, stream: &str, after: usize| {
-            Request::builder()
-                .method("GET")
-                .uri(format!("/v1/tasks/{task_uid}/logs/{stream}?after={after}"))
-                .header("authorization", format!("Bearer {assertion}"))
-                .header("accept", "application/json")
-                .body(Body::empty())
-                .map_err(|error| format!("build runner log request: {error}"))
-        };
+        let request =
+            |requested_task_uid: Uuid, assertion: Option<&str>, stream: &str, after: usize| {
+                let mut request = Request::builder().method("GET").uri(format!(
+                    "/v1/tasks/{requested_task_uid}/logs/{stream}?after={after}"
+                ));
+                if let Some(assertion) = assertion {
+                    request = request.header("authorization", format!("Bearer {assertion}"));
+                }
+                request
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build runner log request: {error}"))
+            };
 
         let response = app
             .clone()
-            .oneshot(request("github-assertion", "stdout", 6)?)
+            .oneshot(request(task_uid, Some("github-assertion"), "stdout", 6)?)
             .await
             .map_err(|error| format!("request runner stdout: {error}"))?;
         assert_eq!(response.status(), StatusCode::OK);
@@ -14315,13 +14333,97 @@ mod tests {
 
         let hidden = app
             .clone()
-            .oneshot(request("github-bob-assertion", "stderr", 0)?)
+            .oneshot(request(
+                task_uid,
+                Some("github-bob-assertion"),
+                "stderr",
+                0,
+            )?)
             .await
             .map_err(|error| format!("request another caller's stderr: {error}"))?;
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 
+        let different_service = app
+            .clone()
+            .oneshot(request(task_uid, Some("service-assertion"), "stdout", 0)?)
+            .await
+            .map_err(|error| format!("request log from another service: {error}"))?;
+        assert_eq!(different_service.status(), StatusCode::NOT_FOUND);
+
+        let unknown = app
+            .clone()
+            .oneshot(request(
+                Uuid::from_u128(999_999),
+                Some("github-assertion"),
+                "stdout",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request unknown Task log: {error}"))?;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(request(task_uid, None, "stdout", 0)?)
+            .await
+            .map_err(|error| format!("request log without credentials: {error}"))?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let provider_control_uid = submit_package_path_task(
+            &app,
+            "provider-control-log",
+            Some(serde_json::json!({ "executionLog": "full" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            provider_control_uid,
+            &stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]),
+            Some(strict_transcript(b"must stay hidden", b"must stay hidden")),
+        )?;
+        ledger
+            .provider_control_tasks
+            .lock()
+            .map_err(|_| "fake provider-control Task ledger lock was poisoned")?
+            .push(provider_control_uid);
+        let provider_control = app
+            .clone()
+            .oneshot(request(
+                provider_control_uid,
+                Some("github-assertion"),
+                "stdout",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request provider-control log: {error}"))?;
+        assert_eq!(provider_control.status(), StatusCode::NOT_FOUND);
+
+        let no_transcript_uid = submit_package_path_task(
+            &app,
+            "historical-log-unavailable",
+            Some(serde_json::json!({ "executionLog": "off" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            no_transcript_uid,
+            &stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]),
+            None,
+        )?;
+        let no_transcript = app
+            .clone()
+            .oneshot(request(
+                no_transcript_uid,
+                Some("github-assertion"),
+                "stdout",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request historical unavailable log: {error}"))?;
+        assert_eq!(no_transcript.status(), StatusCode::NOT_FOUND);
+
         let invalid = app
-            .oneshot(request("github-assertion", "combined", 0)?)
+            .oneshot(request(task_uid, Some("github-assertion"), "combined", 0)?)
             .await
             .map_err(|error| format!("request invalid runner stream: {error}"))?;
         assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
