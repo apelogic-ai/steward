@@ -137,10 +137,7 @@ migration, not an in-place value edit.
 
 `config.controller.litellmUrl` is the LiteLLM management API base URL. Runtime
 keys remain the inference authority. The target installation must prove the
-real HTTP operation for each admitted model. The management credential must
-also read `/spend/logs` for a runtime key hash. When that read is refused,
-budget enforcement continues from the key counter but Agent Runs reports spend
-and tokens as `Not reported`.
+real HTTP operation for each admitted model.
 
 ### MCP-GW authority
 

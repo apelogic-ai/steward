@@ -681,27 +681,14 @@ preserve the same immutable coordinates and cross-component relationships.
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
    `config.controller.litellmUrl` is the LiteLLM management API base URL. The
-   controller appends `/key/delete`, `/key/list`, `/key/generate`,
-   `/spend/logs`, and `/v1/model/info`; do not add an operation path to that
-   value. The management credential must be allowed to read request spend logs
-   for the runtime key hash returned by `/key/list`. If LiteLLM refuses that
-   read, Steward continues to enforce the key budget but Agent Runs shows spend
-   and tokens as `Not reported`; it never substitutes the key budget counter.
+   controller appends `/key/delete`, `/key/list`, `/key/generate`, and
+   `/v1/model/info`; do not add an operation path to that value.
 
    Every model admitted by the capability catalog must have pricing configured
-   in LiteLLM. LiteLLM `model_name` must equal the capability catalog's exact
-   `model` value. Steward passes that value unchanged and never adds the separate
-   `provider` value. A provider-qualified alias remains supported when the full
-   qualified alias is configured in `model`.
-
-   Before upgrading an installation that relied on Steward to add the provider
-   prefix, add the bare capability-catalog `model` value as a LiteLLM alias.
-   Retain the prior provider-qualified alias for rollback. Stop new Task
-   submissions and let every Task created by the older Steward version finish
-   before upgrading; otherwise re-create those Tasks after the upgrade. The new
-   controller can replace an existing runtime key's model restriction with the
-   bare alias, so retaining both LiteLLM aliases does not make an older queued,
-   awaiting-approval, or in-flight Task safe to resume.
+   in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,
+   including its provider prefix (for example `openai/model-name`). In this
+   contract, “provider-qualified” means that exact catalog string and routing
+   alias; Steward does not strip, add, or remap the prefix.
 
    Governed dependencies remain platform-owned. Set resource requests and
    limits for the OpenShell gateway, sandbox workloads, SPIRE components, and

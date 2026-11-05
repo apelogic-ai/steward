@@ -5272,7 +5272,7 @@ async fn finalize_inference_if_required<I: InferencePlane>(
     capture: FinalSpendCapture,
 ) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
     let final_spend = match tokio::time::timeout(
-        FINAL_SPEND_CAPTURE_TIMEOUT,
+        FINAL_SPEND_CAPTURE_TIMEOUT.saturating_add(inference.usage_report_timeout()),
         observe_and_record_final_spend(runtime, inference, request, authority, capture),
     )
     .await
@@ -8541,6 +8541,15 @@ mod tests {
     impl InferencePlane for FinalSpendObservationInference {
         fn capabilities(&self) -> InferenceCapabilities {
             InferenceCapabilities::default()
+        }
+
+        fn usage_report_timeout(&self) -> StdDuration {
+            match self.behavior {
+                FinalSpendObservationBehavior::CompleteAfter(delay) => delay,
+                FinalSpendObservationBehavior::Fail | FinalSpendObservationBehavior::Pending => {
+                    StdDuration::ZERO
+                }
+            }
         }
 
         async fn validate_configuration(

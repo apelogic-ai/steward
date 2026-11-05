@@ -1,6 +1,7 @@
 //! Vendor-neutral interfaces for every replaceable Steward plane.
 
 use std::future::Future;
+use std::time::Duration;
 
 use futures::Stream;
 
@@ -501,6 +502,10 @@ pub enum SessionEvent {
 
 pub trait InferencePlane: Send + Sync + 'static {
     fn capabilities(&self) -> InferenceCapabilities;
+
+    fn usage_report_timeout(&self) -> Duration {
+        Duration::ZERO
+    }
 
     fn validate_configuration(
         &self,

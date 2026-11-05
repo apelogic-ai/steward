@@ -158,6 +158,10 @@ impl InferencePlane for LiteLlmAdapter {
         capabilities
     }
 
+    fn usage_report_timeout(&self) -> Duration {
+        self.spend_log_timeout
+    }
+
     async fn validate_configuration(
         &self,
         models: &[ModelRef],
