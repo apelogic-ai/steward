@@ -1051,5 +1051,20 @@ helm_template "${governed_inputs[@]}" \
   --set-string config.mint.openshellNamespace=customer-openshell > "${rendered}"
 grep -qF 'kind: ClusterSPIFFEID' "${rendered}"
 grep -qF 'name: steward-mint' "${rendered}"
+if ! grep -A1 -F 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}" |
+  grep -qF 'value: "10"'; then
+  echo 'the LiteLLM spend-log timeout must default to 10 seconds' >&2
+  exit 1
+fi
+helm_template "${governed_inputs[@]}" \
+  --set-string config.mint.issuer=https://mint.example.test \
+  --set-string config.mint.spiffeTrustDomain=customer.example.test \
+  --set-string config.mint.openshellNamespace=customer-openshell \
+  --set config.controller.litellmSpendLogTimeoutSeconds=17 > "${rendered}"
+if ! grep -A1 -F 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}" |
+  grep -qF 'value: "17"'; then
+  echo 'the controller must receive the configured LiteLLM spend-log timeout' >&2
+  exit 1
+fi
 
 echo 'core-only chart dependency boundary passed'
