@@ -1120,8 +1120,8 @@ pub enum OpenShellTaskLogMode {
     Off,
     /// Emit escaped stdout and stderr events for synchronous task processes.
     ///
-    /// Agent executions with full diagnostics run detached and publish their output through the
-    /// authenticated execution-log API instead of the controller log stream.
+    /// Agent executions run detached and publish their output through the authenticated
+    /// execution-log API instead of the controller log stream.
     Full,
 }
 

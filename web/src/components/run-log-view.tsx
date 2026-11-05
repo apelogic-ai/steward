@@ -111,7 +111,7 @@ export function ExecutionLogContent({ state, stream, warning = false }: Readonly
   warning?: boolean;
 }>) {
   if (state.status === "loading") return <p className="text-sm text-muted-ink" role="status">Loading {stream} log…</p>;
-  if (state.status === "unavailable") return <div className="space-y-1 text-sm text-muted-ink" role="status"><p className="font-semibold text-ink">No execution log was captured for this run.</p><p>Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr.</p></div>;
+  if (state.status === "unavailable") return <p className="text-sm text-muted-ink" role="status">The execution log is not available for this run.</p>;
   if (state.status === "error") return <p className="text-sm text-err" role="alert">The {stream} log could not be loaded.</p>;
   const partialNote = state.partial ? <p className="text-xs text-muted-ink" role="status">The run ended before the full log was saved. This is the output captured while it ran.</p> : null;
   if (state.complete && state.text === "") return <div className="space-y-1"><p className="text-sm text-muted-ink" role="status">The captured {stream} log is empty.</p>{partialNote}</div>;

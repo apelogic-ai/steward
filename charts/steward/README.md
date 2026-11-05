@@ -895,10 +895,10 @@ Steward release namespace also creates `steward-workflows`.
   to mirror synchronous task-process stdout and stderr into controller logs;
   each record includes `runtime_uid`, `workspace`, `sandbox`, `stream`, and the
   escaped output `message`, including prompts and responses emitted by the task
-  process. Beginning with Steward 0.3.16, Agent Tasks with
-  `diagnostics.executionLog: full` run detached, so their process output is
-  available through the authenticated Run execution-log routes and is not
-  copied into controller logs.
+  process. Every ordinary Agent Task runs detached, so its process output is
+  available through the authenticated Run and Task execution-log routes and is
+  not copied into controller logs. The `diagnostics.executionLog` request field
+  remains accepted for compatibility but does not disable bounded stream retention.
   **Warning:** `full` logging copies task-controlled output without redaction
   and may expose prompts, responses, credentials, or other sensitive information
   to anyone authorized to read or retain controller-log or Run-log output.

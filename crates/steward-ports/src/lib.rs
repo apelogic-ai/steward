@@ -279,8 +279,8 @@ pub struct SandboxTaskRequest {
     /// The exact models admitted into the immutable runtime spec for this Task.
     pub models: Vec<ModelRef>,
     pub command: Vec<String>,
-    /// Immutable caller-visible diagnostics selected by the admitted direct package.
-    /// Legacy tasks and provider-control operations always carry the default disabled value.
+    /// Server-selected execution diagnostics. Ordinary Agent Tasks always retain their bounded
+    /// streams; provider-control operations carry the disabled value.
     pub diagnostics: DiagnosticsRequest,
     /// Immutable workspace identities resolved at admission. Materializers consume only this
     /// server-authored evidence plus the separately framed workspace archive.

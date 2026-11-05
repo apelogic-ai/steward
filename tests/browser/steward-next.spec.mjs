@@ -3878,7 +3878,7 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     await expect(developer.page.getByRole("heading", { name: starterTaskFixture.title })).toBeVisible();
     await expect(developer.page.getByRole("textbox", { name: /^Prompt\b/ })).toHaveValue(starterTaskFixture.taskDefinition.promptText);
     await expect(developer.page.getByRole("textbox", { name: /^Inputs \(JSON object\)/ })).toHaveValue(JSON.stringify(starterTaskFixture.inputs, null, 2));
-    await expect(developer.page.getByRole("checkbox", { name: /Capture execution log/ })).toBeChecked();
+    await expect(developer.page.getByText("Sensitive output warning", { exact: true })).toBeVisible();
     await expect(developer.page.getByLabel("Model", { exact: true }).locator("option")).toHaveText([
       "provider-a/model-a",
       "openai/gpt-5.4",
@@ -3919,7 +3919,6 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     await developer.page.getByRole("button", { name: "Continue" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/new?task=${encodeURIComponent(browserTaskDigest)}`);
     await expect(developer.page.getByRole("textbox", { name: /^Inputs \(JSON object\)/ })).toHaveValue("{}");
-    await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
     await developer.page.getByRole("button", { name: "Run now" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
 
@@ -4373,14 +4372,11 @@ test("job and log stream deep links survive reload and browser history", async (
   }
 });
 
-test("logging-off runs explain that no transcript was captured", async ({ browser }) => {
+test("legacy logging-off runs still expose retained streams", async ({ browser }) => {
   const developer = await guardedPage(browser);
   const loggingOffRun = {
     ...run,
     executionLog: "off",
-    stages: run.stages.map((stage) => stage.id === "agent_execution"
-      ? { ...stage, steps: [{ ...stage.steps[0], logStreams: [] }] }
-      : stage),
   };
   await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => route.fulfill({
     status: 200,
@@ -4394,8 +4390,9 @@ test("logging-off runs explain that no transcript was captured", async ({ browse
   }));
   try {
     await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution`);
-    await expect(developer.page.getByText("No execution log was captured for this run.", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("region", { name: "Execution log" })).toHaveCount(0);
+    await expect(developer.page.getByText("No execution log was captured for this run.", { exact: true })).toHaveCount(0);
+    await developer.page.getByText("Execution", { exact: true }).click();
+    await expect(developer.page.getByRole("tab", { name: "stdout" })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -4526,7 +4523,7 @@ test("administrator run logs use the administrator boundary and report unavailab
     await administrator.page.getByRole("tab", { name: "stderr" }).click();
     await administrator.page.getByRole("link", { name: "Open full page" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/runs/${taskUid}/logs/stderr`);
-    await expect(administrator.page.getByRole("status")).toContainText("No execution log was captured for this run.");
+    await expect(administrator.page.getByRole("status")).toContainText("The execution log is not available for this run.");
     const requestedPaths = administrator.executionLogRequests.map((request) => new URL(request.url()).pathname);
     expect(requestedPaths).toContain(`/admin/api/v1/all-runs/${taskUid}/logs/stderr`);
     expect(requestedPaths.every((path) => path.startsWith(`/admin/api/v1/all-runs/${taskUid}/logs/`))).toBe(true);

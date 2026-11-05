@@ -2828,14 +2828,13 @@ fn sandbox_task_workspace(
 
 fn sandbox_task_diagnostics(
     execution_class: SandboxExecutionClass,
-    evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
-    browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
+    _evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
+    _browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
 ) -> steward_types::direct_package::DiagnosticsRequest {
     if execution_class == SandboxExecutionClass::Agent {
-        evidence
-            .map(|evidence| evidence.diagnostics)
-            .or_else(|| browser_evidence.map(|evidence| evidence.diagnostics))
-            .unwrap_or_default()
+        steward_types::direct_package::DiagnosticsRequest {
+            execution_log: steward_types::direct_package::ExecutionLogMode::Full,
+        }
     } else {
         steward_types::direct_package::DiagnosticsRequest::default()
     }

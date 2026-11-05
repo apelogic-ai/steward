@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Every governed agent run now retains bounded stdout and stderr and exposes them while the run is
+  active and after it succeeds or fails. The Agent Runs view no longer asks users to opt in, and
+  authenticated task submitters can read the same streams through the task API. Provider-control
+  operations remain excluded, and runs rejected before an agent starts have no process output.
+
 ## [0.3.26] - 2026-10-26
 
 Steward v0.3.26 adds an optional Mint `HTTPRoute` to the Steward chart so installations can publish

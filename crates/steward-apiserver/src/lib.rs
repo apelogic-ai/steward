@@ -357,6 +357,7 @@ pub struct GrantRevocationRequest {
         task_inputs_contract,
         task_execute_contract,
         task_status_contract,
+        task_logs_contract,
         task_outputs_contract,
         task_delete_contract,
         browser_auth::session,
@@ -738,6 +739,29 @@ pub async fn task_execute_contract() {}
 )]
 #[doc(hidden)]
 pub async fn task_status_contract() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{taskUid}/logs/{stream}",
+    params(
+        ("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity"),
+        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr"),
+        ("after" = Option<usize>, Query, description = "Byte offset for the next bounded JSON chunk; omit for the complete text stream")
+    ),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 200, content(
+            (agent_runs_ui::BrowserExecutionLogResponse = "application/json"),
+            (String = "text/plain")
+        )),
+        (status = 400, description = "taskUid or byte offset is invalid", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task or stream is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_logs_contract() {}
 
 #[utoipa::path(
     get,
@@ -10387,6 +10411,53 @@ mod tests {
                             .find(|(candidate, _)| *candidate == task_uid)
                             .map(|(_, transcript)| transcript.clone())
                     })
+            })
+        }
+
+        fn task_execution_log<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            owner_user_id: &'a str,
+            stream: steward_store::AgentRunLogStream,
+        ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>> {
+            Box::pin(async move {
+                let task = TaskSubmissionLedger::task_for_submitter(
+                    self,
+                    task_uid,
+                    submitter_service,
+                    owner_user_id,
+                )
+                .await?;
+                let Some(task) = task else {
+                    return Ok(None);
+                };
+                let transcript = self
+                    .task_output_transcripts
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake Task transcript ledger lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .iter()
+                    .find(|(candidate, _)| *candidate == task_uid)
+                    .map(|(_, transcript)| transcript.clone());
+                let Some(transcript) = transcript else {
+                    return Ok(None);
+                };
+                let content = match stream {
+                    steward_store::AgentRunLogStream::Stdout => transcript.execution_stdout,
+                    steward_store::AgentRunLogStream::Stderr => transcript.execution_stderr,
+                };
+                Ok(content.map(|content| AgentRunExecutionLog {
+                    content,
+                    complete: matches!(
+                        task.phase,
+                        TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+                    ),
+                    partial: false,
+                }))
             })
         }
 
