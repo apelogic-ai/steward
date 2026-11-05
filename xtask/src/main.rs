@@ -133,8 +133,7 @@ fn ci() -> TaskResult {
     run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
-    conformance(&["--pinned".to_owned()])?;
-    e2e_hosted_litellm_aliases()
+    conformance(&["--pinned".to_owned()])
 }
 
 fn quality() -> TaskResult {
@@ -3547,7 +3546,7 @@ mod tests {
     }
 
     #[test]
-    fn real_hosted_litellm_alias_e2e_is_part_of_the_shared_ci_gate() -> Result<(), String> {
+    fn real_hosted_litellm_alias_e2e_is_part_of_the_pinned_ci_lane() -> Result<(), String> {
         let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
         let xtask_source = fs::read_to_string(root().join("xtask/src/main.rs"))
@@ -3555,11 +3554,14 @@ mod tests {
         let harness = fs::read_to_string(root().join("scripts/hosted-litellm-alias-e2e.sh"))
             .map_err(|error| format!("hosted LiteLLM alias harness is required: {error}"))?;
 
+        let shared_ci = xtask_source
+            .split_once("fn ci() -> TaskResult {\n")
+            .and_then(|(_before, after)| after.split_once("\n}\n\nfn quality()"))
+            .map(|(body, _after)| body)
+            .ok_or_else(|| "shared CI function could not be isolated".to_owned())?;
         assert!(
-            xtask_source.contains(
-                "conformance(&[\"--pinned\".to_owned()])?;\n    e2e_hosted_litellm_aliases()"
-            ),
-            "cargo xtask ci must run the real hosted LiteLLM alias integration"
+            !shared_ci.contains("e2e_hosted_litellm_aliases"),
+            "the real hosted LiteLLM integration must not extend the quality or release validation gate"
         );
         let pinned = ci
             .split_once("  conformance-pinned:\n")

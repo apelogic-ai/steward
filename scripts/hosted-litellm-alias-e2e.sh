@@ -107,7 +107,7 @@ if [[ -z "${port}" ]]; then
 fi
 base_url="http://127.0.0.1:${port}"
 for attempt in {1..120}; do
-  if curl -fsS "${base_url}/health/liveliness" >/dev/null 2>&1; then
+  if curl -fsS "${base_url}/health/readiness" >/dev/null 2>&1; then
     break
   fi
   if [[ "$(docker inspect --format '{{.State.Running}}' "${PROXY}" 2>/dev/null || true)" != "true" ]]; then
