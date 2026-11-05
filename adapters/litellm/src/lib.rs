@@ -183,7 +183,7 @@ impl InferencePlane for LiteLlmAdapter {
         } else {
             Err(PortError::Rejected {
                 reason: format!(
-                    "models are absent from the priced inference catalog: {}",
+                    "These models are not available: {}.",
                     unpriced
                         .iter()
                         .map(model_name)
@@ -314,7 +314,7 @@ struct ReportedUsage {
 }
 
 fn model_name(model: &ModelRef) -> String {
-    format!("{}/{}", model.provider, model.model)
+    model.model.clone()
 }
 
 fn budget_limit(budget: &Budget) -> Result<f64, PortError> {
@@ -1403,7 +1403,7 @@ mod tests {
         }];
         let catalog = json!({
             "data": [{
-                "model_name": "openai/unpriced-model",
+                "model_name": "unpriced-model",
                 "model_info": {
                     "input_cost_per_token": 0,
                     "output_cost_per_token": 0
@@ -1416,6 +1416,98 @@ mod tests {
             requested,
             "a zero-cost model must be rejected because it cannot enforce a spend budget"
         );
+    }
+
+    #[test]
+    fn priced_hosted_alias_is_found_without_deriving_a_provider_prefix() {
+        let requested = vec![ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "hosted-alias".to_owned(),
+        }];
+        let catalog = json!({
+            "data": [{
+                "model_name": "hosted-alias",
+                "model_info": {
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000002
+                },
+                "unknown_hosted_field": {"ignored": true}
+            }]
+        });
+
+        assert!(
+            unpriced_models(&catalog, &requested).is_empty(),
+            "the configured model alias must be compared exactly while unknown response fields are ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_hosted_alias_is_rejected_with_a_plain_named_error() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"data":[{"model_name":"other-alias","model_info":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002},"unknown_hosted_field":true}]}"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("configure hosted fake adapter: {error:?}"))?;
+        let models = [ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "unknown-alias".to_owned(),
+        }];
+        let budget = Budget {
+            monthly_limit: "1.00".to_owned(),
+            single_run_limit: None,
+            currency: "USD".to_owned(),
+        };
+
+        assert_eq!(
+            adapter.validate_configuration(&models, &budget).await,
+            Err(PortError::Rejected {
+                reason: "These models are not available: unknown-alias.".to_owned(),
+            })
+        );
+        let requests = server.finish()?;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("authorization: Bearer fixture-management-value"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hosted_alias_provisions_an_exact_runtime_key_allowlist() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"data":[{"model_name":"priced-model","model_info":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002},"unknown_hosted_field":true}]}"#,
+            "{}",
+            r#"{"key":"fixture-runtime-value","unknown_hosted_field":true}"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("configure hosted fake adapter: {error:?}"))?;
+
+        let provisioned = adapter
+            .provision(&request())
+            .await
+            .map_err(|error| format!("provision hosted alias: {error:?}"))?;
+
+        assert_eq!(
+            provisioned.credential.expose_secret(),
+            "fixture-runtime-value"
+        );
+        let requests = server.finish()?;
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("authorization: Bearer fixture-management-value"))
+        );
+        assert!(requests[0].starts_with("GET /v1/model/info "));
+        assert!(requests[1].starts_with("POST /key/delete "));
+        assert!(requests[2].starts_with("POST /key/generate "));
+        assert!(requests[2].contains(r#""models":["priced-model"]"#));
+        assert!(!requests[2].contains("openai/priced-model"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1490,7 +1582,7 @@ mod tests {
         let update = &requests[1];
         assert!(update.starts_with("POST /key/update "));
         assert!(update.contains(r#""key":"fixture-token-hash""#));
-        assert!(update.contains(r#""models":["openai/priced-model"]"#));
+        assert!(update.contains(r#""models":["priced-model"]"#));
         assert!(update.contains(r#""max_budget":0.5"#));
         assert!(
             !update.contains(r#""spend""#),
@@ -1507,7 +1599,7 @@ mod tests {
                 &json!({
                     "keys": [{
                         "token": "fixture-token-hash",
-                        "models": ["openai/priced-model"],
+                        "models": ["priced-model"],
                         "spend": 0.25,
                         "max_budget": 1.0,
                         "blocked": false

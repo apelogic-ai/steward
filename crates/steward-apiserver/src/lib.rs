@@ -4140,7 +4140,7 @@ mod tests {
                 command: vec![
                     "example-runner".to_owned(),
                     request.workflow_prompt.to_owned(),
-                    format!("{}/{}", request.model.provider, request.model.model),
+                    request.model.model.clone(),
                 ],
             })
         }
@@ -17813,7 +17813,7 @@ mod tests {
         );
         assert_eq!(
             task.agent_command.get(2).map(String::as_str),
-            Some("openai/gpt-5.4")
+            Some("gpt-5.4")
         );
         let api_task = &rows[1];
         assert_eq!(api_task.task_origin, TaskOrigin::Api);
