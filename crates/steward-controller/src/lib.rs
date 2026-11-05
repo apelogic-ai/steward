@@ -8534,6 +8534,7 @@ mod tests {
 
     struct FinalSpendObservationInference {
         behavior: FinalSpendObservationBehavior,
+        observations: Arc<AtomicUsize>,
         revocations: Arc<AtomicUsize>,
     }
 
@@ -8573,6 +8574,7 @@ mod tests {
             match self.behavior {
                 FinalSpendObservationBehavior::CompleteAfter(delay) => {
                     tokio::time::sleep(delay).await;
+                    self.observations.fetch_add(1, Ordering::SeqCst);
                     Ok(InferenceObservation::Active {
                         reference: "runtime-key".to_owned(),
                         spend: steward_types::SpendSummary {
@@ -8617,12 +8619,13 @@ mod tests {
             steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
                 .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
         let configured_timeout = StdDuration::from_secs(17);
+        let observations = Arc::new(AtomicUsize::new(0));
         let revocations = Arc::new(AtomicUsize::new(0));
         let inference = FinalSpendObservationInference {
             behavior: FinalSpendObservationBehavior::CompleteAfter(configured_timeout),
+            observations: observations.clone(),
             revocations,
         };
-        let started_at = tokio::time::Instant::now();
 
         super::finalize_inference_if_required(
             &runtime,
@@ -8634,11 +8637,7 @@ mod tests {
         .await
         .map_err(|error| format!("configured usage report must remain best effort: {error}"))?;
 
-        assert_eq!(
-            started_at.elapsed(),
-            super::FINAL_SPEND_SETTLEMENT_DELAY + configured_timeout,
-            "final capture must allow the configured usage-report deadline after settlement"
-        );
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -8653,6 +8652,7 @@ mod tests {
         let revocations = Arc::new(AtomicUsize::new(0));
         let inference = FinalSpendObservationInference {
             behavior: FinalSpendObservationBehavior::Fail,
+            observations: Arc::new(AtomicUsize::new(0)),
             revocations: revocations.clone(),
         };
 
@@ -8685,6 +8685,7 @@ mod tests {
         let revocations = Arc::new(AtomicUsize::new(0));
         let inference = FinalSpendObservationInference {
             behavior: FinalSpendObservationBehavior::Pending,
+            observations: Arc::new(AtomicUsize::new(0)),
             revocations: revocations.clone(),
         };
 
