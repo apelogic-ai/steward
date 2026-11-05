@@ -3410,19 +3410,26 @@ fn task_attempt_execution_command(
     } else {
         String::new()
     };
+    let transcript_truncation_marker = shell_quote(EXECUTION_TRANSCRIPT_TRUNCATION_MARKER);
+    let retained_transcript_bytes = MAX_EXECUTION_STREAM_BYTES
+        .saturating_sub(EXECUTION_TRANSCRIPT_TRUNCATION_MARKER.len() as u64);
     let execution = if capture_transcript {
         format!(
             "({command}) > {stdout_path} 2> {stderr_path}; status=$?; \
-             if ! stdout_size=$(wc -c < {stdout_path}) \
-                || ! stderr_size=$(wc -c < {stderr_path}); then status=70; \
-             else transcript_size=$((stdout_size + stderr_size)); \
-               if [ \"$stdout_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
-                  || [ \"$stderr_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
-                  || [ \"$transcript_size\" -gt {MAX_EXECUTION_TRANSCRIPT_BYTES} ]; then \
-                 printf '%s' transcript_too_large > {failure_reason_path}; \
-                 status=74; \
-               else cat {stdout_path}; cat {stderr_path} >&2; fi; \
-             fi"
+             bound_transcript() {{ path=$1; \
+               if size=$(wc -c < \"$path\"); then \
+                 case \"$size\" in ''|*[!0-9]*) return 0 ;; esac; \
+                 if [ \"$size\" -gt {MAX_EXECUTION_STREAM_BYTES} ]; then \
+                   tmp=\"$path.tmp\"; \
+                   if (printf '%s' {transcript_truncation_marker}; \
+                       tail -c {retained_transcript_bytes} \"$path\" \
+                         | head -c {retained_transcript_bytes}) > \"$tmp\"; then \
+                     mv \"$tmp\" \"$path\"; else rm -f \"$tmp\"; fi; \
+                 fi; \
+               fi; \
+             }}; \
+             bound_transcript {stdout_path}; bound_transcript {stderr_path}; \
+             cat {stdout_path}; cat {stderr_path} >&2"
         )
     } else {
         format!("{command}; status=$?")

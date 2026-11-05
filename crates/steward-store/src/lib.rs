@@ -5261,6 +5261,14 @@ impl PgStore {
             statement.push(" AND tasks.submitter_service = ");
             statement.push_bind(submitter_service);
         }
+        statement.push(match stream {
+            AgentRunLogStream::Stdout => {
+                " AND COALESCE(attempts.execution_stdout, attempts.live_execution_stdout) IS NOT NULL"
+            }
+            AgentRunLogStream::Stderr => {
+                " AND COALESCE(attempts.execution_stderr, attempts.live_execution_stderr) IS NOT NULL"
+            }
+        });
         statement
             .build()
             .fetch_optional(&self.pool)

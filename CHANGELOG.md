@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   active and after it succeeds or fails. The Agent Runs view no longer asks users to opt in, and
   authenticated task submitters can read the same streams through the task API. Provider-control
   operations remain excluded, and runs rejected before an agent starts have no process output.
+  Output beyond 4 MiB per stream keeps its bounded tail without changing the run result. Workflow
+  Tasks now keep their output in Agent Runs instead of also echoing it through controller logs.
 
 ### Security
 

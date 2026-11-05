@@ -246,10 +246,10 @@ after its Task succeeded; Steward 0.3.13 restores them. When diagnostics is miss
 delivered archive is `out/`-only.
 
 Each original process stream is retained verbatim up to 4 MiB; the combined bound is
-8 MiB. Exceeding either bound prevents a successful transcript result and returns the
-bounded `execution_transcript_too_large` failure category rather than truncating
-silently. The `.steward/diagnostics` namespace is reserved: agent output cannot create
-or replace these entries. Since Steward 0.3.11 the stored archive is validated as
+8 MiB. Output beyond either per-stream bound keeps the newest bytes after a visible truncation
+marker and never changes the agent's exit status. Delivery still rejects stored transcript data
+that exceeds these bounds. The `.steward/diagnostics` namespace is reserved: agent output cannot
+create or replace these entries. Since Steward 0.3.11 the stored archive is validated as
 `out/`-only (`steward.task-output/v1`). Since Steward 0.3.13 the runner download of a
 `full` Task is rebuilt from the validated `out/` directories and regular files with
 Steward-written ustar headers (a Steward-written PAX `path` record only for paths longer
