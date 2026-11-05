@@ -1131,6 +1131,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exponent_form_spend_outside_the_finite_range_is_not_expanded() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[{"api_key":"fixture-token-hash","spend":"1e10000","total_tokens":1}]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("extreme exponent blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                spend: SpendSummary { observed_amount, .. },
+                usage: None,
+                ..
+            } if observed_amount == "0.25"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unavailable_key_hash_does_not_block_budget_enforcement() -> Result<(), String> {
         for token_field in ["", r#","token":"""#, r#","token":17"#] {
             let body = format!(
