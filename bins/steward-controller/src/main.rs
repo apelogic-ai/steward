@@ -825,14 +825,17 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE, TlsListener,
+        DeploymentInferencePlane, GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE,
+        TlsListener,
         bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
         connections_bridge_startup_log, decode_tls_material, openshell_task_log_mode,
         parse_inference_mode, parse_litellm_spend_log_timeout, parse_runtime_controller_config,
         rustls_crypto_provider, verify_bridge_image_provenance,
         verify_connections_bridge_image_configuration,
     };
+    use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
     use steward_adapter_openshell::OpenShellTaskLogMode;
+    use steward_ports::InferencePlane;
 
     #[test]
     fn task_log_mode_accepts_unset_off_and_full() -> Result<(), String> {
@@ -900,6 +903,24 @@ mod tests {
                 "invalid timeout {invalid:?} was accepted"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_inference_plane_preserves_the_configured_usage_report_timeout()
+    -> Result<(), String> {
+        let plane = DeploymentInferencePlane::Stock(
+            LiteLlmAdapter::new_with_spend_log_timeout(
+                LiteLlmConfig {
+                    base_url: "http://127.0.0.1:1".to_owned(),
+                    master_key: "fixture-management-value".to_owned(),
+                },
+                Duration::from_secs(17),
+            )
+            .map_err(|error| format!("test inference plane configuration failed: {error:?}"))?,
+        );
+
+        assert_eq!(plane.usage_report_timeout(), Duration::from_secs(17));
         Ok(())
     }
 
