@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.26"
+          test "$version" = "0.3.27"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -969,16 +969,16 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.26 adds an optional Mint HTTPRoute to the Steward chart. When an operator enables it with explicit hostnames and Gateway parent references, the chart routes only the exact /token and /.well-known/jwks.json paths to the existing Mint Service. The route is disabled by default, and existing chart values keep their prior rendering.\n\n'
+            printf 'Steward v0.3.27 retains bounded stdout and stderr for every governed agent run and adds a task-authenticated GET /v1/tasks/{taskUid}/logs/{stream} endpoint for reading either stream while the run is active or after it ends. Existing execution-log off values remain accepted but no longer disable retention. Output beyond 4 MiB per stream keeps its bounded tail without changing the run exit status.\n\n'
+            printf 'This release also updates pulldown-cmark to 0.13.6 to resolve RUSTSEC-2026-0414 and RUSTSEC-2026-0433. The Codex and Claude Code reference runtimes install checksum-verified uv 0.11.15, which removes the vulnerable Rust zip 8.1.0 dependency and resolves CVE-2026-115905.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'No database migration is required when upgrading from v0.3.25. Deploy the chart and component images as one release unit.\n\n'
-            printf 'The Mint HTTPRoute is opt-in. Enabling it requires governed execution, at least one hostname, and at least one parent reference. The chart does not create the Gateway, listener, DNS record, or public certificate.\n\n'
-            printf 'Before rolling back to v0.3.25, remove the mint.httpRoute values before installing the older chart, and restore any Mint routing the installation managed outside the chart. No database rollback is required.\n\n'
+            printf 'No database or configuration migration is required when upgrading from v0.3.26. Deploy the chart, component images, and reference runtimes as one release unit, then update mirrored runtime digests and execution bindings to the v0.3.27 artifacts.\n\n'
+            printf 'Rolling back to v0.3.26 removes the task log endpoint and always-on stream retention and restores the earlier dependency and reference-runtime images, including the vulnerabilities corrected in v0.3.27. No database rollback is required.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
             printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
-            printf 'No action is required for existing installations. To route Mint through the chart, provide the Gateway listener, DNS record, and public certificate, then set mint.httpRoute.enabled, mint.httpRoute.hostnames, and mint.httpRoute.parentRefs.\n\n'
+            printf 'Replace mirrored v0.3.26 reference runtimes with the v0.3.27 digests and update execution bindings before starting new governed runs. No configuration change is required. Installations that previously selected execution-log off should review access to retained task output because that value is now a compatibility no-op.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1058,7 +1058,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.26.json
+          subject-path: dist/steward-product-compatibility-0.3.27.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1068,7 +1068,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.26.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.27.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

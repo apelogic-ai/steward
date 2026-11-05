@@ -69,7 +69,7 @@ Feature: J7 - User watches and stops a run
     Then the log holds every line printed before the run ended
     And I do not see "Live log · polling for new output…"
 
-  # F1. Updated after 0.3.26: every ordinary Agent run retains its streams.
+  # F1. Updated in 0.3.27: every ordinary Agent run retains its streams.
   @extended @needs-model
   Scenario: Every run exposes its execution log
     When I open "Runs"
