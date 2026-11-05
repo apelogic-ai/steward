@@ -7102,6 +7102,13 @@
           },
           "observedAmount": {
             "type": "string"
+          },
+          "totalTokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },

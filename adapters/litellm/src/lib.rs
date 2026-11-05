@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, PortError, ProvisionedInference,
+    InferenceRequest, InferenceUsage, PortError, ProvisionedInference,
 };
 use steward_types::{Budget, ModelRef, SpendSummary};
 
@@ -95,6 +95,35 @@ impl LiteLlmAdapter {
                 reason: "inference key lookup was unavailable".to_owned(),
             })?;
         self.response_json(response).await
+    }
+
+    async fn spend_logs(&self, key_hash: &str) -> Result<Option<ReportedUsage>, PortError> {
+        let response = self
+            .client
+            .get(format!("{}/spend/logs", self.base_url))
+            .bearer_auth(&self.master_key)
+            .query(&[("api_key", key_hash)])
+            .send()
+            .await
+            .map_err(|_| PortError::Failed {
+                reason: "inference usage report was unavailable".to_owned(),
+            })?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Ok(None);
+        }
+        let truncated = response
+            .headers()
+            .get("x-litellm-spend-logs-truncated")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let body = self.response_json(response).await?;
+        if truncated {
+            return Ok(None);
+        }
+        reported_usage(&body)
     }
 }
 
@@ -205,7 +234,12 @@ impl InferencePlane for LiteLlmAdapter {
     async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
         let alias = runtime_alias(&request.runtime.0);
         let body = self.list_alias(&alias).await?;
-        observation_from_key_list(request, &alias, &body)
+        let usage = match key_hash_from_key_list(&body)? {
+            KeyHash::Absent => return Ok(InferenceObservation::Absent),
+            KeyHash::Unavailable => None,
+            KeyHash::Available(key_hash) => self.spend_logs(&key_hash).await.unwrap_or_default(),
+        };
+        observation_from_key_list(request, &alias, &body, usage)
     }
 
     async fn revoke(&self, request: &InferenceRequest) -> Result<(), PortError> {
@@ -248,7 +282,12 @@ struct KeyInfo {
     models: Vec<String>,
     spend: Value,
     #[serde(default)]
-    token: Option<String>,
+    token: Option<Value>,
+}
+
+struct ReportedUsage {
+    observed_amount: String,
+    total_tokens: Option<i64>,
 }
 
 fn model_name(model: &ModelRef) -> String {
@@ -335,6 +374,7 @@ fn observation_from_key_list(
     request: &InferenceRequest,
     reference: &str,
     response: &Value,
+    reported: Option<ReportedUsage>,
 ) -> Result<InferenceObservation, PortError> {
     let keys = response
         .get("keys")
@@ -354,13 +394,13 @@ fn observation_from_key_list(
     let info: KeyInfo = serde_json::from_value(key.clone()).map_err(|_| PortError::Failed {
         reason: "inference key info omitted spend enforcement fields".to_owned(),
     })?;
-    let spend = value_number(&info.spend).ok_or_else(|| PortError::Failed {
+    let key_spend = value_number(&info.spend).ok_or_else(|| PortError::Failed {
         reason: "inference key spend was not numeric".to_owned(),
     })?;
     let max_budget = value_number(&info.max_budget).ok_or_else(|| PortError::Failed {
         reason: "inference key budget was not numeric".to_owned(),
     })?;
-    if !spend.is_finite() || !max_budget.is_finite() || spend < 0.0 || max_budget <= 0.0 {
+    if !key_spend.is_finite() || !max_budget.is_finite() || key_spend < 0.0 || max_budget <= 0.0 {
         return Err(PortError::Failed {
             reason: "inference key returned invalid spend enforcement values".to_owned(),
         });
@@ -372,27 +412,178 @@ fn observation_from_key_list(
         },
         currency: request.budget.currency.clone(),
     };
-    let observation = if info.blocked.unwrap_or(false) || spend_amount(&spend)? >= max_budget {
+    let usage = reported.map(|reported| InferenceUsage {
+        spend: SpendSummary {
+            observed_amount: reported.observed_amount,
+            currency: request.budget.currency.clone(),
+        },
+        total_tokens: reported.total_tokens,
+    });
+    let observation = if info.blocked.unwrap_or(false) || key_spend >= max_budget {
         InferenceObservation::Exhausted {
             reference: reference.to_owned(),
             spend,
+            usage,
         }
     } else {
         InferenceObservation::Active {
             reference: reference.to_owned(),
             spend,
+            usage,
         }
     };
     Ok(observation)
 }
 
-fn spend_amount(spend: &SpendSummary) -> Result<f64, PortError> {
-    spend
-        .observed_amount
-        .parse()
-        .map_err(|_| PortError::Failed {
-            reason: "inference key spend was not numeric".to_owned(),
-        })
+enum KeyHash {
+    Absent,
+    Available(String),
+    Unavailable,
+}
+
+fn key_hash_from_key_list(response: &Value) -> Result<KeyHash, PortError> {
+    let keys = response
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PortError::Failed {
+            reason: "inference key list omitted the keys collection".to_owned(),
+        })?;
+    let [key] = keys.as_slice() else {
+        return if keys.is_empty() {
+            Ok(KeyHash::Absent)
+        } else {
+            Err(PortError::Failed {
+                reason: "inference runtime must resolve to exactly one virtual key".to_owned(),
+            })
+        };
+    };
+    Ok(key
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .map_or(KeyHash::Unavailable, KeyHash::Available))
+}
+
+fn reported_usage(response: &Value) -> Result<Option<ReportedUsage>, PortError> {
+    let logs = response
+        .as_array()
+        .or_else(|| response.get("data").and_then(Value::as_array))
+        .ok_or_else(|| PortError::Failed {
+            reason: "inference usage report omitted the request collection".to_owned(),
+        })?;
+    if response.get("data").is_some() {
+        let incomplete_total = response
+            .get("total")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > logs.len() as u64);
+        let multiple_pages = response
+            .get("total_pages")
+            .and_then(Value::as_u64)
+            .is_some_and(|pages| pages > 1);
+        if incomplete_total || multiple_pages {
+            return Ok(None);
+        }
+    }
+    let mut spend = "0".to_owned();
+    let mut total_tokens = Some(0_i64);
+    for log in logs {
+        let amount = log
+            .get("spend")
+            .and_then(value_decimal)
+            .ok_or_else(|| PortError::Failed {
+                reason: "inference usage report returned an invalid spend amount".to_owned(),
+            })?;
+        spend = add_decimal_amount(&spend, &amount).ok_or_else(|| PortError::Failed {
+            reason: "inference usage report returned an invalid spend amount".to_owned(),
+        })?;
+        total_tokens = total_tokens.and_then(|total| {
+            log.get("total_tokens")
+                .and_then(Value::as_i64)
+                .filter(|tokens| *tokens >= 0)
+                .and_then(|tokens| total.checked_add(tokens))
+        });
+    }
+    Ok(Some(ReportedUsage {
+        observed_amount: spend,
+        total_tokens,
+    }))
+}
+
+fn value_decimal(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => decimal_parts(value).map(|_| value.clone()),
+        Value::Number(value) => {
+            let value = value.to_string();
+            decimal_parts(&value).is_some().then_some(value)
+        }
+        _ => None,
+    }
+}
+
+fn add_decimal_amount(left: &str, right: &str) -> Option<String> {
+    let (left_integer, left_fractional) = decimal_parts(left)?;
+    let (right_integer, right_fractional) = decimal_parts(right)?;
+    let scale = left_fractional.len().max(right_fractional.len());
+    let mut left_digits = decimal_digits(left_integer, left_fractional);
+    let mut right_digits = decimal_digits(right_integer, right_fractional);
+    left_digits.extend(std::iter::repeat_n(0, scale - left_fractional.len()));
+    right_digits.extend(std::iter::repeat_n(0, scale - right_fractional.len()));
+    let width = left_digits.len().max(right_digits.len());
+    left_digits.splice(0..0, std::iter::repeat_n(0, width - left_digits.len()));
+    right_digits.splice(0..0, std::iter::repeat_n(0, width - right_digits.len()));
+
+    let mut carry = 0;
+    let mut sum = Vec::with_capacity(width + 1);
+    for (left, right) in left_digits.into_iter().zip(right_digits).rev() {
+        let value = left + right + carry;
+        sum.push(value % 10);
+        carry = value / 10;
+    }
+    if carry > 0 {
+        sum.push(carry);
+    }
+    sum.reverse();
+    let first_nonzero = sum
+        .iter()
+        .position(|digit| *digit != 0)
+        .unwrap_or(sum.len().saturating_sub(scale + 1));
+    let mut text = sum[first_nonzero..]
+        .iter()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect::<String>();
+    if scale > 0 {
+        if text.len() <= scale {
+            text.insert_str(0, &"0".repeat(scale + 1 - text.len()));
+        }
+        text.insert(text.len() - scale, '.');
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    Some(text)
+}
+
+fn decimal_parts(value: &str) -> Option<(&str, &str)> {
+    let mut parts = value.split('.');
+    let integer = parts.next()?;
+    let fractional = parts.next().unwrap_or_default();
+    (parts.next().is_none()
+        && !integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fractional.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some((integer, fractional))
+}
+
+fn decimal_digits(integer: &str, fractional: &str) -> Vec<u8> {
+    integer
+        .bytes()
+        .chain(fractional.bytes())
+        .map(|byte| byte - b'0')
+        .collect()
 }
 
 fn configuration_update(
@@ -432,7 +623,10 @@ fn configuration_update(
     }
     let token = info
         .token
+        .as_ref()
+        .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
+        .map(str::to_owned)
         .ok_or_else(|| PortError::Failed {
             reason: "inference key info omitted its update identifier".to_owned(),
         })?;
@@ -452,7 +646,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
-    use steward_ports::{InferenceObservation, InferencePlane, InferenceRequest, PortError};
+    use steward_ports::{
+        InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage, PortError,
+    };
     use steward_types::{Budget, ModelRef, RuntimeId, SpendSummary};
 
     use super::{
@@ -477,6 +673,29 @@ mod tests {
             responses: Vec<&str>,
             request_timeout: Duration,
         ) -> Result<Self, String> {
+            Self::start_with_statuses(
+                responses.into_iter().map(|body| (200, body)).collect(),
+                request_timeout,
+            )
+        }
+
+        fn start_with_statuses(
+            responses: Vec<(u16, &str)>,
+            request_timeout: Duration,
+        ) -> Result<Self, String> {
+            Self::start_with_headers(
+                responses
+                    .into_iter()
+                    .map(|(status, body)| (status, body, ""))
+                    .collect(),
+                request_timeout,
+            )
+        }
+
+        fn start_with_headers(
+            responses: Vec<(u16, &str, &str)>,
+            request_timeout: Duration,
+        ) -> Result<Self, String> {
             let listener = TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|error| format!("failed to bind mock LiteLLM: {error}"))?;
             listener
@@ -487,9 +706,12 @@ mod tests {
                 .map_err(|error| format!("failed to read mock LiteLLM address: {error}"))?;
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server_requests = requests.clone();
-            let responses = responses.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let responses = responses
+                .into_iter()
+                .map(|(status, body, headers)| (status, body.to_owned(), headers.to_owned()))
+                .collect::<Vec<_>>();
             let server = thread::spawn(move || {
-                for response_body in responses {
+                for (status, response_body, response_headers) in responses {
                     let deadline = Instant::now() + request_timeout;
                     let (mut stream, _) = loop {
                         match listener.accept() {
@@ -514,7 +736,7 @@ mod tests {
                         .lock()
                         .map_err(|_| "mock LiteLLM request lock was poisoned".to_owned())?
                         .push(request);
-                    write_response(&mut stream, &response_body)?;
+                    write_response(&mut stream, status, &response_headers, &response_body)?;
                 }
                 Ok(())
             });
@@ -542,7 +764,7 @@ mod tests {
                 r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false,"hosted_extension":"ignored"}]}"#,
                 spend_logs,
             ],
-            Duration::from_millis(500),
+            MOCK_REQUEST_TIMEOUT,
         )?;
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
             base_url: server.base_url.clone(),
@@ -556,7 +778,11 @@ mod tests {
             .map_err(|error| format!("hosted spend observation failed: {error:?}"))?;
         let requests = server.finish()?;
 
-        assert_eq!(requests.len(), 2, "one exact key lookup and one spend-log read are required");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one exact key lookup and one spend-log read are required"
+        );
         assert!(requests[0].starts_with("GET /key/list?"));
         assert!(requests[1].starts_with("GET /spend/logs?api_key=fixture-token-hash "));
         assert!(requests[1].contains("authorization: Bearer fixture-management-value"));
@@ -565,11 +791,18 @@ mod tests {
             InferenceObservation::Active {
                 reference: super::runtime_alias("runtime-a"),
                 spend: SpendSummary {
-                    observed_amount: "0.02".to_owned(),
+                    observed_amount: "0".to_owned(),
                     currency: "USD".to_owned(),
                 },
+                usage: Some(InferenceUsage {
+                    spend: SpendSummary {
+                        observed_amount: "0.02".to_owned(),
+                        currency: "USD".to_owned(),
+                    },
+                    total_tokens: Some(250),
+                }),
             },
-            "request-level logs must replace a stale hosted key counter"
+            "request-level logs must remain separate from the enforcement counter"
         );
         Ok(())
     }
@@ -594,6 +827,269 @@ mod tests {
             ],"total":2,"page":1,"page_size":50,"total_pages":1}"#,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn request_log_spend_is_summed_without_floating_point_rounding() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[{"spend":0.1,"total_tokens":1},{"spend":0.2,"total_tokens":1}]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("exact usage report failed: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                usage: Some(InferenceUsage {
+                    spend: SpendSummary { observed_amount, .. },
+                    total_tokens: Some(2),
+                }),
+                ..
+            } if observed_amount == "0.3"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refused_request_logs_are_not_reported_as_key_spend() -> Result<(), String> {
+        let server = MockLiteLlm::start_with_statuses(
+            vec![
+                (
+                    200,
+                    r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+                ),
+                (403, r#"{"detail":"not permitted"}"#),
+            ],
+            MOCK_REQUEST_TIMEOUT,
+        )?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter.observe(&request()).await.map_err(|error| {
+            format!("refused usage report must preserve enforcement: {error:?}")
+        })?;
+        server.finish()?;
+
+        assert_eq!(
+            observation,
+            InferenceObservation::Active {
+                reference: super::runtime_alias("runtime-a"),
+                spend: SpendSummary {
+                    observed_amount: "0.25".to_owned(),
+                    currency: "USD".to_owned(),
+                },
+                usage: None,
+            },
+            "a key counter may enforce a budget but must not become reported run usage"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_key_hash_does_not_block_budget_enforcement() -> Result<(), String> {
+        for token_field in ["", r#","token":"""#, r#","token":17"#] {
+            let body = format!(
+                r#"{{"keys":[{{"models":["openai/priced-model"],"spend":1.0,"max_budget":1.0,"blocked":false{token_field}}}]}}"#
+            );
+            let server = MockLiteLlm::start(vec![body.as_str()])?;
+            let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+                base_url: server.base_url.clone(),
+                master_key: "fixture-management-value".to_owned(),
+            })
+            .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+            let observation = adapter.observe(&request()).await.map_err(|error| {
+                format!("unavailable report key blocked enforcement: {error:?}")
+            })?;
+            server.finish()?;
+
+            assert!(matches!(
+                observation,
+                InferenceObservation::Exhausted {
+                    spend: SpendSummary { observed_amount, .. },
+                    usage: None,
+                    ..
+                } if observed_amount == "1.0"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_total_tokens_leave_only_tokens_unreported() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[{"spend":0.02,"prompt_tokens":200,"completion_tokens":50}]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("usage report without token total failed: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                usage: Some(InferenceUsage {
+                    total_tokens: None,
+                    ..
+                }),
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_request_log_spend_is_not_reported() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[{"spend":-0.01,"total_tokens":1}]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("invalid usage report blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                spend: SpendSummary { observed_amount, .. },
+                usage: None,
+                ..
+            } if observed_amount == "0"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incomplete_request_log_page_is_not_reported() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+            r#"{"data":[{"spend":0.02,"total_tokens":250}],"total":2,"page":1,"page_size":1,"total_pages":2}"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("incomplete usage report blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                spend: SpendSummary { observed_amount, .. },
+                usage: None,
+                ..
+            } if observed_amount == "0.25"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncated_request_logs_are_not_reported() -> Result<(), String> {
+        let server = MockLiteLlm::start_with_headers(
+            vec![
+                (
+                    200,
+                    r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+                    "",
+                ),
+                (
+                    200,
+                    r#"[{"spend":0.02,"total_tokens":250}]"#,
+                    "x-litellm-spend-logs-truncated: true\r\n",
+                ),
+            ],
+            MOCK_REQUEST_TIMEOUT,
+        )?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("truncated usage report blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                spend: SpendSummary { observed_amount, .. },
+                usage: None,
+                ..
+            } if observed_amount == "0.25"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_logs_do_not_weaken_key_budget_enforcement() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":1.0,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[{"spend":0.02,"total_tokens":250}]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("reported usage weakened enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Exhausted {
+                spend: SpendSummary { observed_amount, .. },
+                usage: Some(InferenceUsage {
+                    spend: SpendSummary {
+                        observed_amount: reported_amount,
+                        ..
+                    },
+                    total_tokens: Some(250),
+                }),
+                ..
+            } if observed_amount == "1.0" && reported_amount == "0.02"
+        ));
+        Ok(())
     }
 
     fn request() -> InferenceRequest {
@@ -749,6 +1245,7 @@ mod tests {
                     "blocked": false
                 }]
             }),
+            None,
         )
         .map_err(|error| format!("key info must be readable: {error:?}"))?;
 
@@ -760,6 +1257,7 @@ mod tests {
                     observed_amount: "1.0".to_owned(),
                     currency: "USD".to_owned(),
                 },
+                usage: None,
             },
             "spend at the hard limit must drive the runtime to exhaustion"
         );
@@ -778,6 +1276,7 @@ mod tests {
                     "blocked": null
                 }]
             }),
+            None,
         )
         .map_err(|error| format!("pinned LiteLLM key info must be readable: {error:?}"))?;
 
@@ -789,6 +1288,7 @@ mod tests {
                     observed_amount: "0.25".to_owned(),
                     currency: "USD".to_owned(),
                 },
+                usage: None,
             },
             "a null blocked field in pinned LiteLLM 1.93.0 means the key is not blocked"
         );
@@ -838,9 +1338,19 @@ mod tests {
         Ok(bytes.len() >= header_end + 4 + content_length)
     }
 
-    fn write_response(stream: &mut TcpStream, body: &str) -> Result<(), String> {
+    fn write_response(
+        stream: &mut TcpStream,
+        status: u16,
+        headers: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let reason = if status == 200 {
+            "OK"
+        } else {
+            "Fixture response"
+        };
         let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
         stream

@@ -681,8 +681,12 @@ preserve the same immutable coordinates and cross-component relationships.
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
    `config.controller.litellmUrl` is the LiteLLM management API base URL. The
-   controller appends `/key/delete`, `/key/list`, `/key/generate`, and
-   `/v1/model/info`; do not add an operation path to that value.
+   controller appends `/key/delete`, `/key/list`, `/key/generate`,
+   `/spend/logs`, and `/v1/model/info`; do not add an operation path to that
+   value. The management credential must be allowed to read request spend logs
+   for the runtime key hash returned by `/key/list`. If LiteLLM refuses that
+   read, Steward continues to enforce the key budget but Agent Runs shows spend
+   and tokens as `Not reported`; it never substitutes the key budget counter.
 
    Every model admitted by the capability catalog must have pricing configured
    in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,

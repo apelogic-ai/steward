@@ -47,8 +47,8 @@ use steward_controller::{
 };
 use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, InferenceCapabilities,
-    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, PortError,
-    ProviderControlExecutionBindings, ProvisionedInference,
+    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
+    PortError, ProviderControlExecutionBindings, ProvisionedInference,
     SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
     SandboxTaskTranscript, TaskAttemptId, TaskExecutionAdapter, TaskExecutionPlan,
@@ -58,7 +58,7 @@ use steward_store::{
     AgentRunLogStream, AgentRunTimelineKind, BrowserMemberStateAction, BrowserMemberStateChange,
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
     EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER, ManagedInferenceKeyCipher,
-    PgStore, StoreError, TaskActivationObservation, TaskCleanupObservation,
+    PgStore, ReportedInferenceUsage, StoreError, TaskActivationObservation, TaskCleanupObservation,
     TaskExecutionObservation, TaskExecutionTransition, TaskOperationTransition,
     TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest, WorkflowPublication,
 };
@@ -2254,7 +2254,12 @@ impl InferencePlane for ActiveInference {
             })?
             .pop_front();
         let observed_amount = match sequenced_amount {
-            Some(amount) => amount,
+            Some(amount) => {
+                *self.observed_spend.lock().map_err(|_| PortError::Failed {
+                    reason: "fixture inference spend lock was poisoned".to_owned(),
+                })? = Some(amount.clone());
+                amount
+            }
             None => self
                 .observed_spend
                 .lock()
@@ -2271,12 +2276,20 @@ impl InferencePlane for ActiveInference {
         if self.report_exhausted.load(Ordering::SeqCst) {
             return Ok(InferenceObservation::Exhausted {
                 reference: format!("inference-{}", request.runtime.0),
-                spend: observation,
+                spend: observation.clone(),
+                usage: Some(InferenceUsage {
+                    spend: observation,
+                    total_tokens: None,
+                }),
             });
         }
         Ok(InferenceObservation::Active {
             reference: format!("inference-{}", request.runtime.0),
-            spend: observation,
+            spend: observation.clone(),
+            usage: Some(InferenceUsage {
+                spend: observation,
+                total_tokens: None,
+            }),
         })
     }
 
@@ -3467,6 +3480,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             false,
+            Some(ReportedInferenceUsage {
+                observed_amount: "40.00".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     store
@@ -3479,6 +3496,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             false,
+            Some(ReportedInferenceUsage {
+                observed_amount: "40.00".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -3502,6 +3523,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.40".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     store
@@ -3514,6 +3539,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             false,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.55".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     store
@@ -3526,6 +3555,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.40".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -3559,6 +3592,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.80".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -3805,8 +3842,44 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "12.50".to_owned(),
+                total_tokens: Some(250),
+            }),
         )
         .await?;
+
+    let reported_usage = store
+        .agent_run(task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("agent run with reported usage is absent"))?
+        .spend
+        .ok_or_else(|| io::Error::other("reported agent run usage is absent"))?;
+    assert_eq!(reported_usage.observed_amount, "12.50");
+    assert_eq!(reported_usage.total_tokens, Some(250));
+
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "110.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+            None,
+        )
+        .await?;
+    assert!(
+        store
+            .agent_run(task_uid)
+            .await?
+            .ok_or_else(|| io::Error::other("agent run with unavailable usage is absent"))?
+            .spend
+            .is_none(),
+        "an enforcement-only key counter must not be reported as run usage"
+    );
 
     let escalation = store
         .admin_escalations()
@@ -3903,6 +3976,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "130.00".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(

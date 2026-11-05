@@ -415,15 +415,23 @@ pub struct ProvisionedInference {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceUsage {
+    pub spend: SpendSummary,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InferenceObservation {
     Absent,
     Active {
         reference: String,
         spend: SpendSummary,
+        usage: Option<InferenceUsage>,
     },
     Exhausted {
         reference: String,
         spend: SpendSummary,
+        usage: Option<InferenceUsage>,
     },
 }
 

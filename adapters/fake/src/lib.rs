@@ -6,9 +6,9 @@ use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
     GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest,
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, Notification, NotificationSink, PolicySink, PortError, ProvisionedInference,
-    SessionEvent, SessionRelay, StreamGranularity, SvidAssertion, SvidValidationError,
-    ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
+    InferenceRequest, InferenceUsage, Notification, NotificationSink, PolicySink, PortError,
+    ProvisionedInference, SessionEvent, SessionRelay, StreamGranularity, SvidAssertion,
+    SvidValidationError, ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
 };
 use steward_types::direct_package::{RepositoryUrl, StableProviderId};
 use steward_types::{RuntimeId, SpendSummary};
@@ -72,6 +72,13 @@ impl InferencePlane for FakeAdapter {
                 observed_amount: "0".to_owned(),
                 currency: request.budget.currency.clone(),
             },
+            usage: Some(InferenceUsage {
+                spend: SpendSummary {
+                    observed_amount: "0".to_owned(),
+                    currency: request.budget.currency.clone(),
+                },
+                total_tokens: None,
+            }),
         })
     }
 
