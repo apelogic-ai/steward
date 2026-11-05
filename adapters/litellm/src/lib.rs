@@ -696,6 +696,21 @@ mod tests {
             responses: Vec<(u16, &str, &str)>,
             request_timeout: Duration,
         ) -> Result<Self, String> {
+            Self::start_with_response_delays(
+                responses
+                    .into_iter()
+                    .map(|(status, body, headers)| {
+                        (status, body, headers, Duration::from_secs(0))
+                    })
+                    .collect(),
+                request_timeout,
+            )
+        }
+
+        fn start_with_response_delays(
+            responses: Vec<(u16, &str, &str, Duration)>,
+            request_timeout: Duration,
+        ) -> Result<Self, String> {
             let listener = TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|error| format!("failed to bind mock LiteLLM: {error}"))?;
             listener
@@ -708,10 +723,12 @@ mod tests {
             let server_requests = requests.clone();
             let responses = responses
                 .into_iter()
-                .map(|(status, body, headers)| (status, body.to_owned(), headers.to_owned()))
+                .map(|(status, body, headers, delay)| {
+                    (status, body.to_owned(), headers.to_owned(), delay)
+                })
                 .collect::<Vec<_>>();
             let server = thread::spawn(move || {
-                for (status, response_body, response_headers) in responses {
+                for (status, response_body, response_headers, delay) in responses {
                     let deadline = Instant::now() + request_timeout;
                     let (mut stream, _) = loop {
                         match listener.accept() {
@@ -736,6 +753,7 @@ mod tests {
                         .lock()
                         .map_err(|_| "mock LiteLLM request lock was poisoned".to_owned())?
                         .push(request);
+                    thread::sleep(delay);
                     write_response(&mut stream, status, &response_headers, &response_body)?;
                 }
                 Ok(())
@@ -811,8 +829,8 @@ mod tests {
     async fn flat_request_logs_supply_hosted_run_spend() -> Result<(), String> {
         assert_request_logs_supply_run_spend(
             r#"[
-                {"spend":0.0125,"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"hosted_extension":"ignored"},
-                {"spend":0.0075,"prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"hosted_extension":"ignored"}
+                {"api_key":"fixture-token-hash","spend":0.0125,"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"hosted_extension":"ignored"},
+                {"api_key":"fixture-token-hash","spend":0.0075,"prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"hosted_extension":"ignored"}
             ]"#,
         )
         .await
@@ -822,8 +840,8 @@ mod tests {
     async fn data_envelope_request_logs_supply_bundled_run_spend() -> Result<(), String> {
         assert_request_logs_supply_run_spend(
             r#"{"data":[
-                {"spend":"0.0125","prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"bundled_extension":true},
-                {"spend":"0.0075","prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"bundled_extension":true}
+                {"api_key":"fixture-token-hash","spend":"0.0125","prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"bundled_extension":true},
+                {"api_key":"fixture-token-hash","spend":"0.0075","prompt_tokens":80,"completion_tokens":20,"total_tokens":100,"bundled_extension":true}
             ],"total":2,"page":1,"page_size":50,"total_pages":1}"#,
         )
         .await
@@ -833,7 +851,7 @@ mod tests {
     async fn request_log_spend_is_summed_without_floating_point_rounding() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
             r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false}]}"#,
-            r#"[{"spend":0.1,"total_tokens":1},{"spend":0.2,"total_tokens":1}]"#,
+            r#"[{"api_key":"fixture-token-hash","spend":0.1,"total_tokens":1},{"api_key":"fixture-token-hash","spend":0.2,"total_tokens":1}]"#,
         ])?;
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
             base_url: server.base_url.clone(),
@@ -899,6 +917,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_request_logs_are_not_reported_as_zero_usage() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+            "[]",
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("empty usage report blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                spend: SpendSummary { observed_amount, .. },
+                usage: None,
+                ..
+            } if observed_amount == "0.25"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_request_logs_do_not_delay_budget_enforcement() -> Result<(), String> {
+        let server = MockLiteLlm::start_with_response_delays(
+            vec![
+                (
+                    200,
+                    r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+                    "",
+                    Duration::from_secs(0),
+                ),
+                (
+                    200,
+                    r#"[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}]"#,
+                    "",
+                    Duration::from_millis(2_200),
+                ),
+            ],
+            MOCK_REQUEST_TIMEOUT,
+        )?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observed = tokio::time::timeout(Duration::from_millis(2_100), adapter.observe(&request()))
+            .await;
+        let server_result = server.finish();
+        let observation = observed
+            .map_err(|_| "slow usage reporting delayed budget enforcement".to_owned())?
+            .map_err(|error| format!("slow usage report blocked enforcement: {error:?}"))?;
+        server_result?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                spend: SpendSummary { observed_amount, .. },
+                usage: None,
+                ..
+            } if observed_amount == "0.25"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_logs_include_only_the_requested_key_hash() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[
+                {"api_key":"another-key-hash","spend":9.99,"total_tokens":999},
+                {"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}
+            ]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("mixed usage report blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                usage: Some(InferenceUsage {
+                    spend: SpendSummary { observed_amount, .. },
+                    total_tokens: Some(250),
+                }),
+                ..
+            } if observed_amount == "0.02"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exponent_form_request_log_spend_is_aggregated_exactly() -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
+            r#"[{"api_key":"fixture-token-hash","spend":"1.5e-05","total_tokens":1}]"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+
+        let observation = adapter
+            .observe(&request())
+            .await
+            .map_err(|error| format!("exponent usage report blocked enforcement: {error:?}"))?;
+        server.finish()?;
+
+        assert!(matches!(
+            observation,
+            InferenceObservation::Active {
+                usage: Some(InferenceUsage {
+                    spend: SpendSummary { observed_amount, .. },
+                    total_tokens: Some(1),
+                }),
+                ..
+            } if observed_amount == "0.000015"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unavailable_key_hash_does_not_block_budget_enforcement() -> Result<(), String> {
         for token_field in ["", r#","token":"""#, r#","token":17"#] {
             let body = format!(
@@ -932,7 +1088,7 @@ mod tests {
     async fn absent_total_tokens_leave_only_tokens_unreported() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
             r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false}]}"#,
-            r#"[{"spend":0.02,"prompt_tokens":200,"completion_tokens":50}]"#,
+            r#"[{"api_key":"fixture-token-hash","spend":0.02,"prompt_tokens":200,"completion_tokens":50}]"#,
         ])?;
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
             base_url: server.base_url.clone(),
@@ -963,7 +1119,7 @@ mod tests {
     async fn invalid_request_log_spend_is_not_reported() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
             r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0,"max_budget":1.0,"blocked":false}]}"#,
-            r#"[{"spend":-0.01,"total_tokens":1}]"#,
+            r#"[{"api_key":"fixture-token-hash","spend":-0.01,"total_tokens":1}]"#,
         ])?;
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
             base_url: server.base_url.clone(),
@@ -992,7 +1148,7 @@ mod tests {
     async fn incomplete_request_log_page_is_not_reported() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
             r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
-            r#"{"data":[{"spend":0.02,"total_tokens":250}],"total":2,"page":1,"page_size":1,"total_pages":2}"#,
+            r#"{"data":[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}],"total":2,"page":1,"page_size":1,"total_pages":2}"#,
         ])?;
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
             base_url: server.base_url.clone(),
@@ -1028,7 +1184,7 @@ mod tests {
                 ),
                 (
                     200,
-                    r#"[{"spend":0.02,"total_tokens":250}]"#,
+                    r#"[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}]"#,
                     "x-litellm-spend-logs-truncated: true\r\n",
                 ),
             ],
@@ -1061,7 +1217,7 @@ mod tests {
     async fn request_logs_do_not_weaken_key_budget_enforcement() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
             r#"{"keys":[{"token":"fixture-token-hash","models":["openai/priced-model"],"spend":1.0,"max_budget":1.0,"blocked":false}]}"#,
-            r#"[{"spend":0.02,"total_tokens":250}]"#,
+            r#"[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}]"#,
         ])?;
         let adapter = LiteLlmAdapter::new(LiteLlmConfig {
             base_url: server.base_url.clone(),
