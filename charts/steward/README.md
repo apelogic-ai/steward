@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.27` and application `0.3.27`.
+Current release contract: chart `0.3.28` and application `0.3.28`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -906,6 +906,9 @@ Steward release namespace also creates `steward-workflows`.
   accepts `12` through `60`. It controls how often a running inference-backed
   runtime refreshes observed spend; Steward refuses values shorter than the
   initial final-spend delay or longer than the controller's requeue ceiling.
+- `config.controller.litellmSpendLogTimeoutSeconds` defaults to `10` seconds
+  and accepts whole values of at least `1`. It limits each LiteLLM request-log
+  read used to report a run's spend and token usage.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

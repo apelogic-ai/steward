@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.27`. The release workflow pulls the published OCI
+Release contract: chart `0.3.28`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -680,18 +680,20 @@ preserve the same immutable coordinates and cross-component relationships.
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
-   `config.controller.litellmUrl` is the LiteLLM management API base URL. In
-   Steward 0.3.27, the controller appends `/key/delete`, `/key/list`,
-   `/key/generate`, and `/v1/model/info`; do not add an operation path to that
-   value. Beginning with the next release, it also appends `/spend/logs`. The
+   `config.controller.litellmUrl` is the LiteLLM management API base URL. The
+   controller appends `/key/delete`, `/key/list`, `/key/generate`, and
+   `/v1/model/info`; do not add an operation path to that value. Beginning with
+   Steward 0.3.28, it also appends `/spend/logs`. The
    LiteLLM management credential must be allowed to read request logs for
    runtime key hashes. If LiteLLM refuses that read, budget enforcement
    continues but Agent Runs shows spend and tokens as `Not reported`.
+   `config.controller.litellmSpendLogTimeoutSeconds` limits each request-log
+   read, defaults to 10 seconds, and accepts whole values of at least 1 second.
 
    Every model admitted by the capability catalog must have pricing configured
    in LiteLLM. In Steward 0.3.27, LiteLLM `model_name` must equal the exact
    provider-qualified catalog model string (for example `openai/model-name`).
-   Beginning with the next release, `model_name` must instead equal the exact
+   Beginning with Steward 0.3.28, `model_name` must instead equal the exact
    capability-catalog `model`, which may be a deployment-defined alias with no
    provider prefix. Steward sends that alias unchanged; the separate catalog
    `provider` selects compatible execution bindings.
