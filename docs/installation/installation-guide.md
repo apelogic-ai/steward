@@ -278,14 +278,42 @@ required normalized fields are `manifestSchemaVersion`, `version`,
 v0.7.0 or later and immutable commits. The deprecated
 `governedJobContainerImage` field remains accepted for older installation
 values, but the active versioned workflow generator does not use it. This value
-binds generated workflows to the same
-steward-run release selected for the installation.
+records the reviewed steward-run release selected for the installation. The
+`workflowRef` option below is an unreleased addition after chart 0.3.28.
+
+For the default `remote` mode, omit the optional `workflowRef` to keep generated
+callers pinned to `workflowCommit`. An installation may instead set a non-empty
+`workflowRef` alongside the verified fields:
+
+```yaml
+config:
+  apiserver:
+    stewardRunRelease:
+      workflowRef: customer-managed
+```
+
+With that setting, versioned and direct-package callers generated in `remote`
+mode use
+`<workflowRepository>/.github/workflows/<workflow-file>@<workflowRef>`. Use it
+when `workflowRepository` names an in-organization steward-run copy that only
+the customer's administrators may update. Those administrators can then move
+the configured ref when upgrading steward-run without editing every compatible
+caller pipeline. The verified `workflowCommit` remains required and stays in
+generated provenance; it records the reviewed baseline rather than the code
+selected by the ref. Generated provenance records `workflowRef` separately as
+the effective reference. The ref may move, so the code that runs is no longer
+pinned to the verified commit. The configured `version` must still identify the
+release whose reusable-workflow input contract the ref provides. If that input
+contract changes, update `version` and regenerate affected callers.
+`workflowRef` is an installation choice, not a replacement release coordinate.
+Empty and whitespace-only values fail configuration loading.
 
 Set `config.apiserver.stewardRunWorkflowInstallationMode` independently from
 those signed coordinates. Its default, `remote`, renders the exact immutable
-repository and workflow commit. `vendored` renders the local path described
-below; it does not change the verified release coordinates retained in
-generated provenance.
+repository and workflow commit when `workflowRef` is unset, or the configured
+repository and ref when it is set. `vendored` renders the local path described
+below; it does not change the verified release coordinates retained in generated
+provenance and does not use `workflowRef`.
 
 ### Vendored steward-run workflow
 
