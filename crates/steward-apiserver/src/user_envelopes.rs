@@ -1911,6 +1911,7 @@ mod tests {
                 manifest_schema_version: 3,
                 version: self.steward_run_version.clone(),
                 workflow_repository: "example-org/steward-run".to_owned(),
+                workflow_ref: None,
                 workflow_commit: "3333333333333333333333333333333333333333".to_owned(),
                 action_commit: "4444444444444444444444444444444444444444".to_owned(),
                 governed_job_container_image: Some(format!(

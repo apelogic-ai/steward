@@ -756,17 +756,22 @@ Steward release namespace also creates `steward-workflows`.
   justification. Steward validates model, tool, and workspace-type availability for these reviewed
   requests both when a request is created and when it is approved; deployment workspace limits
   remain enforced at Task admission.
-- `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
-  installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
-  and action commit. The deprecated `governedJobContainerImage` coordinate remains accepted for
-  compatibility but is not used by the active versioned workflow generator. The default `null`
-  value is valid while browser
+- `config.apiserver.stewardRunRelease` contains the exact verified steward-run handoff selected by
+  the installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
+  and action commit. The unreleased source after chart 0.3.28 also lets an installation add a
+  non-empty `workflowRef`; remote generated workflows then use that ref while retaining the required
+  verified commit as their reviewed baseline and recording the effective ref separately. Omit it to
+  preserve the exact-commit default. Use it only for an in-organization steward-run copy whose
+  updates are restricted to the customer's administrators. The configured `version` must still
+  identify the release whose reusable-workflow input contract the ref provides. The deprecated
+  `governedJobContainerImage` coordinate remains accepted for compatibility but is not used by the
+  active versioned workflow generator. The default `null` value is valid while browser
   administration is disabled. Enabling browser administration requires a complete v0.7.0-or-later
   object and fails schema validation when the value is absent, null, or malformed. Steward validates
   and renders these deployment coordinates; its source and chart defaults do not select them.
 - `config.apiserver.stewardRunWorkflowInstallationMode` controls only how generated callers
-  reference that verified release. `remote` is the default and renders the release handoff's exact
-  repository and workflow commit. `vendored` renders
+  reference that verified release. `remote` is the default and renders the release repository with
+  `workflowRef` when configured, or the exact workflow commit when it is not. `vendored` renders
   `./.github/workflows/steward-task-vendored.yml`; select it only after each caller repository has
   installed the checksum- and signature-verified steward-run v0.7.6-or-later release asset at that
   exact path. Older release handoffs fail closed in this mode. The local mode does not add a PAT,

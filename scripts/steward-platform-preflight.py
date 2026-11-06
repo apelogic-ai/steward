@@ -100,6 +100,20 @@ def require_string(parent: dict[str, Any], key: str, path: str) -> str:
     return value
 
 
+RUST_WHITESPACE = frozenset(
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def require_steward_nonblank_string(parent: dict[str, Any], key: str, path: str) -> str:
+    value = parent.get(key)
+    if not isinstance(value, str) or not value or all(character in RUST_WHITESPACE for character in value):
+        raise ValidationError(f"{path}.{key} must be a non-empty string")
+    return value
+
+
 def require_exact_keys(parent: dict[str, Any], expected: set[str], path: str) -> None:
     unexpected = sorted(set(parent) - expected)
     if unexpected:
@@ -1173,6 +1187,7 @@ def validate_steward_run_release(release: dict[str, Any]) -> None:
             "manifestSchemaVersion",
             "version",
             "workflowRepository",
+            "workflowRef",
             "workflowCommit",
             "actionCommit",
             "governedJobContainerImage",
@@ -1199,6 +1214,8 @@ def validate_steward_run_release(release: dict[str, Any]) -> None:
         )
     ):
         raise ValidationError("stewardRunRelease.workflowRepository must be owner/repository")
+    if "workflowRef" in release:
+        require_steward_nonblank_string(release, "workflowRef", path)
     for key in ("workflowCommit", "actionCommit"):
         if not re.fullmatch(r"[0-9a-f]{40}", require_string(release, key, path)):
             raise ValidationError(f"stewardRunRelease.{key} must be a full lowercase commit")

@@ -107,11 +107,20 @@ exact:
 | `actionCommit` | `actionCommit` |
 
 For the v0.7.0 handoff, `schemaVersion` is the JSON number `3`. This normalized
-projection renames fields but must not select different coordinates from the
-signed BOM. The active versioned workflow does not run caller jobs in a
-steward-run image, so the image coordinate is not part of this projection.
-Existing values may retain `governedJobContainerImage` for compatibility with
-the lower-level v1 smoke renderer.
+projection renames the signed fields but must not select different signed
+coordinates from the BOM. The active versioned workflow does not run caller
+jobs in a steward-run image, so the image coordinate is not part of this
+projection. Existing values may retain `governedJobContainerImage` for
+compatibility with the lower-level v1 smoke renderer. The optional installation
+override below is the only field in this object that is not projected from the
+signed handoff.
+
+After preserving those verified coordinates, an installation may append the
+optional non-empty `workflowRef` setting for an administrator-controlled
+in-organization copy. This is an unreleased addition after Steward v0.3.28 and
+is not a signed handoff coordinate. It changes the effective ref used by
+generated remote callers; `workflowCommit` remains required as the reviewed
+baseline, and generated provenance records both values.
 
 ## Stable runtime contracts
 

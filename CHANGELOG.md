@@ -7,6 +7,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- GitHub Actions workflow generation can use the optional
+  `config.apiserver.stewardRunRelease.workflowRef` for both versioned and direct-package callers,
+  including direct-package caller pull requests created by browser publication.
+  When it is unset, generated workflows remain pinned to the verified steward-run workflow commit.
+  When it is set, generated workflows follow the configured repository and movable ref instead of
+  the verified commit so administrators can upgrade an in-organization steward-run copy without
+  editing every caller pipeline. The generated header records the verified commit as the reviewed
+  baseline and `# steward-run-workflow-ref: "<ref>"` as the effective reference, and the
+  configured `uses:` value is a quoted string. The Helm value,
+  `STEWARD_RUN_RELEASE_FILE`, `STEWARD_RUN_RELEASE_JSON`, and platform-preflight v1 input all accept
+  the optional field. Configured references are quoted so their content cannot add fields to the
+  generated YAML. Empty and whitespace-only values are refused during configuration loading. The
+  configured `version` must continue to identify the release whose reusable-workflow input contract
+  the ref provides; changing that contract requires updating `version` and regenerating affected
+  callers. `workflowRef` affects only versioned and direct-package callers in `remote` mode;
+  `vendored` callers and the lower-level v1 smoke renderer continue to use the verified commit.
+
+### Upgrade and rollback
+
+- No configuration or data migration is required. Existing installations keep exact-commit
+  rendering. Administrators who control an in-organization steward-run copy may add `workflowRef`
+  and move that ref as they upgrade the copy. Remove the field before rolling back because older
+  Steward releases reject the unknown field. Generated caller files already committed with the ref
+  continue to follow it until they are regenerated with exact-commit rendering. Setting, changing,
+  or removing `workflowRef` in `remote` mode changes the generated caller, so browser-published
+  Tasks merged before the configuration change stop matching and **Run on GitHub** remains
+  unavailable for them until the caller is updated. Moving the configured ref itself does not
+  change the caller or its match.
+
 ## [0.3.28] - 2026-11-05
 
 Steward v0.3.28 preserves deployment-configured LiteLLM model aliases exactly and reports each

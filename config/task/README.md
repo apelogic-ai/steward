@@ -31,7 +31,7 @@ user Task.
 | `STEWARD_CAPABILITY_CATALOG_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
 | `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE` | Deprecated compatibility input. It is accepted but ignored, emits a startup warning, and will be removed in the next release. |
 | `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON` | Deprecated inline compatibility input with the same ignored-and-warn behavior. |
-| `STEWARD_RUN_RELEASE_FILE` | Preferred read-only normalized steward-run release handoff for browser Workflow generation. Browser administration requires exactly one file or inline form and steward-run v0.7.0 or later. |
+| `STEWARD_RUN_RELEASE_FILE` | Preferred read-only normalized steward-run release handoff for browser Workflow generation. Browser administration requires exactly one file or inline form and steward-run v0.7.0 or later. The object may add a non-empty `workflowRef`; remote generated callers then use it instead of the required verified workflow commit. |
 | `STEWARD_RUN_RELEASE_JSON` | Inline equivalent used by the Helm chart. Configuring both release-handoff forms fails startup. |
 | `STEWARD_RUN_WORKFLOW_INSTALLATION_MODE` | Optional `remote` (default) or `vendored` caller rendering mode. Vendored mode requires steward-run v0.7.6 or later and its verified release asset at `.github/workflows/steward-task-vendored.yml` in the caller repository. |
 | `STEWARD_DEFAULT_LLM_TEMPLATE_JSON` | Optional ordinary catalog seed for the disabled-by-default LLM smoke template. Its model, roles, budget, TTL, revision, and empty tool set are explicit non-secret configuration. |
