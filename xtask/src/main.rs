@@ -5922,6 +5922,8 @@ mod tests {
             "exit code 125",
             "kubectl delete pods",
             "CLI request failed",
+            "codex-refusal.openshell.svc.cluster.local",
+            "logs deployment/codex-refusal",
             "remote-shell",
         ] {
             assert!(
@@ -5929,6 +5931,10 @@ mod tests {
                 "governed sandbox E2E must prove {required}"
             );
         }
+        assert!(
+            !e2e.contains("MCP_GW_CLI_URL=http://127.0.0.1:18080"),
+            "OpenShell always blocks loopback; the governed CLI refusal fixture must use an exact in-cluster route"
+        );
         for required in [
             "/cli/run",
             "/cli/jobs",
