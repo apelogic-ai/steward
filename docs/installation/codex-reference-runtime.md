@@ -34,31 +34,32 @@ output processing:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
-| `kubectl` | MCP-GW 0.7.0 helper | Governed Kubernetes commands |
-| `remote-shell` | MCP-GW 0.7.0 helper | Governed commands on a run-bound machine |
+| `kubectl` | MCP-GW 0.7.5 helper | Governed Kubernetes commands |
+| `remote-shell` | MCP-GW 0.7.5 helper | Governed commands on a run-bound machine |
 | `uv` | 0.11.15 | Python project and package management |
 
 ## Governed commands and sign-in
 
-The reference image installs the checksum-pinned MCP-GW 0.7.0 sandbox helper
-at `/usr/local/bin/mcp-gw-sandbox-helper`. `kubectl` and `remote-shell` are
-symlinks to that executable. The helper selects `/cli/run` or `/shell/run`
-from its invoked name; it does not contain a gateway credential or implement a
-second sign-in flow.
+The reference image installs the checksum-pinned MCP-GW 0.7.5 sandbox helper
+at `/usr/local/bin/mcp-gw-sandbox-helper`. The `kubectl` and `remote-shell`
+wrappers select the matching helper operation explicitly; the helper does not
+contain a gateway credential or implement a second sign-in flow.
 
-When a Task has the matching approved grant, both supported agent adapters add
-only these values to the agent process:
+When a Task has the matching approved grant, its agent adapter adds only the
+matching route values to the agent process:
 
-- `MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder`
 - `MCP_GW_CLI_URL=https://<configured-gateway-host>/cli/run` for an approved
   `cli/kubectl` command class
 - `MCP_GW_SHELL_URL=https://<configured-gateway-host>/shell/run` for an
   approved `remote-shell/remote_shell_run/write` grant
 
 The URLs are derived from the Task's configured MCP endpoint. An unrelated or
-unrecognized grant adds none of these values. The agent never receives a
-usable token: OpenShell recognizes the placeholder and substitutes a
-short-lived, run-bound token only on the allowed network request. MCP-GW then
+unrecognized grant adds none of these values.
+
+`MCP_GW_RUN_TOKEN` is not present in the agent environment.
+The fixed wrapper adds the non-secret OpenShell
+substitution marker only to the helper child process, and OpenShell substitutes
+a short-lived, run-bound token only on the allowed network request. MCP-GW then
 checks the token's run identifier, target, and approved command class. A
 missing grant, a command classified above the approved class, or a machine not
 tagged for that run is refused by MCP-GW. Helper configuration and request

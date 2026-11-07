@@ -18,12 +18,12 @@ ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 RUN case "${TARGETARCH}" in \
       amd64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
-        helper_sha256="cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e" \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
+        helper_sha256="26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34" \
         ;; \
       arm64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
-        helper_sha256="ca2493fbca2b442b342c06815ea15cc34c68ebd7df65ff1440a19a122bb53b07" \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
+        helper_sha256="0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4" \
         ;; \
       *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
@@ -79,8 +79,13 @@ RUN case "${TARGETARCH}" in \
         --directory /usr/local/bin mcp-gw-sandbox-helper \
     && rm /tmp/mcp-gw-sandbox-helper.tar.gz \
     && chmod 0755 /usr/local/bin/mcp-gw-sandbox-helper \
-    && ln -s mcp-gw-sandbox-helper /usr/local/bin/kubectl \
-    && ln -s mcp-gw-sandbox-helper /usr/local/bin/remote-shell \
+    && printf '%s\n' '#!/bin/sh' \
+        'exec /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper --operation kubectl "$@"' \
+        >/usr/local/bin/kubectl \
+    && printf '%s\n' '#!/bin/sh' \
+        'exec /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper --operation remote-shell "$@"' \
+        >/usr/local/bin/remote-shell \
+    && chmod 0755 /usr/local/bin/kubectl /usr/local/bin/remote-shell \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \
     && npm pack --silent tar@7.5.22 --pack-destination /tmp \
     && rm -rf /usr/lib/node_modules/npm/node_modules/tar \
@@ -105,7 +110,7 @@ RUN rg --version \
     && fd --version \
     && tree --version \
     && test -x /usr/local/bin/mcp-gw-sandbox-helper \
-    && test "$(readlink /usr/local/bin/kubectl)" = mcp-gw-sandbox-helper \
-    && test "$(readlink /usr/local/bin/remote-shell)" = mcp-gw-sandbox-helper \
+    && grep -F -- '--operation kubectl' /usr/local/bin/kubectl \
+    && grep -F -- '--operation remote-shell' /usr/local/bin/remote-shell \
     && uv --version \
     && uvx --version

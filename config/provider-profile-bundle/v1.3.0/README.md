@@ -10,9 +10,10 @@ and four exact `POST` routes: `/cli/run`, `/cli/jobs`, `/shell/run`, and
 
 The network profile only permits the helper to reach those routes. MCP-GW
 still checks the run-bound command class or remote-shell grant, target, and run
-identifier for every request. The sandbox receives only
-`openshell-token-grant-placeholder`; OpenShell substitutes a short-lived token
-at the network edge and never exposes a usable token to the agent process.
+identifier for every request. The fixed runtime wrappers provide
+`openshell-token-grant-placeholder` only while starting the helper; it is not
+present in the agent environment. OpenShell substitutes a short-lived token on
+the network request and never exposes a usable token to the agent.
 
 `mint-audience` must equal `config.mint.audience`. Service CIDRs must be
 canonical and must not overlap OpenShell's always-blocked IPv4, IPv6, or

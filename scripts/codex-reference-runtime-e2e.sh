@@ -107,17 +107,21 @@ sandbox_exec tree --version
 sandbox_exec /bin/sh -c "
 set -eu
 test -x /usr/local/bin/mcp-gw-sandbox-helper
-test \"\$(readlink /usr/local/bin/kubectl)\" = mcp-gw-sandbox-helper
-test \"\$(readlink /usr/local/bin/remote-shell)\" = mcp-gw-sandbox-helper
+grep -F -- '--operation kubectl' /usr/local/bin/kubectl >/dev/null
+grep -F -- '--operation remote-shell' /usr/local/bin/remote-shell >/dev/null
+test -z \"\${MCP_GW_RUN_TOKEN+x}\"
+case \"\$(env)\" in
+  *openshell-token-grant-placeholder*) exit 1 ;;
+esac
 
 # Both helpers must fail closed with exit code 125 when a usable edge grant is
-# unavailable. The only token visible to the sandbox is the substitution marker.
+# unavailable. The fixed wrappers add the substitution marker only to the
+# helper child process, so it is absent from the agent environment and output.
 check_helper_refusal() {
   expected=\$1
   shift
   set +e
   output=\$(env \
-    MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder \
     MCP_GW_CLI_URL=http://127.0.0.1:1/cli/run \
     MCP_GW_SHELL_URL=http://127.0.0.1:1/shell/run \
     \"\$@\" 2>&1)
@@ -130,7 +134,29 @@ check_helper_refusal() {
     *openshell-token-grant-placeholder*) exit 1 ;;
   esac
 }
-check_helper_refusal \"CLI request failed\" kubectl get pods
 check_helper_refusal \"Remote shell request failed\" \
   remote-shell machine.test -- uname -a
+
+rm -f /tmp/steward-cli-refusal-ready /tmp/steward-cli-refusal-reason
+node -e 'const fs = require("node:fs"); const http = require("node:http"); const server = http.createServer((request, response) => { let body = ""; request.setEncoding("utf8"); request.on("data", (chunk) => { body += chunk; }); request.on("end", () => { let parsed; try { parsed = JSON.parse(body); } catch { parsed = {}; } const refused = request.method === "POST" && request.url === "/cli/run" && request.headers.authorization === "Bearer openshell-token-grant-placeholder" && parsed.cli === "kubectl" && Array.isArray(parsed.args) && parsed.args[0] === "delete"; if (!refused) { response.writeHead(500); response.end(); return; } const reason = "This command is not approved for this run."; fs.writeFileSync("/tmp/steward-cli-refusal-reason", reason); response.writeHead(403, { "content-type": "application/json" }); response.end(JSON.stringify({ error: "task_not_authorized", message: reason })); }); }); server.listen(18080, "127.0.0.1", () => { fs.writeFileSync("/tmp/steward-cli-refusal-ready", "ready"); });' &
+server_pid=\$!
+trap 'kill \"\${server_pid}\" 2>/dev/null || true' EXIT INT TERM
+for attempt in \$(seq 1 100); do
+  test -f /tmp/steward-cli-refusal-ready && break
+  sleep 0.01
+done
+test -f /tmp/steward-cli-refusal-ready
+set +e
+output=\$(MCP_GW_CLI_URL=http://127.0.0.1:18080/cli/run kubectl delete pods 2>&1)
+status=\$?
+set -e
+kill \"\${server_pid}\"
+wait \"\${server_pid}\" 2>/dev/null || true
+trap - EXIT INT TERM
+test \"\${status}\" -eq 125
+test \"\${output}\" = \"CLI request failed\"
+test \"\$(cat /tmp/steward-cli-refusal-reason)\" = \"This command is not approved for this run.\"
+case \"\${output}\" in
+  *openshell-token-grant-placeholder*) exit 1 ;;
+esac
 "

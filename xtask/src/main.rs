@@ -5873,14 +5873,16 @@ mod tests {
 
         for required in [
             "ARG TARGETARCH",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
-            "cfbb335b5791ac45f7f3b7b99d5560bfb4b77e7d1247dfd15a135bf6df61a55e",
-            "ca2493fbca2b442b342c06815ea15cc34c68ebd7df65ff1440a19a122bb53b07",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
+            "26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34",
+            "0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4",
             "sha256sum --check --strict",
             "/usr/local/bin/mcp-gw-sandbox-helper",
             "/usr/local/bin/kubectl",
             "/usr/local/bin/remote-shell",
+            "--operation kubectl",
+            "--operation remote-shell",
         ] {
             assert!(
                 container.contains(required),
@@ -5900,11 +5902,13 @@ mod tests {
             "the command profile must preserve only the existing MCP transport and exact command routes"
         );
         for required in [
-            "MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder",
+            "openshell-token-grant-placeholder",
             "MCP_GW_CLI_URL",
             "MCP_GW_SHELL_URL",
+            r#"test -z \"\${MCP_GW_RUN_TOKEN+x}\""#,
             "exit code 125",
-            "kubectl",
+            "kubectl delete pods",
+            "CLI request failed",
             "remote-shell",
         ] {
             assert!(
@@ -5925,8 +5929,8 @@ mod tests {
             );
         }
         for required in [
-            "MCP-GW 0.7.0",
-            "openshell-token-grant-placeholder",
+            "MCP-GW 0.7.5",
+            "not present in the agent environment",
             "MCP_GW_CLI_URL",
             "MCP_GW_SHELL_URL",
         ] {

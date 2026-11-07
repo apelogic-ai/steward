@@ -9,6 +9,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- The Codex reference sandbox now includes checksum-pinned `kubectl` and
+  `remote-shell` wrappers from MCP-GW 0.7.5. Approved Task grants expose only
+  the matching same-origin command URLs in the agent environment; the wrappers
+  provide the non-secret network substitution marker only while starting the
+  helper. Provider-profile bundle 1.3.0 permits the existing MCP transport and
+  exactly four command and job routes. Prefix paths, sibling paths, other
+  methods and hosts, unrelated grants, and unapproved command classes remain
+  refused.
 - GitHub Actions workflow generation can use the optional
   `config.apiserver.stewardRunRelease.workflowRef` for both versioned and direct-package callers,
   including direct-package caller pull requests created by browser publication.
@@ -271,13 +279,6 @@ latest-upstream LiteLLM image to an immutable digest and refreshes the bundled w
 - The Helm chart can now set independent request and backend-request timeouts
   on its API and web HTTPRoutes. Timeout fields remain absent by default, so
   existing route behavior is unchanged until an operator opts in.
-- The Codex reference sandbox now includes checksum-pinned `kubectl` and
-  `remote-shell` helpers from MCP-GW 0.7.0. Approved Task grants expose only a
-  network-edge token placeholder and same-origin command URLs; the agent never
-  receives a usable credential. Provider-profile bundle 1.3.0 narrows gateway
-  access to the existing MCP transport and the four command and job routes,
-  and both supported agent adapters refuse to configure helpers for unrelated
-  or unrecognized grant classes.
 - The Helm chart can now create the public task-token JWKS and gateway backend
   CA ConfigMaps from values. It rejects malformed public material and private
   keys, while unchanged values continue to reference separately managed

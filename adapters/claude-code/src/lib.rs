@@ -151,7 +151,7 @@ fn governed_command_setup(
     let mut endpoint = reqwest::Url::parse(endpoint).map_err(|_| PortError::Rejected {
         reason: "Claude Code tool endpoint must be an exact HTTP(S) URL".to_owned(),
     })?;
-    let mut setup = "export MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder; ".to_owned();
+    let mut setup = String::new();
     if cli {
         endpoint.set_path("/cli/run");
         setup.push_str("export MCP_GW_CLI_URL=");
@@ -575,8 +575,8 @@ mod tests {
     }
 
     #[test]
-    fn governed_command_grants_expose_only_placeholder_backed_helper_routes() -> Result<(), String>
-    {
+    fn governed_command_grants_expose_routes_without_helper_token_in_agent_environment()
+    -> Result<(), String> {
         let adapter =
             ClaudeCodeTaskExecutionAdapter::new("https://inference.example.test".to_owned())
                 .map_err(|error| format!("configure adapter: {error:?}"))?;
@@ -604,7 +604,7 @@ mod tests {
             })
             .map_err(|error| format!("render governed command plan: {error:?}"))?;
         let shell = &command_plan.command[2];
-        assert!(shell.contains("MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder"));
+        assert!(!shell.contains("MCP_GW_RUN_TOKEN"));
         assert!(shell.contains("MCP_GW_CLI_URL=https://tools.example.test/cli/run"));
         assert!(shell.contains("MCP_GW_SHELL_URL=https://tools.example.test/shell/run"));
         assert!(!shell.contains("MCP_GW_RUN_TOKEN_FILE"));
