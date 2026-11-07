@@ -9,6 +9,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- The Codex reference sandbox now includes checksum-pinned `kubectl` and
+  `remote-shell` wrappers from MCP-GW 0.7.5. Approved Task grants expose only
+  the matching same-origin command URLs in the agent environment; the wrappers
+  provide the non-secret network substitution marker only while starting the
+  helper. Provider-profile bundle 1.3.0 permits the existing MCP transport and
+  exactly four command and job routes. Prefix paths, sibling paths, other
+  methods and hosts, unrelated grants, and unapproved command classes remain
+  refused.
 - GitHub Actions workflow generation can use the optional
   `config.apiserver.stewardRunRelease.workflowRef` for both versioned and direct-package callers,
   including direct-package caller pull requests created by browser publication.

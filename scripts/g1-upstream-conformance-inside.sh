@@ -72,6 +72,34 @@ network_policies:
         access: read-only
     binaries:
       - path: /usr/bin/curl
+  governed_gateway_routes:
+    name: governed-gateway-exact-routes
+    endpoints:
+      - host: oidc.openshell.svc.cluster.local
+        port: 8000
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: /mcp
+          - allow:
+              method: DELETE
+              path: /mcp
+          - allow:
+              method: POST
+              path: /cli/run
+          - allow:
+              method: POST
+              path: /cli/jobs
+          - allow:
+              method: POST
+              path: /shell/run
+          - allow:
+              method: POST
+              path: /shell/jobs
+    binaries:
+      - path: /usr/bin/curl
 YAML
 
 "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
@@ -106,6 +134,68 @@ done
 "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
   curl -sS --max-time 20 -H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen >/dev/null
+
+governed_origin="http://oidc.openshell.svc.cluster.local:8000"
+
+assert_allowed_route() {
+  method="$1"
+  path="$2"
+  set +e
+  status="$("${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
+    curl -sS --max-time 10 --request "${method}" --output /dev/null \
+      --write-out '%{http_code}' "${governed_origin}${path}" 2>/dev/null)"
+  route_exit="$?"
+  set -e
+  if [[ "${route_exit}" -ne 0 || "${status}" != "501" ]]; then
+    echo "OpenShell exact ${method} ${path} probe returned HTTP ${status:-none} with curl exit ${route_exit}; expected controlled upstream HTTP 501 with exit 0" >&2
+    exit 1
+  fi
+}
+
+assert_denied_route() {
+  method="$1"
+  path="$2"
+  set +e
+  status="$("${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
+    curl -sS --fail --max-time 10 --request "${method}" --output /dev/null \
+      --write-out '%{http_code}' "${governed_origin}${path}" 2>/dev/null)"
+  route_exit="$?"
+  set -e
+  if [[ "${route_exit}" -ne 22 || "${status}" != "403" ]]; then
+    echo "OpenShell forbidden ${method} ${path} probe returned HTTP ${status:-none} with curl exit ${route_exit}; expected HTTP 403 with exit 22" >&2
+    exit 1
+  fi
+}
+
+assert_upstream_rejects_query() {
+  method="$1"
+  path="$2"
+  set +e
+  status="$("${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
+    curl -sS --fail --max-time 10 --request "${method}" --output /dev/null \
+      --write-out '%{http_code}' "${governed_origin}${path}" 2>/dev/null)"
+  route_exit="$?"
+  set -e
+  if [[ "${route_exit}" -ne 22 || "${status}" != "501" ]]; then
+    echo "Controlled upstream query probe returned HTTP ${status:-none} with curl exit ${route_exit}; expected HTTP 501 with exit 22 and no command handling" >&2
+    exit 1
+  fi
+}
+
+assert_allowed_route POST /mcp
+assert_allowed_route DELETE /mcp
+assert_allowed_route POST /cli/run
+assert_allowed_route POST /cli/jobs
+assert_allowed_route POST /shell/run
+assert_allowed_route POST /shell/jobs
+
+assert_denied_route POST /cli/run/extra
+assert_denied_route GET /cli/run
+assert_denied_route POST /cli/other
+assert_upstream_rejects_query POST '/cli/run?escape=1'
 
 set +e
 denied_connect_status="$(
