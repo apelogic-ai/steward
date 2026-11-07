@@ -5921,8 +5921,9 @@ mod tests {
             r#"test -z \"\${MCP_GW_RUN_TOKEN+x}\""#,
             "exit code 125",
             "kubectl delete pods",
-            "codex-refusal.openshell.svc.cluster.local",
-            "logs deployment/codex-refusal",
+            "codex-refusal.test",
+            "docker network create",
+            "docker logs",
             "REFUSED kubectl delete: This command is not approved for this run.",
             "REFUSED remote shell: This command is not approved for this run.",
             "remote-shell",
@@ -5934,10 +5935,10 @@ mod tests {
         }
         assert!(
             !e2e.contains("MCP_GW_CLI_URL=http://127.0.0.1:18080"),
-            "OpenShell always blocks loopback; the governed CLI refusal fixture must use an exact in-cluster route"
+            "the governed CLI refusal fixture must use its run-owned HTTPS network"
         );
         assert!(
-            !e2e.contains("http://codex-refusal.openshell.svc.cluster.local"),
+            !e2e.contains("http://codex-refusal.test"),
             "the sandbox helper permits non-loopback command routes only over HTTPS"
         );
         for required in [

@@ -9,20 +9,21 @@ kubeconfig="${STEWARD_TEST_KUBECONFIG:?STEWARD_TEST_KUBECONFIG is required}"
 workspace="codex-runtime"
 sandbox="tool-check"
 cli="${STEWARD_RUN_DIR:?STEWARD_RUN_DIR is required}/openshell"
+refusal_container="steward-codex-refusal-${run_id}"
+refusal_network="steward-codex-refusal-${run_id}"
 cluster_name="${kube_context#kind-}"
 if [[ "${cluster_name}" == "${kube_context}" || "${cluster_name}" != "steward-${run_id}" ]]; then
   echo "refusing non-run-owned kube context: ${kube_context}" >&2
   exit 1
 fi
-KUBECTL=(
-  kubectl
-  --kubeconfig "${kubeconfig}"
-  --context "${kube_context}"
-)
+test -f "${kubeconfig}"
 
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
+  docker stop --timeout 5 "${refusal_container}" >/dev/null 2>&1 || true
+  docker rm "${refusal_container}" >/dev/null 2>&1 || true
+  docker network rm "${refusal_network}" >/dev/null 2>&1 || true
   if [[ -x "${cli}" ]]; then
     "${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
       --workspace "${workspace}" sandbox delete "${sandbox}" >/dev/null 2>&1 || true
@@ -68,8 +69,8 @@ refusal_server="${STEWARD_RUN_DIR}/codex-refusal-server.py"
 refusal_certificate="${STEWARD_RUN_DIR}/codex-refusal.crt"
 refusal_private_key="${STEWARD_RUN_DIR}/codex-refusal.key"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -subj '/CN=codex-refusal.openshell.svc.cluster.local' \
-  -addext 'subjectAltName=DNS:codex-refusal.openshell.svc.cluster.local' \
+  -subj '/CN=codex-refusal.test' \
+  -addext 'subjectAltName=DNS:codex-refusal.test' \
   -keyout "${refusal_private_key}" \
   -out "${refusal_certificate}" \
   >/dev/null 2>&1
@@ -77,6 +78,7 @@ cat >"${refusal_server}" <<'PYTHON'
 import json
 import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -124,84 +126,76 @@ server = ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
 server.socket = context.wrap_socket(server.socket, server_side=True)
+Path("/tmp/ready").touch()
 server.serve_forever()
 PYTHON
 
-"${KUBECTL[@]}" -n openshell create secret tls codex-refusal-tls \
-  --cert="${refusal_certificate}" \
-  --key="${refusal_private_key}" \
-  --dry-run=client \
-  -o yaml |
-  "${KUBECTL[@]}" label --local -f - \
-    "steward.test/run-id=${run_id}" \
-    -o yaml |
-  "${KUBECTL[@]}" apply -f -
-"${KUBECTL[@]}" -n openshell create configmap codex-refusal \
-  --from-file=server.py="${refusal_server}" \
-  --dry-run=client \
-  -o yaml |
-  "${KUBECTL[@]}" label --local -f - \
-    "steward.test/run-id=${run_id}" \
-    -o yaml |
-  "${KUBECTL[@]}" apply -f -
-"${KUBECTL[@]}" apply -f - <<YAML
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: codex-refusal
-  namespace: openshell
-  labels:
-    steward.test/run-id: ${run_id}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: codex-refusal
-  template:
-    metadata:
-      labels:
-        app: codex-refusal
-        steward.test/run-id: ${run_id}
-    spec:
-      containers:
-        - name: server
-          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
-          args: ["python3", "/srv/server.py"]
-          env:
-            - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
-          ports:
-            - { name: https, containerPort: 8443 }
-          readinessProbe:
-            tcpSocket: { port: https }
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65534
-          volumeMounts:
-            - { name: server, mountPath: /srv, readOnly: true }
-            - { name: tls, mountPath: /tls, readOnly: true }
-      volumes:
-        - name: server
-          configMap: { name: codex-refusal }
-        - name: tls
-          secret: { secretName: codex-refusal-tls }
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: codex-refusal
-  namespace: openshell
-  labels:
-    steward.test/run-id: ${run_id}
-spec:
-  selector:
-    app: codex-refusal
-  ports:
-    - { name: https, port: 8443, targetPort: https }
-YAML
-"${KUBECTL[@]}" -n openshell rollout status deployment/codex-refusal --timeout=300s
+# OpenShell reconnects inspected HTTPS with its system trust roots. Keep the
+# run-generated CA and refusal fixture on a run-owned Docker network so the
+# packaged helper can be tested without changing cluster trust.
+docker network create \
+  --label "steward.test/run-id=${run_id}" \
+  "${refusal_network}" >/dev/null
+docker run --detach \
+  --name "${refusal_container}" \
+  --network "${refusal_network}" \
+  --network-alias codex-refusal.test \
+  --label "steward.test/run-id=${run_id}" \
+  --volume "${refusal_server}:/srv/server.py:ro" \
+  --volume "${refusal_certificate}:/tls/tls.crt:ro" \
+  --volume "${refusal_private_key}:/tls/tls.key:ro" \
+  python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf \
+  python3 /srv/server.py >/dev/null
+for attempt in {1..30}; do
+  if docker exec "${refusal_container}" test -f /tmp/ready; then
+    break
+  fi
+  if [[ "${attempt}" == 30 ]]; then
+    echo "governed command refusal fixture did not become ready" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+check_helper_refusal() {
+  helper="$1"
+  shift
+  set +e
+  output="$(docker run --rm \
+    --network "${refusal_network}" \
+    --label "steward.test/run-id=${run_id}" \
+    --volume "${refusal_certificate}:/sandbox/codex-refusal-ca.crt:ro" \
+    --env NODE_EXTRA_CA_CERTS=/sandbox/codex-refusal-ca.crt \
+    --env MCP_GW_CLI_URL=https://codex-refusal.test:8443/cli/run \
+    --env MCP_GW_SHELL_URL=https://codex-refusal.test:8443/shell/run \
+    --entrypoint "/usr/local/bin/${helper}" \
+    "${image}" "$@" 2>&1)"
+  status=$?
+  set -e
+  if [[ "${status}" -ne 125 ]]; then
+    echo "${helper} did not return exit code 125" >&2
+    exit 1
+  fi
+  case "${output}" in
+    *openshell-token-grant-placeholder*)
+      echo "${helper} exposed its substitution marker" >&2
+      exit 1
+      ;;
+  esac
+}
+check_helper_refusal remote-shell machine.test -- uname -a
+check_helper_refusal kubectl delete pods
+
+refusal_logs="$(docker logs "${refusal_container}")"
+for expected in \
+  'REFUSED kubectl delete: This command is not approved for this run.' \
+  'REFUSED remote shell: This command is not approved for this run.'
+do
+  if ! grep -Fx "${expected}" <<<"${refusal_logs}" >/dev/null; then
+    echo "governed command refusal fixture did not record the exact request" >&2
+    exit 1
+  fi
+done
 
 policy="${STEWARD_RUN_DIR}/codex-reference-runtime-policy.yaml"
 cat >"${policy}" <<'YAML'
@@ -219,7 +213,7 @@ network_policies:
   governed_cli_refusal:
     name: governed-cli-refusal
     endpoints:
-      - host: codex-refusal.openshell.svc.cluster.local
+      - host: codex-refusal.test
         port: 8443
         protocol: rest
         enforcement: enforce
@@ -270,10 +264,6 @@ sandbox_exec() {
     --workspace "${workspace}" sandbox exec --name "${sandbox}" --no-tty -- "$@"
 }
 
-refusal_certificate_base64="$(openssl base64 -A -in "${refusal_certificate}")"
-sandbox_exec /bin/sh -c \
-  "printf '%s' '${refusal_certificate_base64}' | base64 -d > /sandbox/codex-refusal-ca.crt"
-
 sandbox_exec rg --version
 sandbox_exec jq --version
 sandbox_exec fd --version
@@ -288,57 +278,4 @@ test -z \"\${MCP_GW_RUN_TOKEN+x}\"
 case \"\$(env)\" in
   *openshell-token-grant-placeholder*) exit 1 ;;
 esac
-
-# Both helpers must fail closed with exit code 125 when the governed route
-# refuses a request. The host-side fixture logs below prove the exact request
-# and plain refusal; OpenShell may decorate or suppress the helper's stderr.
-# The fixed wrappers add the substitution marker only to the helper child
-# process, so it is absent from the agent environment and output.
-check_helper_refusal() {
-  set +e
-  output=\$(env \
-    NODE_EXTRA_CA_CERTS=/sandbox/codex-refusal-ca.crt \
-    MCP_GW_CLI_URL=https://codex-refusal.openshell.svc.cluster.local:8443/cli/run \
-    MCP_GW_SHELL_URL=https://codex-refusal.openshell.svc.cluster.local:8443/shell/run \
-    \"\$@\" 2>&1)
-  status=\$?
-  set -e
-  if test \"\$status\" -ne 125; then
-    echo \"remote shell helper did not return exit code 125\" >&2
-    exit 1
-  fi
-  case \"\$output\" in
-    *openshell-token-grant-placeholder*)
-      echo \"remote shell helper exposed its substitution marker\" >&2
-      exit 1
-      ;;
-  esac
-}
-check_helper_refusal remote-shell machine.test -- uname -a
-
-set +e
-output=\$(env \
-  NODE_EXTRA_CA_CERTS=/sandbox/codex-refusal-ca.crt \
-  MCP_GW_CLI_URL=https://codex-refusal.openshell.svc.cluster.local:8443/cli/run \
-  kubectl delete pods 2>&1)
-status=\$?
-set -e
-if test \"\${status}\" -ne 125; then
-  echo \"CLI helper did not return exit code 125\" >&2
-  exit 1
-fi
-case \"\${output}\" in
-  *openshell-token-grant-placeholder*)
-    echo \"CLI helper exposed its substitution marker\" >&2
-    exit 1
-    ;;
-esac
 "
-
-refusal_logs="$("${KUBECTL[@]}" -n openshell logs deployment/codex-refusal --container server)"
-for expected in \
-  'REFUSED kubectl delete: This command is not approved for this run.' \
-  'REFUSED remote shell: This command is not approved for this run.'
-do
-  grep -Fx "${expected}" <<<"${refusal_logs}" >/dev/null
-done
