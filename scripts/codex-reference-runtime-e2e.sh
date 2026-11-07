@@ -79,18 +79,27 @@ class Handler(BaseHTTPRequestHandler):
             request = {}
         authorization = self.headers.get("authorization", "")
         args = request.get("args")
-        refused = (
+        cli_refused = (
             self.path == "/cli/run"
             and authorization.startswith("Bearer ")
             and request.get("cli") == "kubectl"
             and args == ["delete", "pods"]
         )
-        if not refused:
+        shell_refused = (
+            self.path == "/shell/run"
+            and authorization.startswith("Bearer ")
+            and request.get("target") == "machine.test"
+            and request.get("command") == "uname -a"
+        )
+        if not cli_refused and not shell_refused:
             self.send_response(500)
             self.end_headers()
             return
         reason = "This command is not approved for this run."
-        print(f"REFUSED kubectl delete: {reason}", flush=True)
+        if cli_refused:
+            print(f"REFUSED kubectl delete: {reason}", flush=True)
+        else:
+            print(f"REFUSED remote shell: {reason}", flush=True)
         body = json.dumps({"message": reason}).encode()
         self.send_response(403)
         self.send_header("content-type", "application/json")
@@ -193,6 +202,9 @@ network_policies:
           - allow:
               method: POST
               path: /cli/run
+          - allow:
+              method: POST
+              path: /shell/run
     binaries:
       - path: /usr/local/bin/mcp-gw-sandbox-helper
 YAML
@@ -246,16 +258,16 @@ case \"\$(env)\" in
   *openshell-token-grant-placeholder*) exit 1 ;;
 esac
 
-# Both helpers must fail closed with exit code 125 when a usable edge grant is
-# unavailable. The fixed wrappers add the substitution marker only to the
+# Both helpers must fail closed with exit code 125 when the governed route
+# refuses a request. The fixed wrappers add the substitution marker only to the
 # helper child process, so it is absent from the agent environment and output.
 check_helper_refusal() {
   expected=\$1
   shift
   set +e
   output=\$(env \
-    MCP_GW_CLI_URL=http://127.0.0.1:1/cli/run \
-    MCP_GW_SHELL_URL=http://127.0.0.1:1/shell/run \
+    MCP_GW_CLI_URL=http://codex-refusal.openshell.svc.cluster.local:8080/cli/run \
+    MCP_GW_SHELL_URL=http://codex-refusal.openshell.svc.cluster.local:8080/shell/run \
     \"\$@\" 2>&1)
   status=\$?
   set -e
@@ -281,5 +293,10 @@ case \"\${output}\" in
 esac
 "
 
-"${KUBECTL[@]}" -n openshell logs deployment/codex-refusal --container server |
-  grep -Fx 'REFUSED kubectl delete: This command is not approved for this run.' >/dev/null
+refusal_logs="$("${KUBECTL[@]}" -n openshell logs deployment/codex-refusal --container server)"
+for expected in \
+  'REFUSED kubectl delete: This command is not approved for this run.' \
+  'REFUSED remote shell: This command is not approved for this run.'
+do
+  grep -Fx "${expected}" <<<"${refusal_logs}" >/dev/null
+done

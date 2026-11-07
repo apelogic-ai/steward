@@ -5924,6 +5924,7 @@ mod tests {
             "CLI request failed",
             "codex-refusal.openshell.svc.cluster.local",
             "logs deployment/codex-refusal",
+            "REFUSED remote shell: This command is not approved for this run.",
             "remote-shell",
         ] {
             assert!(
