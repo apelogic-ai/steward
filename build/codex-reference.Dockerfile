@@ -1,6 +1,7 @@
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
 
 USER root
+ARG TARGETARCH
 ARG RIPGREP_VERSION=14.1.0-1
 ARG RIPGREP_SHA256=c5ae63c7bee915b1cfc9f0bd07c55b4ce7f2bcd1133cba4da56719aac26101a4
 ARG JQ_VERSION=1.7.1-3ubuntu0.24.04.2
@@ -15,33 +16,48 @@ ARG TREE_VERSION=2.1.1-2ubuntu3.24.04.2
 ARG TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e
 ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
-RUN curl --fail --silent --show-error --location \
+RUN case "${TARGETARCH}" in \
+      amd64) \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
+        helper_sha256="26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34" \
+        ;; \
+      arm64) \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
+        helper_sha256="0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4" \
+        ;; \
+      *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
         --output /tmp/uv.tar.gz \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/jq_${JQ_VERSION}_amd64.deb" \
         --output /tmp/jq.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/libjq1_${LIBJQ_VERSION}_amd64.deb" \
         --output /tmp/libjq1.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/libonig5_${LIBONIG_VERSION}_amd64.deb" \
         --output /tmp/libonig5.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/fd-find_${FD_FIND_VERSION}_amd64.deb" \
         --output /tmp/fd-find.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location "${helper_url}" \
+        --output /tmp/mcp-gw-sandbox-helper.tar.gz \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${JQ_SHA256}" /tmp/jq.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBJQ_SHA256}" /tmp/libjq1.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBONIG_SHA256}" /tmp/libonig5.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${FD_FIND_SHA256}" /tmp/fd-find.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${TREE_SHA256}" /tmp/tree.deb | sha256sum --check --strict \
+    && printf '%s  %s\n' "${helper_sha256}" \
+        /tmp/mcp-gw-sandbox-helper.tar.gz | sha256sum --check --strict \
     && printf '%s  %s\n' "${UV_SHA256}" /tmp/uv.tar.gz | sha256sum --check --strict \
     && mkdir /tmp/uv-release \
     && tar --extract --gzip --file /tmp/uv.tar.gz --strip-components=1 --directory /tmp/uv-release \
@@ -59,6 +75,17 @@ RUN curl --fail --silent --show-error --location \
     && rm /tmp/ripgrep.deb /tmp/libonig5.deb \
         /tmp/libjq1.deb /tmp/jq.deb /tmp/fd-find.deb /tmp/tree.deb \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && tar --extract --gzip --file /tmp/mcp-gw-sandbox-helper.tar.gz \
+        --directory /usr/local/bin mcp-gw-sandbox-helper \
+    && rm /tmp/mcp-gw-sandbox-helper.tar.gz \
+    && chmod 0755 /usr/local/bin/mcp-gw-sandbox-helper \
+    && printf '%s\n' '#!/bin/sh' \
+        'exec /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper --operation kubectl "$@"' \
+        >/usr/local/bin/kubectl \
+    && printf '%s\n' '#!/bin/sh' \
+        'exec /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper --operation remote-shell "$@"' \
+        >/usr/local/bin/remote-shell \
+    && chmod 0755 /usr/local/bin/kubectl /usr/local/bin/remote-shell \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \
     && npm pack --silent tar@7.5.22 --pack-destination /tmp \
     && rm -rf /usr/lib/node_modules/npm/node_modules/tar \
@@ -82,5 +109,8 @@ RUN rg --version \
     && jq --version \
     && fd --version \
     && tree --version \
+    && test -x /usr/local/bin/mcp-gw-sandbox-helper \
+    && grep -F -- '--operation kubectl' /usr/local/bin/kubectl \
+    && grep -F -- '--operation remote-shell' /usr/local/bin/remote-shell \
     && uv --version \
     && uvx --version

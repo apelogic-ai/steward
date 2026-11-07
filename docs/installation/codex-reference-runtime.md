@@ -34,7 +34,60 @@ output processing:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
+| `kubectl` | MCP-GW 0.7.5 helper | Governed Kubernetes commands |
+| `remote-shell` | MCP-GW 0.7.5 helper | Governed commands on a run-bound machine |
 | `uv` | 0.11.15 | Python project and package management |
+
+## Governed commands and sign-in
+
+The reference image installs the checksum-pinned MCP-GW 0.7.5 sandbox helper
+at `/usr/local/bin/mcp-gw-sandbox-helper`. The `kubectl` and `remote-shell`
+wrappers select the matching helper operation explicitly; the helper does not
+contain a gateway credential or implement a second sign-in flow.
+
+When a Task has the matching approved grant, its agent adapter adds only the
+matching route values to the agent process:
+
+- `MCP_GW_CLI_URL=https://<configured-gateway-host>/cli/run` for an approved
+  `cli/kubectl` command class
+- `MCP_GW_SHELL_URL=https://<configured-gateway-host>/shell/run` for an
+  approved `remote-shell/remote_shell_run/write` grant
+
+The URLs are derived from the Task's configured MCP endpoint. An unrelated or
+unrecognized grant adds none of these values.
+
+`MCP_GW_RUN_TOKEN` is not present in the agent environment. The adapter uses
+the non-secret `openshell-token-grant-placeholder` marker when governed tools
+are granted, and OpenShell substitutes
+a short-lived, run-bound token only on the allowed network request. MCP-GW then
+checks the token's run identifier, target, and approved command class. A
+missing grant, a command classified above the approved class, or a machine not
+tagged for that run is refused by MCP-GW. Helper configuration and request
+failures return exit code `125` with a generic message and do not print the
+placeholder or substituted token.
+
+Use `steward-runtime-providers@1.3.0` with an image containing the helper. Its
+MCP-GW profile preserves exact `POST /mcp` and `DELETE /mcp` access for the
+existing tool transport, preserves the four exact GitHub connections-bridge
+operations, and adds only `POST /cli/run` and `POST /shell/run` on the
+configured gateway host.
+Prefix and sibling paths, other hosts, and all other methods remain blocked.
+The route policy matches the HTTP method and URL path; query input is handled
+by the endpoint without broadening that route. The same Task and Envelope API
+grants drive native UI submissions; the UI does not create a separate command
+or sign-in path.
+
+Example agent commands are:
+
+```sh
+kubectl get pods
+remote-shell machine.test -- uname -a
+```
+
+Operators must bind remote-shell targets to the same run identifier used in
+the Task token. Do not inject a gateway bearer token, token file, cloud access
+key, or Systems Manager credential into the image, execution binding, Task, or
+agent environment.
 
 ## Mirror the exact manifest
 

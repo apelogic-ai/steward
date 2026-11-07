@@ -76,6 +76,28 @@ pub struct TaskExecutionPlanRequest<'a> {
     pub binding: &'a DisposableExecutionBinding,
 }
 
+/// Command routes enabled by the exact grants admitted for one Task.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GovernedCommandGrants {
+    pub cli: bool,
+    pub remote_shell: bool,
+}
+
+pub fn governed_command_grants(tools: &[ToolGrant]) -> GovernedCommandGrants {
+    GovernedCommandGrants {
+        cli: tools.iter().any(|tool| {
+            tool.provider == "cli"
+                && tool.resource == "kubectl"
+                && matches!(tool.action.as_str(), "read" | "write" | "destructive")
+        }),
+        remote_shell: tools.iter().any(|tool| {
+            tool.provider == "remote-shell"
+                && tool.resource == "remote_shell_run"
+                && tool.action == "write"
+        }),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskExecutionPlan {
     pub command: Vec<String>,
@@ -798,7 +820,46 @@ pub trait GitHostingPlane: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::GitTreePath;
+    use steward_types::ToolGrant;
+
+    use super::{GitTreePath, GovernedCommandGrants, governed_command_grants};
+
+    #[test]
+    fn governed_command_grants_match_only_the_shared_exact_contract() {
+        let grant = |provider: &str, resource: &str, action: &str| ToolGrant {
+            provider: provider.to_owned(),
+            resource: resource.to_owned(),
+            action: action.to_owned(),
+        };
+
+        for action in ["read", "write", "destructive"] {
+            assert_eq!(
+                governed_command_grants(&[grant("cli", "kubectl", action)]),
+                GovernedCommandGrants {
+                    cli: true,
+                    remote_shell: false,
+                }
+            );
+        }
+        assert_eq!(
+            governed_command_grants(&[grant("remote-shell", "remote_shell_run", "write")]),
+            GovernedCommandGrants {
+                cli: false,
+                remote_shell: true,
+            }
+        );
+        for refused in [
+            grant("cli", "kubectl", "admin"),
+            grant("cli", "other", "read"),
+            grant("remote-shell", "remote_shell_run", "read"),
+            grant("example-tool", "repository", "read"),
+        ] {
+            assert_eq!(
+                governed_command_grants(&[refused]),
+                GovernedCommandGrants::default()
+            );
+        }
+    }
 
     #[test]
     fn git_tree_paths_accept_common_names_but_reject_escape_and_metadata() {
