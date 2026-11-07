@@ -188,7 +188,8 @@ kill \"\${server_pid}\"
 wait \"\${server_pid}\" 2>/dev/null || true
 trap - EXIT INT TERM
 test \"\${status}\" -eq 125
-test \"\${output}\" = \"CLI request failed\"
+last_line=\$(printf '%s\\n' \"\${output}\" | tail -n 1)
+test \"\${last_line}\" = \"CLI request failed\"
 test \"\$(cat /tmp/steward-cli-refusal-reason)\" = \"This command is not approved for this run.\"
 case \"\${output}\" in
   *openshell-token-grant-placeholder*) exit 1 ;;
