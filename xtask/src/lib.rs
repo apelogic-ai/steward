@@ -3875,7 +3875,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_profile_upgrade_to_1_3_0_adds_only_governed_command_routes() -> Result<(), String> {
+    fn provider_profile_upgrade_to_1_3_0_preserves_bridge_and_adds_only_run_routes()
+    -> Result<(), String> {
         let current = render_test_provider_profile_bundle(
             "v1.2.2",
             "1.2.2",
@@ -3884,29 +3885,32 @@ mod tests {
             "https://mint.gateway.test",
             "192.0.2.0/24",
         )?;
-        let mut replacement = RenderedProviderProfileBundle {
-            profiles: current.profiles.clone(),
-            state: current.state.clone(),
-        };
-        replacement.state["bundle"]["version"] = serde_json::json!("1.3.0");
+        let replacement = render_test_provider_profile_bundle(
+            "v1.3.0",
+            "1.3.0",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
         let mcp = replacement
             .profiles
-            .get_mut("steward-mcp-gw")
+            .get("steward-mcp-gw")
             .ok_or_else(|| "replacement MCP profile is required".to_owned())?;
-        mcp["endpoints"][0]["rules"] = serde_json::json!([
-            {"allow": {"method": "POST", "path": "/mcp"}},
-            {"allow": {"method": "DELETE", "path": "/mcp"}},
-            {"allow": {"method": "POST", "path": "/cli/run"}},
-            {"allow": {"method": "POST", "path": "/cli/jobs"}},
-            {"allow": {"method": "POST", "path": "/shell/run"}},
-            {"allow": {"method": "POST", "path": "/shell/jobs"}}
-        ]);
-        mcp["binaries"]
-            .as_array_mut()
-            .ok_or_else(|| "replacement MCP profile binaries are required".to_owned())?
-            .push(serde_json::json!("/usr/local/bin/mcp-gw-sandbox-helper"));
-        replacement.state["profiles"] = serde_json::to_value(&replacement.profiles)
-            .map_err(|error| format!("render replacement state: {error}"))?;
+        assert_eq!(
+            mcp.pointer("/endpoints/0/rules"),
+            Some(&serde_json::json!([
+                {"allow": {"method": "POST", "path": "/mcp"}},
+                {"allow": {"method": "DELETE", "path": "/mcp"}},
+                {"allow": {"method": "GET", "path": "/connections/github/status"}},
+                {"allow": {"method": "GET", "path": "/oauth/github/status"}},
+                {"allow": {"method": "POST", "path": "/oauth/github/start"}},
+                {"allow": {"method": "POST", "path": "/oauth/github/disconnect"}},
+                {"allow": {"method": "POST", "path": "/cli/run"}},
+                {"allow": {"method": "POST", "path": "/shell/run"}}
+            ])),
+            "the released profile must keep every connections-bridge operation and must not expose unusable detached-job starts"
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "steward-provider-profile-upgrade-1-3-0-test-{}-{}",

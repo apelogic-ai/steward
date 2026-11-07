@@ -358,8 +358,18 @@ mod tests {
             .map_err(|error| format!("render governed command plan: {error:?}"))?;
         let shell = &command_plan.command[2];
         assert!(!shell.contains("MCP_GW_RUN_TOKEN"));
-        assert!(shell.contains("MCP_GW_CLI_URL=https://tools.example.test/cli/run"));
-        assert!(shell.contains("MCP_GW_SHELL_URL=https://tools.example.test/shell/run"));
+        assert!(!shell.contains("https://tools.example.test/cli/run"));
+        assert!(!shell.contains("https://tools.example.test/shell/run"));
+        assert!(
+            command_plan
+                .command
+                .contains(&"https://tools.example.test/cli/run".to_owned())
+        );
+        assert!(
+            command_plan
+                .command
+                .contains(&"https://tools.example.test/shell/run".to_owned())
+        );
         assert!(!shell.contains("MCP_GW_RUN_TOKEN_FILE"));
 
         let unrelated_tools = [ToolGrant {

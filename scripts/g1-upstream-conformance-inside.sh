@@ -87,17 +87,23 @@ network_policies:
               method: DELETE
               path: /mcp
           - allow:
+              method: GET
+              path: /connections/github/status
+          - allow:
+              method: GET
+              path: /oauth/github/status
+          - allow:
+              method: POST
+              path: /oauth/github/start
+          - allow:
+              method: POST
+              path: /oauth/github/disconnect
+          - allow:
               method: POST
               path: /cli/run
           - allow:
               method: POST
-              path: /cli/jobs
-          - allow:
-              method: POST
               path: /shell/run
-          - allow:
-              method: POST
-              path: /shell/jobs
     binaries:
       - path: /usr/bin/curl
 YAML
@@ -187,14 +193,22 @@ assert_upstream_rejects_query() {
 
 assert_allowed_route POST /mcp
 assert_allowed_route DELETE /mcp
+assert_allowed_route GET /connections/github/status
+assert_allowed_route GET /oauth/github/status
+assert_allowed_route POST /oauth/github/start
+assert_allowed_route POST /oauth/github/disconnect
 assert_allowed_route POST /cli/run
-assert_allowed_route POST /cli/jobs
 assert_allowed_route POST /shell/run
-assert_allowed_route POST /shell/jobs
 
 assert_denied_route POST /cli/run/extra
 assert_denied_route GET /cli/run
 assert_denied_route POST /cli/other
+assert_denied_route POST /cli/jobs
+assert_denied_route POST /shell/jobs
+assert_denied_route GET /connections/github/status/extra
+assert_denied_route GET /connections/github/other
+assert_denied_route POST /connections/github/status
+assert_denied_route GET /oauth/github/start
 assert_upstream_rejects_query POST '/cli/run?escape=1'
 
 set +e
