@@ -257,6 +257,7 @@ test -z \"\${MCP_GW_RUN_TOKEN+x}\"
 case \"\$(env)\" in
   *openshell-token-grant-placeholder*) exit 1 ;;
 esac
+echo \"sandbox helper configuration passed\"
 
 # Both helpers must fail closed with exit code 125 when the governed route
 # refuses a request. The fixed wrappers add the substitution marker only to the
@@ -271,26 +272,46 @@ check_helper_refusal() {
     \"\$@\" 2>&1)
   status=\$?
   set -e
-  test \"\$status\" -eq 125
+  if test \"\$status\" -ne 125; then
+    echo \"remote shell helper did not return exit code 125\" >&2
+    exit 1
+  fi
   last_line=\$(printf '%s\\n' \"\$output\" | tail -n 1)
-  test \"\$last_line\" = \"\$expected\"
+  if test \"\$last_line\" != \"\$expected\"; then
+    echo \"remote shell helper did not return its plain refusal\" >&2
+    exit 1
+  fi
   case \"\$output\" in
-    *openshell-token-grant-placeholder*) exit 1 ;;
+    *openshell-token-grant-placeholder*)
+      echo \"remote shell helper exposed its substitution marker\" >&2
+      exit 1
+      ;;
   esac
 }
 check_helper_refusal \"Remote shell request failed\" \
   remote-shell machine.test -- uname -a
+echo \"remote shell refusal passed\"
 
 set +e
 output=\$(MCP_GW_CLI_URL=http://codex-refusal.openshell.svc.cluster.local:8080/cli/run kubectl delete pods 2>&1)
 status=\$?
 set -e
-test \"\${status}\" -eq 125
+if test \"\${status}\" -ne 125; then
+  echo \"CLI helper did not return exit code 125\" >&2
+  exit 1
+fi
 last_line=\$(printf '%s\\n' \"\${output}\" | tail -n 1)
-test \"\${last_line}\" = \"CLI request failed\"
+if test \"\${last_line}\" != \"CLI request failed\"; then
+  echo \"CLI helper did not return its plain refusal\" >&2
+  exit 1
+fi
 case \"\${output}\" in
-  *openshell-token-grant-placeholder*) exit 1 ;;
+  *openshell-token-grant-placeholder*)
+    echo \"CLI helper exposed its substitution marker\" >&2
+    exit 1
+    ;;
 esac
+echo \"CLI refusal passed\"
 "
 
 refusal_logs="$("${KUBECTL[@]}" -n openshell logs deployment/codex-refusal --container server)"
