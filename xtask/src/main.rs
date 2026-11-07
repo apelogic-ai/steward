@@ -5921,9 +5921,9 @@ mod tests {
             r#"test -z \"\${MCP_GW_RUN_TOKEN+x}\""#,
             "exit code 125",
             "kubectl delete pods",
-            "CLI request failed",
             "codex-refusal.openshell.svc.cluster.local",
             "logs deployment/codex-refusal",
+            "REFUSED kubectl delete: This command is not approved for this run.",
             "REFUSED remote shell: This command is not approved for this run.",
             "remote-shell",
         ] {

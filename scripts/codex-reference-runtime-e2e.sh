@@ -290,11 +290,11 @@ case \"\$(env)\" in
 esac
 
 # Both helpers must fail closed with exit code 125 when the governed route
-# refuses a request. The fixed wrappers add the substitution marker only to the
-# helper child process, so it is absent from the agent environment and output.
+# refuses a request. The host-side fixture logs below prove the exact request
+# and plain refusal; OpenShell may decorate or suppress the helper's stderr.
+# The fixed wrappers add the substitution marker only to the helper child
+# process, so it is absent from the agent environment and output.
 check_helper_refusal() {
-  expected=\$1
-  shift
   set +e
   output=\$(env \
     NODE_EXTRA_CA_CERTS=/sandbox/codex-refusal-ca.crt \
@@ -308,21 +308,13 @@ check_helper_refusal() {
     exit 1
   fi
   case \"\$output\" in
-    *\"\$expected\"*) ;;
-    *)
-      echo \"remote shell helper did not return its plain refusal\" >&2
-      exit 1
-      ;;
-  esac
-  case \"\$output\" in
     *openshell-token-grant-placeholder*)
       echo \"remote shell helper exposed its substitution marker\" >&2
       exit 1
       ;;
   esac
 }
-check_helper_refusal \"Remote shell request failed\" \
-  remote-shell machine.test -- uname -a
+check_helper_refusal remote-shell machine.test -- uname -a
 
 set +e
 output=\$(env \
@@ -335,13 +327,6 @@ if test \"\${status}\" -ne 125; then
   echo \"CLI helper did not return exit code 125\" >&2
   exit 1
 fi
-case \"\${output}\" in
-  *\"CLI request failed\"*) ;;
-  *)
-    echo \"CLI helper did not return its plain refusal\" >&2
-    exit 1
-    ;;
-esac
 case \"\${output}\" in
   *openshell-token-grant-placeholder*)
     echo \"CLI helper exposed its substitution marker\" >&2
