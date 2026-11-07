@@ -27,6 +27,7 @@ submitter-scoped `Idempotency-Key`.
 | `PUT` | `/v1/tasks/{taskUid}/inputs` | `204`; body is `application/x-tar` |
 | `POST` | `/v1/tasks/{taskUid}/execute` | `202`; desired execution is recorded durably |
 | `GET` | `/v1/tasks/{taskUid}` | `200`; returns `TaskStatusResponse` |
+| `GET` | `/v1/tasks/{taskUid}/logs/{stream}` | `200` with bounded `stdout` or `stderr`, scoped to the exact authenticated submitter and owner |
 | `GET` | `/v1/tasks/{taskUid}/outputs` | `200` with `application/x-tar` after success or when a failed run has partial output or requested diagnostics; `204` when a failed run has neither |
 | `DELETE` | `/v1/tasks/{taskUid}` | `202`; desired cleanup is recorded durably |
 
@@ -98,12 +99,18 @@ The maximum raw HTTP input archive is **64 MiB (67,108,864 bytes)**. The maximum
 archive accepted from the sandbox is also **64 MiB (67,108,864 bytes)**. An oversized input is
 `413 Payload Too Large`; oversized sandbox output fails the Task before output persistence.
 
-After an agent process fails, the authenticated submitter can download validated files left
-beneath `out/`, when any exist. The archive also includes bounded stdout and stderr only when the
-Task requested `diagnostics.executionLog: full`. A terminal failure with neither partial output
-nor requested diagnostics returns `204 No Content`; a failure before the process starts likewise
-has no process log, and its safe explanation remains in `failureReason`. Another owner receives
-the same `404` as for any Task outside their submitter scope.
+Every ordinary Agent Task retains bounded stdout and stderr after its process starts. The exact
+authenticated submitter and canonical owner can read either stream from
+`GET /v1/tasks/{taskUid}/logs/{stream}?after={byteOffset}` while the Task runs and after it ends.
+Each JSON response is at most 64 KiB and reports `complete`, `partial`, `truncated`, and the total
+captured size. Another submitter or owner receives the same `404` as for an absent Task.
+
+After an agent process fails, the authenticated submitter can also download validated files left
+beneath `out/`, when any exist. For compatibility, the output archive includes bounded stdout and
+stderr only when the Task requested `diagnostics.executionLog: full`. A terminal failure with
+neither partial output nor requested archive diagnostics returns `204 No Content`; a failure
+before the process starts has no process log, and its safe explanation remains in
+`failureReason`.
 
 ## Production identity boundary
 

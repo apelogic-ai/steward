@@ -45,6 +45,10 @@ allow = ["CDLA-Permissive-2.0"]
 [advisories]
 version = 2
 yanked = "deny"
+# `p256` uses this release only for test key generation. The production dependency
+# check fails if `p256` or `crypto-bigint` 0.5 enters any shipped binary.
+# Review and remove this exception by 2027-01-31, or earlier when test tooling upgrades.
+ignore = ["RUSTSEC-2026-0387"]
 
 [bans]
 multiple-versions = "warn"

@@ -6,8 +6,13 @@ rendered="$(mktemp)"
 component_rendered="$(mktemp)"
 http_route_default_rendered="$(mktemp)"
 http_route_timeout_rendered="$(mktemp)"
+mint_route_default_rendered="$(mktemp)"
+mint_route_disabled_rendered="$(mktemp)"
+mint_route_enabled_rendered="$(mktemp)"
 compatibility_directory="$(mktemp -d)"
 inline_config_directory="$(mktemp -d)"
+reused_values_chart="$(mktemp -d)"
+reused_values_rendered="$(mktemp)"
 missing_namespace_error="$(mktemp)"
 receiver_startup_config="$(mktemp)"
 receiver_startup_output="$(mktemp)"
@@ -27,10 +32,13 @@ cleanup() {
     wait "${receiver_stub_pid}" 2>/dev/null || true
   fi
   rm -f "${rendered}" "${component_rendered}" "${http_route_default_rendered}" \
-    "${http_route_timeout_rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
-    "${receiver_startup_output}" "${receiver_stub_port}" "${receiver_stub_kubeconfig}"
+    "${http_route_timeout_rendered}" "${mint_route_default_rendered}" \
+    "${mint_route_disabled_rendered}" "${mint_route_enabled_rendered}" \
+    "${missing_namespace_error}" "${receiver_startup_config}" "${receiver_startup_output}" \
+    "${receiver_stub_port}" "${receiver_stub_kubeconfig}" "${reused_values_rendered}"
   find "${compatibility_directory}" -depth -delete
   find "${inline_config_directory}" -depth -delete
+  find "${reused_values_chart}" -depth -delete
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -139,6 +147,110 @@ http_route_profile=(
   --set-string web.httpRoute.backendTls.caConfigMap.name=steward-apiserver-ca
   --set-string web.httpRoute.backendTls.caConfigMap.key=ca.crt
 )
+mint_route_profile=(
+  --set mint.httpRoute.enabled=true
+  --set-string 'mint.httpRoute.hostnames[0]=mint.example.test'
+  --set-string 'mint.httpRoute.parentRefs[0].name=shared-gateway'
+  --set-string 'mint.httpRoute.parentRefs[0].namespace=edge-system'
+  --set-string 'mint.httpRoute.parentRefs[0].sectionName=https'
+)
+
+helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca > "${mint_route_default_rendered}"
+helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set mint.httpRoute.enabled=false > "${mint_route_disabled_rendered}"
+if ! cmp -s "${mint_route_default_rendered}" "${mint_route_disabled_rendered}"; then
+  diff -u "${mint_route_default_rendered}" "${mint_route_disabled_rendered}" >&2 || true
+  echo 'disabled Mint HTTPRoute must leave the existing render byte-identical' >&2
+  exit 1
+fi
+
+helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  "${mint_route_profile[@]}" > "${mint_route_enabled_rendered}"
+mint_route="$(awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: HTTPRoute/ && $0 ~ /name: steward-mint/ { print; exit }
+' "${mint_route_enabled_rendered}" | sed '/^# Source:/d; /^[[:space:]]*$/d')"
+expected_mint_route='apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: steward-mint
+spec:
+  parentRefs:
+    - name: "shared-gateway"
+      namespace: "edge-system"
+      sectionName: "https"
+  hostnames:
+    - "mint.example.test"
+  rules:
+    - matches:
+        - path: { type: Exact, value: "/token" }
+        - path: { type: Exact, value: "/.well-known/jwks.json" }
+      backendRefs:
+        - name: steward-mint
+          port: 8080'
+if [[ "${mint_route}" != "${expected_mint_route}" ]]; then
+  diff -u <(printf '%s\n' "${expected_mint_route}") <(printf '%s\n' "${mint_route}") >&2 || true
+  echo 'enabled Mint HTTPRoute must render exactly the reviewed route object' >&2
+  exit 1
+fi
+if [[ "$(grep -c '^kind: HTTPRoute$' "${mint_route_enabled_rendered}")" != 1 ]]; then
+  echo 'enabling the Mint HTTPRoute must render exactly one HTTPRoute object' >&2
+  exit 1
+fi
+if grep -Fq '/introspect' <<<"${mint_route}" || grep -Fq 'PathPrefix' <<<"${mint_route}"; then
+  echo 'Mint HTTPRoute must never expose introspection or prefix matches' >&2
+  exit 1
+fi
+
+if helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set mint.httpRoute.enabled=true \
+  --set-string 'mint.httpRoute.parentRefs[0].name=shared-gateway' \
+  --set-string 'mint.httpRoute.parentRefs[0].namespace=edge-system' \
+  --set-string 'mint.httpRoute.parentRefs[0].sectionName=https' >/dev/null 2>&1
+then
+  echo 'enabled Mint HTTPRoute must reject an empty hostname list' >&2
+  exit 1
+fi
+if helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set mint.httpRoute.enabled=true \
+  --set-string 'mint.httpRoute.hostnames[0]=mint.example.test' >/dev/null 2>&1
+then
+  echo 'enabled Mint HTTPRoute must reject an empty parent reference list' >&2
+  exit 1
+fi
+if helm_template \
+  "${legacy_complete_images[@]}" \
+  "${complete_profile[@]}" \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  "${mint_route_profile[@]}" \
+  --set-string 'mint.httpRoute.paths[0].type=PathPrefix' \
+  --set-string 'mint.httpRoute.paths[0].value=/' >/dev/null 2>&1
+then
+  echo 'Mint HTTPRoute must reject caller-supplied path matches' >&2
+  exit 1
+fi
+if helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  "${mint_route_profile[@]}" >/dev/null 2>&1
+then
+  echo 'enabled Mint HTTPRoute must reject a missing Mint Service' >&2
+  exit 1
+fi
 
 helm_template \
   "${legacy_complete_images[@]}" \
@@ -167,6 +279,14 @@ web_route="$(awk '
 ' "${http_route_timeout_rendered}")"
 grep -Fq 'request: "90s"' <<<"${api_route}"
 grep -Fq 'backendRequest: "85s"' <<<"${api_route}"
+grep -Fq 'path: { type: PathPrefix, value: "/app/api" }' <<<"${api_route}" || {
+  echo 'the shipped chart must route the Agent Runs log API to the apiserver' >&2
+  exit 1
+}
+grep -Fq 'path: { type: PathPrefix, value: "/v1" }' <<<"${api_route}" || {
+  echo 'the shipped chart must route task-authenticated logs to the apiserver' >&2
+  exit 1
+}
 grep -Fq 'request: "30s"' <<<"${web_route}"
 grep -Fq 'backendRequest: "25s"' <<<"${web_route}"
 
@@ -934,5 +1054,41 @@ helm_template "${governed_inputs[@]}" \
   --set-string config.mint.openshellNamespace=customer-openshell > "${rendered}"
 grep -qF 'kind: ClusterSPIFFEID' "${rendered}"
 grep -qF 'name: steward-mint' "${rendered}"
+if ! awk '
+  $1 == "litellmSpendLogTimeoutSeconds:" { found = ($2 == 10) }
+  END { exit !found }
+' "${root}/charts/steward/values.yaml"; then
+  echo 'the chart LiteLLM spend-log timeout must default to 10 seconds' >&2
+  exit 1
+fi
+cp -R "${root}/charts/steward/." "${reused_values_chart}/"
+awk '$1 != "litellmSpendLogTimeoutSeconds:"' \
+  "${root}/charts/steward/values.yaml" > "${reused_values_chart}/values.yaml"
+if ! helm template steward "${reused_values_chart}" --namespace steward \
+  "${customer_images[@]}" "${governed_inputs[@]}" \
+  --set-string config.mint.issuer=https://mint.example.test \
+  --set-string config.mint.spiffeTrustDomain=customer.example.test \
+  --set-string config.mint.openshellNamespace=customer-openshell > "${reused_values_rendered}"; then
+  echo 'the chart must render when reused upgrade values omit the LiteLLM spend-log timeout' >&2
+  exit 1
+fi
+if grep -qF 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${reused_values_rendered}"; then
+  echo 'a missing LiteLLM spend-log timeout must use the controller default' >&2
+  exit 1
+fi
+if grep -qF 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}"; then
+  echo 'the default LiteLLM spend-log timeout must preserve the existing controller render' >&2
+  exit 1
+fi
+helm_template "${governed_inputs[@]}" \
+  --set-string config.mint.issuer=https://mint.example.test \
+  --set-string config.mint.spiffeTrustDomain=customer.example.test \
+  --set-string config.mint.openshellNamespace=customer-openshell \
+  --set config.controller.litellmSpendLogTimeoutSeconds=17 > "${rendered}"
+if ! grep -A1 -F 'name: STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS' "${rendered}" |
+  grep -qF 'value: "17"'; then
+  echo 'the controller must receive the configured LiteLLM spend-log timeout' >&2
+  exit 1
+fi
 
 echo 'core-only chart dependency boundary passed'

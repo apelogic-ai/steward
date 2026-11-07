@@ -357,6 +357,7 @@ pub struct GrantRevocationRequest {
         task_inputs_contract,
         task_execute_contract,
         task_status_contract,
+        task_logs_contract,
         task_outputs_contract,
         task_delete_contract,
         browser_auth::session,
@@ -741,6 +742,29 @@ pub async fn task_status_contract() {}
 
 #[utoipa::path(
     get,
+    path = "/v1/tasks/{taskUid}/logs/{stream}",
+    params(
+        ("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity"),
+        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr"),
+        ("after" = Option<usize>, Query, description = "Byte offset for the next bounded JSON chunk; omit for the complete text stream")
+    ),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 200, content(
+            (agent_runs_ui::BrowserExecutionLogResponse = "application/json"),
+            (String = "text/plain")
+        )),
+        (status = 400, description = "taskUid or byte offset is invalid", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task or stream is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_logs_contract() {}
+
+#[utoipa::path(
+    get,
     path = "/v1/tasks/{taskUid}/outputs",
     params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
     security(("taskBearer" = [])),
@@ -889,6 +913,8 @@ pub struct AgentRunSpendView {
     pub observed_amount: String,
     pub currency: String,
     pub exhausted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -2360,6 +2386,7 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
         observed_amount: spend.observed_amount.clone(),
         currency: spend.currency.clone(),
         exhausted: spend.exhausted || spending_limit_reached,
+        total_tokens: spend.total_tokens,
     });
     let unavailable = |reason: &str| AgentRunDataStatus {
         availability: AgentRunAvailability::Unavailable,
@@ -4113,7 +4140,7 @@ mod tests {
                 command: vec![
                     "example-runner".to_owned(),
                     request.workflow_prompt.to_owned(),
-                    format!("{}/{}", request.model.provider, request.model.model),
+                    request.model.model.clone(),
                 ],
             })
         }
@@ -8387,6 +8414,7 @@ mod tests {
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
         fail_task_submission_error: Arc<Mutex<Option<StoreError>>>,
         task_output_transcripts: Arc<Mutex<Vec<(Uuid, steward_store::TaskOutputTranscript)>>>,
+        provider_control_tasks: Arc<Mutex<Vec<Uuid>>>,
         miss_next_task_lookup: Arc<Mutex<bool>>,
         task_operations: Arc<Mutex<Vec<TaskRuntimeOperationRecord>>>,
         task_approval_state: Arc<Mutex<FakeApprovalState>>,
@@ -10390,6 +10418,65 @@ mod tests {
             })
         }
 
+        fn task_execution_log<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            owner_user_id: &'a str,
+            stream: steward_store::AgentRunLogStream,
+        ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>> {
+            Box::pin(async move {
+                let task = TaskSubmissionLedger::task_for_submitter(
+                    self,
+                    task_uid,
+                    submitter_service,
+                    owner_user_id,
+                )
+                .await?;
+                let Some(task) = task else {
+                    return Ok(None);
+                };
+                if self
+                    .provider_control_tasks
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake provider-control Task ledger lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .contains(&task_uid)
+                {
+                    return Ok(None);
+                }
+                let transcript = self
+                    .task_output_transcripts
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake Task transcript ledger lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .iter()
+                    .find(|(candidate, _)| *candidate == task_uid)
+                    .map(|(_, transcript)| transcript.clone());
+                let Some(transcript) = transcript else {
+                    return Ok(None);
+                };
+                let content = match stream {
+                    steward_store::AgentRunLogStream::Stdout => transcript.execution_stdout,
+                    steward_store::AgentRunLogStream::Stderr => transcript.execution_stderr,
+                };
+                Ok(content.map(|content| AgentRunExecutionLog {
+                    content,
+                    complete: matches!(
+                        task.phase,
+                        TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+                    ),
+                    partial: false,
+                }))
+            })
+        }
+
         fn request_task_finalization<'a>(
             &'a self,
             task_uid: Uuid,
@@ -10544,6 +10631,7 @@ mod tests {
             tasks: Arc::new(Mutex::new(Vec::new())),
             fail_task_submission_error: Arc::new(Mutex::new(None)),
             task_output_transcripts: Arc::new(Mutex::new(Vec::new())),
+            provider_control_tasks: Arc::new(Mutex::new(Vec::new())),
             miss_next_task_lookup: Arc::new(Mutex::new(false)),
             task_operations: Arc::new(Mutex::new(Vec::new())),
             task_approval_state: Arc::new(Mutex::new(FakeApprovalState::Pending)),
@@ -14197,6 +14285,154 @@ mod tests {
         Ok((status, content_type, body.to_vec()))
     }
 
+    #[tokio::test]
+    async fn runner_log_route_is_submitter_scoped_and_incremental() -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let task_uid = submit_package_path_task(
+            &app,
+            "runner-incremental-log",
+            Some(serde_json::json!({ "executionLog": "off" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            task_uid,
+            &stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]),
+            Some(strict_transcript(b"agent stdout\n", b"agent stderr\n")),
+        )?;
+
+        let request =
+            |requested_task_uid: Uuid, assertion: Option<&str>, stream: &str, after: usize| {
+                let mut request = Request::builder().method("GET").uri(format!(
+                    "/v1/tasks/{requested_task_uid}/logs/{stream}?after={after}"
+                ));
+                if let Some(assertion) = assertion {
+                    request = request.header("authorization", format!("Bearer {assertion}"));
+                }
+                request
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build runner log request: {error}"))
+            };
+
+        let response = app
+            .clone()
+            .oneshot(request(task_uid, Some("github-assertion"), "stdout", 6)?)
+            .await
+            .map_err(|error| format!("request runner stdout: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read runner stdout: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode runner stdout: {error}"))?;
+        assert_eq!(body["stream"], "stdout");
+        assert_eq!(body["content"], "stdout\n");
+        assert_eq!(body["sizeBytes"], 13);
+        assert_eq!(body["complete"], true);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["truncated"], false);
+
+        let hidden = app
+            .clone()
+            .oneshot(request(
+                task_uid,
+                Some("github-bob-assertion"),
+                "stderr",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request another caller's stderr: {error}"))?;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let different_service = app
+            .clone()
+            .oneshot(request(task_uid, Some("service-assertion"), "stdout", 0)?)
+            .await
+            .map_err(|error| format!("request log from another service: {error}"))?;
+        assert_eq!(different_service.status(), StatusCode::NOT_FOUND);
+
+        let unknown = app
+            .clone()
+            .oneshot(request(
+                Uuid::from_u128(999_999),
+                Some("github-assertion"),
+                "stdout",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request unknown Task log: {error}"))?;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(request(task_uid, None, "stdout", 0)?)
+            .await
+            .map_err(|error| format!("request log without credentials: {error}"))?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let provider_control_uid = submit_package_path_task(
+            &app,
+            "provider-control-log",
+            Some(serde_json::json!({ "executionLog": "full" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            provider_control_uid,
+            &stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]),
+            Some(strict_transcript(b"must stay hidden", b"must stay hidden")),
+        )?;
+        ledger
+            .provider_control_tasks
+            .lock()
+            .map_err(|_| "fake provider-control Task ledger lock was poisoned")?
+            .push(provider_control_uid);
+        let provider_control = app
+            .clone()
+            .oneshot(request(
+                provider_control_uid,
+                Some("github-assertion"),
+                "stdout",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request provider-control log: {error}"))?;
+        assert_eq!(provider_control.status(), StatusCode::NOT_FOUND);
+
+        let no_transcript_uid = submit_package_path_task(
+            &app,
+            "historical-log-unavailable",
+            Some(serde_json::json!({ "executionLog": "off" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            no_transcript_uid,
+            &stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]),
+            None,
+        )?;
+        let no_transcript = app
+            .clone()
+            .oneshot(request(
+                no_transcript_uid,
+                Some("github-assertion"),
+                "stdout",
+                0,
+            )?)
+            .await
+            .map_err(|error| format!("request historical unavailable log: {error}"))?;
+        assert_eq!(no_transcript.status(), StatusCode::NOT_FOUND);
+
+        let invalid = app
+            .oneshot(request(task_uid, Some("github-assertion"), "combined", 0)?)
+            .await
+            .map_err(|error| format!("request invalid runner stream: {error}"))?;
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
     fn stored_output_archive(entries: &[(&str, &[u8], u8)]) -> Vec<u8> {
         use steward_types::task_output_archive::{
             TarEntryKind, append_tar_entry, finish_tar_archive,
@@ -17577,7 +17813,7 @@ mod tests {
         );
         assert_eq!(
             task.agent_command.get(2).map(String::as_str),
-            Some("openai/gpt-5.4")
+            Some("gpt-5.4")
         );
         let api_task = &rows[1];
         assert_eq!(api_task.task_origin, TaskOrigin::Api);
@@ -18734,6 +18970,7 @@ mod tests {
                 currency: "USD".to_owned(),
                 exhausted: false,
                 observed_at: "2026-08-12T12:00:30.000000Z".to_owned(),
+                total_tokens: Some(250),
             }),
             history_partial: false,
             direct_task_evidence: None,

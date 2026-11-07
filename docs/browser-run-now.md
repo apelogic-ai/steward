@@ -1,6 +1,7 @@
 # Browser Run now
 
-Status: current Steward v0.3.20 contract.
+Status: current Steward v0.3.28 contract, plus the unreleased `workflowRef` behavior planned for
+the next release.
 
 Steward users can start a governed Task from the browser without first creating a
 GitHub Actions workflow. The browser route is:
@@ -164,19 +165,23 @@ per-user listing can contain one). The browser loads the list once per page load
 shares it between Get started and this panel; **Refresh repositories** in Get started,
 **Retry repositories** after a failure, or a page reload fetches it again.
 
-Publication is a server-owned operation. Steward reconstructs the successful run's
-exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
-creates a `steward/task-<taskUid>` branch from the repository's default branch, pushes
-exactly those two files, and opens a pull request. It never writes to the default
-branch. The response reports the package closure digest proven by the browser run.
-Retries for the same Task and repository reuse the same durable operation identity, so
-a changed browser retry key cannot create a second pull request.
+Publication is a server-owned operation. Steward reconstructs the successful run's exact
+one-file inline package, renders the `steward-run` v0.8.0-or-later caller (pinned to the verified
+workflow commit, or following the installation's configured `workflowRef` in `remote` mode),
+creates a `steward/task-<taskUid>` branch from the repository's default branch, pushes exactly
+those two files, and opens a pull request. It never writes to the default branch. The response
+reports the package closure digest proven by the browser run. Retries for the same Task and
+repository reuse the same durable operation identity, so a changed browser retry key cannot
+create a second pull request.
 
 After the pull request is merged, Steward verifies the exact generated workflow on the
 default branch before enabling **Run on GitHub**. Dispatch is limited to that one
 generated workflow, its declared `workflow_dispatch` inputs, and the default branch.
 The run detail then shows the GitHub run, jobs, bounded failed-job log content, and the
 owner-scoped governed Task correlated by repository, run ID, and attempt.
+In `remote` mode, setting, changing, or removing the installation's `workflowRef` changes that
+generated workflow, so Tasks published before the configuration change stop matching until their
+caller is updated. Moving the configured ref itself does not change the caller or affect the match.
 
 The browser routes are under `/app/api/v1` and remain bound to the authenticated
 canonical owner. Per-user repository listings and lookups, workflow detection,

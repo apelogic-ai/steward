@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.20`. The release workflow pulls the published OCI
+Release contract: chart `0.3.28`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -278,14 +278,42 @@ required normalized fields are `manifestSchemaVersion`, `version`,
 v0.7.0 or later and immutable commits. The deprecated
 `governedJobContainerImage` field remains accepted for older installation
 values, but the active versioned workflow generator does not use it. This value
-binds generated workflows to the same
-steward-run release selected for the installation.
+records the reviewed steward-run release selected for the installation. The
+`workflowRef` option below is an unreleased addition after chart 0.3.28.
+
+For the default `remote` mode, omit the optional `workflowRef` to keep generated
+callers pinned to `workflowCommit`. An installation may instead set a non-empty
+`workflowRef` alongside the verified fields:
+
+```yaml
+config:
+  apiserver:
+    stewardRunRelease:
+      workflowRef: customer-managed
+```
+
+With that setting, versioned and direct-package callers generated in `remote`
+mode use
+`<workflowRepository>/.github/workflows/<workflow-file>@<workflowRef>`. Use it
+when `workflowRepository` names an in-organization steward-run copy that only
+the customer's administrators may update. Those administrators can then move
+the configured ref when upgrading steward-run without editing every compatible
+caller pipeline. The verified `workflowCommit` remains required and stays in
+generated provenance; it records the reviewed baseline rather than the code
+selected by the ref. Generated provenance records `workflowRef` separately as
+the effective reference. The ref may move, so the code that runs is no longer
+pinned to the verified commit. The configured `version` must still identify the
+release whose reusable-workflow input contract the ref provides. If that input
+contract changes, update `version` and regenerate affected callers.
+`workflowRef` is an installation choice, not a replacement release coordinate.
+Empty and whitespace-only values fail configuration loading.
 
 Set `config.apiserver.stewardRunWorkflowInstallationMode` independently from
 those signed coordinates. Its default, `remote`, renders the exact immutable
-repository and workflow commit. `vendored` renders the local path described
-below; it does not change the verified release coordinates retained in
-generated provenance.
+repository and workflow commit when `workflowRef` is unset, or the configured
+repository and ref when it is set. `vendored` renders the local path described
+below; it does not change the verified release coordinates retained in generated
+provenance and does not use `workflowRef`.
 
 ### Vendored steward-run workflow
 
@@ -682,13 +710,21 @@ preserve the same immutable coordinates and cross-component relationships.
 
    `config.controller.litellmUrl` is the LiteLLM management API base URL. The
    controller appends `/key/delete`, `/key/list`, `/key/generate`, and
-   `/v1/model/info`; do not add an operation path to that value.
+   `/v1/model/info`; do not add an operation path to that value. Beginning with
+   Steward 0.3.28, it also appends `/spend/logs`. The
+   LiteLLM management credential must be allowed to read request logs for
+   runtime key hashes. If LiteLLM refuses that read, budget enforcement
+   continues but Agent Runs shows spend and tokens as `Not reported`.
+   `config.controller.litellmSpendLogTimeoutSeconds` limits each request-log
+   read, defaults to 10 seconds, and accepts whole values of at least 1 second.
 
    Every model admitted by the capability catalog must have pricing configured
-   in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,
-   including its provider prefix (for example `openai/model-name`). In this
-   contract, “provider-qualified” means that exact catalog string and routing
-   alias; Steward does not strip, add, or remap the prefix.
+   in LiteLLM. In Steward 0.3.27, LiteLLM `model_name` must equal the exact
+   provider-qualified catalog model string (for example `openai/model-name`).
+   Beginning with Steward 0.3.28, `model_name` must instead equal the exact
+   capability-catalog `model`, which may be a deployment-defined alias with no
+   provider prefix. Steward sends that alias unchanged; the separate catalog
+   `provider` selects compatible execution bindings.
 
    Governed dependencies remain platform-owned. Set resource requests and
    limits for the OpenShell gateway, sandbox workloads, SPIRE components, and

@@ -90,7 +90,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "ANTHROPIC_CUSTOM_HEADERS; ",
                 "export ANTHROPIC_BASE_URL=\"$inference_endpoint\"; ",
                 "export ANTHROPIC_API_KEY=openshell-token-grant-placeholder; ",
-                "export DISABLE_UPDATES=1; ",
+                "export DISABLE_AUTOUPDATER=1; ",
                 "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; ",
                 "export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1; ",
                 "mkdir -p \"$CLAUDE_CONFIG_DIR\"; ",
@@ -116,7 +116,7 @@ impl ClaudeCodeTaskExecutionAdapter {
             shell_command,
             "steward-workflow".to_owned(),
             request.workflow_prompt.to_owned(),
-            format!("{}/{}", request.model.provider, request.model.model),
+            request.model.model.clone(),
             self.inference_endpoint.clone(),
             mcp_config,
             config_dir.to_owned(),
@@ -320,6 +320,8 @@ mod tests {
         let shell = &plan.command[2];
         let mcp_config = &plan.command[7];
         assert!(shell.contains("ANTHROPIC_API_KEY=openshell-token-grant-placeholder"));
+        assert!(shell.contains("export DISABLE_AUTOUPDATER=1"));
+        assert!(!shell.contains("DISABLE_UPDATES"));
         assert!(shell.contains("CLAUDE_CONFIG_DIR=\"$config_dir\""));
         assert!(shell.contains("test \"$(id -u)\" -ne 0"));
         for inherited_selector in [
@@ -348,9 +350,7 @@ mod tests {
         assert!(shell.contains("exit \"$status\""));
         assert!(shell.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"));
         assert_eq!(plan.command[4], "Review the repository state.");
-        // LiteLLM grants the runtime key the provider-qualified model group.
-        // Claude must request that same exact group, not its bare model name.
-        assert_eq!(plan.command[5], "anthropic/claude-sonnet-example");
+        assert_eq!(plan.command[5], "claude-sonnet-example");
         assert_eq!(plan.command[6], "http://inference.example.test:4000");
         assert_eq!(plan.command[8], "/sandbox/steward-claude");
         assert_eq!(plan.command[9], binding.executable);
@@ -385,6 +385,8 @@ mod tests {
                 "test \"$CLAUDE_CONFIG_DIR\" = \"$EXPECTED_CLAUDE_CONFIG_DIR\" || exit 92\n",
                 "test \"$ANTHROPIC_BASE_URL\" = http://inference.example.test:4000 || exit 92\n",
                 "test \"$ANTHROPIC_API_KEY\" = openshell-token-grant-placeholder || exit 93\n",
+                "test \"$DISABLE_AUTOUPDATER\" = 1 || exit 94\n",
+                "test -z \"${DISABLE_UPDATES+x}\" || exit 94\n",
                 "if [ \"$1\" = --version ]; then\n",
                 "  printf '%s\\n' '2.1.222 (Claude Code)'\n",
                 "  exit 0\n",
@@ -546,6 +548,29 @@ mod tests {
         assert!(plan.command.iter().all(|argument| !argument.is_empty()));
         assert!(!plan.command[7].contains("mcpServers"));
         assert!(!plan.command[2].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_an_explicitly_qualified_model_alias_exact() -> Result<(), String> {
+        let adapter =
+            ClaudeCodeTaskExecutionAdapter::new("https://inference.example.test".to_owned())
+                .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        let plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &ModelRef {
+                    provider: "anthropic".to_owned(),
+                    model: "anthropic/legacy-alias".to_owned(),
+                },
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render adapter plan: {error:?}"))?;
+
+        assert_eq!(plan.command[5], "anthropic/legacy-alias");
         Ok(())
     }
 

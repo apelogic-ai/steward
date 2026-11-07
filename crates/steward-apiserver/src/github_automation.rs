@@ -2307,6 +2307,7 @@ mod tests {
                 manifest_schema_version: 3,
                 version: "0.8.0".to_owned(),
                 workflow_repository: "example-org/steward-run".to_owned(),
+                workflow_ref: None,
                 workflow_commit: "a".repeat(40),
                 action_commit: "b".repeat(40),
                 governed_job_container_image: None,

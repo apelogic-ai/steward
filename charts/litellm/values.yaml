@@ -1,0 +1,51 @@
+litellm:
+  image:
+    repository: ghcr.io/berriai/litellm-database
+    tag: v1.106.2@sha256:35f2cec3a14bb297e08bfab56c1fc377432bc4071aaf71978fdff043a5d91e79
+    pullPolicy: IfNotPresent
+  masterkeySecretName: governed-execution
+  masterkeySecretKey: litellm-master-key
+  environmentSecrets:
+    - governed-execution
+  envVars: {}
+  extraEnvVars: {}
+  extraResources: []
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  proxyConfigMap:
+    create: false
+    name: litellm-config
+    key: config.yaml
+  db:
+    useExisting: true
+    deployStandalone: false
+    endpoint: postgresql.steward-test.svc.cluster.local
+    database: litellm
+    url: "postgresql\u003a//$(DATABASE_USERNAME)\u003a$(DATABASE_PASSWORD)\u0040$(DATABASE_HOST)/$(DATABASE_NAME)"
+    readReplicaUrl: ""
+    secret:
+      name: governed-execution
+      usernameKey: litellm-database-username
+      passwordKey: litellm-database-password
+  redis:
+    enabled: false
+  ingress:
+    enabled: false
+
+route:
+  enabled: false
+  parentRefs: []
+  hostname: ""
+  timeouts:
+    request: ""
+    backendRequest: ""

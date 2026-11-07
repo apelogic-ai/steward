@@ -13,7 +13,7 @@ use axum::serve::Listener;
 use kube::Client;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
-use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
+use steward_adapter_litellm::{DEFAULT_SPEND_LOG_TIMEOUT, LiteLlmAdapter, LiteLlmConfig};
 use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
     validate_connections_bridge_gateway_origin,
@@ -59,6 +59,13 @@ impl InferencePlane for DeploymentInferencePlane {
         match self {
             Self::Stock(plane) => plane.capabilities(),
             Self::Managed(plane) => plane.capabilities(),
+        }
+    }
+
+    fn usage_report_timeout(&self) -> Duration {
+        match self {
+            Self::Stock(plane) => plane.usage_report_timeout(),
+            Self::Managed(plane) => plane.usage_report_timeout(),
         }
     }
 
@@ -135,10 +142,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     store.migrate().await?;
     let inference = match inference_mode()? {
         InferenceMode::Stock => DeploymentInferencePlane::Stock(
-            LiteLlmAdapter::new(LiteLlmConfig {
-                base_url: required("STEWARD_LITELLM_URL")?,
-                master_key: required("STEWARD_LITELLM_MASTER_KEY")?,
-            })
+            LiteLlmAdapter::new_with_spend_log_timeout(
+                LiteLlmConfig {
+                    base_url: required("STEWARD_LITELLM_URL")?,
+                    master_key: required("STEWARD_LITELLM_MASTER_KEY")?,
+                },
+                litellm_spend_log_timeout()?,
+            )
             .map_err(|error| {
                 io::Error::other(format!("inference plane configuration failed: {error:?}"))
             })?,
@@ -221,6 +231,33 @@ fn runtime_controller_config() -> Result<steward_controller::RuntimeControllerCo
             "STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS must be Unicode",
         )),
     }
+}
+
+fn litellm_spend_log_timeout() -> Result<Duration, io::Error> {
+    match env::var("STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS") {
+        Ok(value) => parse_litellm_spend_log_timeout(Some(&value)),
+        Err(env::VarError::NotPresent) => parse_litellm_spend_log_timeout(None),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::other(
+            "STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS must be Unicode",
+        )),
+    }
+}
+
+fn parse_litellm_spend_log_timeout(value: Option<&str>) -> Result<Duration, io::Error> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_SPEND_LOG_TIMEOUT);
+    };
+    let seconds = value.parse::<u64>().map_err(|_| {
+        io::Error::other(
+            "STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS must be a positive whole number",
+        )
+    })?;
+    if seconds == 0 {
+        return Err(io::Error::other(
+            "STEWARD_LITELLM_SPEND_LOG_TIMEOUT_SECONDS must be a positive whole number",
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_runtime_controller_config(
@@ -795,13 +832,16 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE, TlsListener,
-        bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
+        DeploymentInferencePlane, GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE,
+        TlsListener, bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
         connections_bridge_startup_log, decode_tls_material, openshell_task_log_mode,
-        parse_inference_mode, parse_runtime_controller_config, rustls_crypto_provider,
-        verify_bridge_image_provenance, verify_connections_bridge_image_configuration,
+        parse_inference_mode, parse_litellm_spend_log_timeout, parse_runtime_controller_config,
+        rustls_crypto_provider, verify_bridge_image_provenance,
+        verify_connections_bridge_image_configuration,
     };
+    use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
     use steward_adapter_openshell::OpenShellTaskLogMode;
+    use steward_ports::InferencePlane;
 
     #[test]
     fn task_log_mode_accepts_unset_off_and_full() -> Result<(), String> {
@@ -850,6 +890,43 @@ mod tests {
                 .inference_observation_interval(),
             Duration::from_secs(30)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn litellm_spend_log_timeout_uses_the_default_and_configured_seconds() -> Result<(), String> {
+        assert_eq!(
+            parse_litellm_spend_log_timeout(None).map_err(|error| error.to_string())?,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_litellm_spend_log_timeout(Some("17")).map_err(|error| error.to_string())?,
+            Duration::from_secs(17)
+        );
+        for invalid in ["", "0", "1.5", "forever"] {
+            assert!(
+                parse_litellm_spend_log_timeout(Some(invalid)).is_err(),
+                "invalid timeout {invalid:?} was accepted"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_inference_plane_preserves_the_configured_usage_report_timeout()
+    -> Result<(), String> {
+        let plane = DeploymentInferencePlane::Stock(
+            LiteLlmAdapter::new_with_spend_log_timeout(
+                LiteLlmConfig {
+                    base_url: "http://127.0.0.1:1".to_owned(),
+                    master_key: "fixture-management-value".to_owned(),
+                },
+                Duration::from_secs(17),
+            )
+            .map_err(|error| format!("test inference plane configuration failed: {error:?}"))?,
+        );
+
+        assert_eq!(plane.usage_report_timeout(), Duration::from_secs(17));
         Ok(())
     }
 

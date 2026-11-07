@@ -904,6 +904,32 @@ mod migration_tests {
             "migration 75 must add a bounded claim counter without rewriting existing turns"
         );
     }
+
+    #[test]
+    fn agent_run_token_usage_migration_does_not_relabel_historical_spend() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 76 && migration.description.contains("agent run token usage")
+            }),
+            "migration 76 must add usage reporting fields without rewriting append-only spend history"
+        );
+        let migration = include_str!("../../../migrations/0076_agent_run_token_usage.sql");
+        assert!(
+            migration.contains("usage_reported boolean NOT NULL DEFAULT false"),
+            "historical key counters must not be relabelled as request-log usage"
+        );
+        assert!(
+            migration.contains("reported_amount numeric")
+                && migration.contains("spend_observations_reported_usage_consistent"),
+            "reported request spend must remain distinct from the enforcement counter"
+        );
+        assert!(
+            !migration.contains("UPDATE spend_observations")
+                && !migration.contains("DELETE FROM spend_observations"),
+            "the migration must not mutate append-only spend history"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3417,14 +3443,18 @@ impl PgStore {
         spec_digest: &str,
         spend: &steward_types::SpendSummary,
         exhausted: bool,
+        reported_usage: Option<ReportedInferenceUsage>,
     ) -> Result<(), StoreError> {
         self.record_spend_observation_with_task_failure(
             runtime_uid,
             observed_generation,
             spec_digest,
             spend,
-            exhausted,
-            None,
+            reported_usage,
+            SpendObservationEffects {
+                exhausted,
+                failed_task_reason: None,
+            },
         )
         .await
     }
@@ -3436,6 +3466,7 @@ impl PgStore {
         spec_digest: &str,
         spend: &steward_types::SpendSummary,
         failed_task_reason: Option<&str>,
+        reported_usage: Option<ReportedInferenceUsage>,
     ) -> Result<(), StoreError> {
         if failed_task_reason.is_some_and(str::is_empty) {
             return Err(StoreError::InvalidTaskTransition);
@@ -3445,8 +3476,11 @@ impl PgStore {
             observed_generation,
             spec_digest,
             spend,
-            false,
-            failed_task_reason,
+            reported_usage,
+            SpendObservationEffects {
+                exhausted: false,
+                failed_task_reason,
+            },
         )
         .await
     }
@@ -3457,9 +3491,18 @@ impl PgStore {
         observed_generation: i64,
         spec_digest: &str,
         spend: &steward_types::SpendSummary,
-        exhausted: bool,
-        failed_task_reason: Option<&str>,
+        reported_usage: Option<ReportedInferenceUsage>,
+        effects: SpendObservationEffects<'_>,
     ) -> Result<(), StoreError> {
+        let SpendObservationEffects {
+            exhausted,
+            failed_task_reason,
+        } = effects;
+        let usage_reported = reported_usage.is_some();
+        let reported_amount = reported_usage
+            .as_ref()
+            .map(|usage| usage.observed_amount.as_str());
+        let total_tokens = reported_usage.as_ref().and_then(|usage| usage.total_tokens);
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(runtime_uid)
@@ -3492,11 +3535,11 @@ impl PgStore {
         }
         let inserted = sqlx::query(
             "INSERT INTO spend_observations \
-             (runtime_uid, observed_amount, currency, exhausted) \
-             SELECT $1, $2::numeric, $3, $4 \
+             (runtime_uid, observed_amount, currency, exhausted, usage_reported, reported_amount, total_tokens) \
+             SELECT $1, $2::numeric, $3, $4, $5, $6::numeric, $7::bigint \
              WHERE NOT EXISTS ( \
                  SELECT 1 FROM ( \
-                     SELECT observed_amount, currency, exhausted \
+                     SELECT observed_amount, currency, exhausted, usage_reported, reported_amount, total_tokens \
                      FROM spend_observations \
                      WHERE runtime_uid = $1 \
                      ORDER BY at DESC, id DESC \
@@ -3505,12 +3548,18 @@ impl PgStore {
                  WHERE latest.observed_amount = $2::numeric \
                    AND latest.currency = $3 \
                    AND latest.exhausted = $4 \
+                   AND latest.usage_reported = $5 \
+                   AND latest.reported_amount IS NOT DISTINCT FROM $6::numeric \
+                   AND latest.total_tokens IS NOT DISTINCT FROM $7::bigint \
              )",
         )
         .bind(runtime_uid)
         .bind(&spend.observed_amount)
         .bind(&spend.currency)
         .bind(exhausted)
+        .bind(usage_reported)
+        .bind(reported_amount)
+        .bind(total_tokens)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?
@@ -5198,6 +5247,34 @@ impl PgStore {
         owner_user_id: Option<&str>,
         stream: AgentRunLogStream,
     ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
+        self.scoped_task_execution_log(task_uid, owner_user_id, None, stream)
+            .await
+    }
+
+    /// Return one bounded execution stream only to the Task's exact submitter and owner.
+    pub async fn task_execution_log_for_submitter(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        owner_user_id: &str,
+        stream: AgentRunLogStream,
+    ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
+        self.scoped_task_execution_log(
+            task_uid,
+            Some(owner_user_id),
+            Some(submitter_service),
+            stream,
+        )
+        .await
+    }
+
+    async fn scoped_task_execution_log(
+        &self,
+        task_uid: Uuid,
+        owner_user_id: Option<&str>,
+        submitter_service: Option<&str>,
+        stream: AgentRunLogStream,
+    ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
         let mut statement = QueryBuilder::<Postgres>::new("SELECT ");
         statement.push(match stream {
             AgentRunLogStream::Stdout => {
@@ -5229,6 +5306,18 @@ impl PgStore {
             statement.push(" AND tasks.owner_user_id = ");
             statement.push_bind(owner_user_id);
         }
+        if let Some(submitter_service) = submitter_service {
+            statement.push(" AND tasks.submitter_service = ");
+            statement.push_bind(submitter_service);
+        }
+        statement.push(match stream {
+            AgentRunLogStream::Stdout => {
+                " AND COALESCE(attempts.execution_stdout, attempts.live_execution_stdout) IS NOT NULL"
+            }
+            AgentRunLogStream::Stderr => {
+                " AND COALESCE(attempts.execution_stderr, attempts.live_execution_stderr) IS NOT NULL"
+            }
+        });
         statement
             .build()
             .fetch_optional(&self.pool)
@@ -12565,6 +12654,19 @@ pub struct AgentRunSpend {
     pub currency: String,
     pub exhausted: bool,
     pub observed_at: String,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReportedInferenceUsage {
+    pub observed_amount: String,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+struct SpendObservationEffects<'a> {
+    exhausted: bool,
+    failed_task_reason: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16179,7 +16281,8 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
             to_char(tasks.updated_at AT TIME ZONE 'UTC', \
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at, \
-            spend.observed_amount, spend.currency, spend.exhausted, spend.observed_at, \
+            spend.reported_amount, spend.currency, spend.exhausted, spend.observed_at, \
+            spend.usage_reported, spend.total_tokens, \
             EXISTS ( \
                 SELECT 1 FROM task_lifecycle_events history \
                 WHERE history.task_uid = tasks.task_uid \
@@ -16197,8 +16300,9 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
          LIMIT 1 \
      ) runtime_minutes ON true \
      LEFT JOIN LATERAL ( \
-         SELECT observation.observed_amount::text AS observed_amount, \
-                observation.currency, observation.exhausted, \
+         SELECT observation.reported_amount::text AS reported_amount, \
+                observation.currency, observation.exhausted, observation.usage_reported, \
+                observation.total_tokens, \
                 to_char(observation.at AT TIME ZONE 'UTC', \
                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at \
          FROM spend_observations observation \
@@ -16263,16 +16367,22 @@ const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_
        ON decision_reference.request_id = requests.id ";
 
 fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreError> {
-    let observed_amount = row
-        .try_get::<Option<String>, _>("observed_amount")
+    let reported_amount = row
+        .try_get::<Option<String>, _>("reported_amount")
         .map_err(database_error)?;
-    let spend = observed_amount
-        .map(|observed_amount| {
+    let usage_reported = row
+        .try_get::<Option<bool>, _>("usage_reported")
+        .map_err(database_error)?
+        .unwrap_or(false);
+    let spend = reported_amount
+        .filter(|_| usage_reported)
+        .map(|reported_amount| {
             Ok(AgentRunSpend {
-                observed_amount,
+                observed_amount: reported_amount,
                 currency: row.try_get("currency").map_err(database_error)?,
                 exhausted: row.try_get("exhausted").map_err(database_error)?,
                 observed_at: row.try_get("observed_at").map_err(database_error)?,
+                total_tokens: row.try_get("total_tokens").map_err(database_error)?,
             })
         })
         .transpose()?;

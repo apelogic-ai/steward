@@ -113,6 +113,7 @@ export type AgentRunSpendView = {
     currency: string;
     exhausted: boolean;
     observedAmount: string;
+    totalTokens?: number | null;
 };
 
 export type AgentRunTimelineEventView = {
@@ -6009,6 +6010,54 @@ export type TaskInputsContractResponses = {
 };
 
 export type TaskInputsContractResponse = TaskInputsContractResponses[keyof TaskInputsContractResponses];
+
+export type TaskLogsContractData = {
+    body?: never;
+    path: {
+        /**
+         * Task lifecycle identity
+         */
+        taskUid: string;
+        /**
+         * Exact execution stream: stdout or stderr
+         */
+        stream: string;
+    };
+    query?: {
+        /**
+         * Byte offset for the next bounded JSON chunk; omit for the complete text stream
+         */
+        after?: number;
+    };
+    url: '/v1/tasks/{taskUid}/logs/{stream}';
+};
+
+export type TaskLogsContractErrors = {
+    /**
+     * taskUid or byte offset is invalid
+     */
+    400: string;
+    /**
+     * Identity assertion is invalid
+     */
+    401: TaskErrorResponse;
+    /**
+     * Task or stream is not owned by the resolved submitter
+     */
+    404: TaskErrorResponse;
+    /**
+     * Identity or persistence dependency unavailable
+     */
+    503: TaskErrorResponse;
+};
+
+export type TaskLogsContractError = TaskLogsContractErrors[keyof TaskLogsContractErrors];
+
+export type TaskLogsContractResponses = {
+    200: BrowserExecutionLogResponse;
+};
+
+export type TaskLogsContractResponse = TaskLogsContractResponses[keyof TaskLogsContractResponses];
 
 export type TaskOutputsContractData = {
     body?: never;

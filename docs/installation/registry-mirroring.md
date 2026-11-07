@@ -73,6 +73,12 @@ The copy is resumable. A target tag already resolving to the planned digest is
 reported as `already-present` and skipped. A target tag resolving to any other
 digest is rejected instead of overwritten.
 
+This deployment-lock tool selects the standalone `chart` member. A release's
+`bundleChart` and `dependencyCharts` members are additional published packaging
+coordinates, not inputs to this lock format. When an installation selects the
+bundle, copy its exact OCI manifest by the handoff digest with the operator's
+registry tooling; its child charts are already packaged inside that artifact.
+
 To create a deliberately narrowed installation, add `--platform linux/amd64`
 to `plan` and use distinct target tags in the mapping. Charts are always copied
 as complete OCI artifacts; platform selection applies only to images and

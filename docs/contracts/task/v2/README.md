@@ -64,13 +64,13 @@ still select one active caller-authorized Envelope by approved content digest. I
 not an Envelope UUID. Product configuration should omit it; internal Envelope UID,
 revision, and digest remain mandatory immutable evidence.
 
-Missing diagnostics, `{}`, or `executionLog: off` means no caller-visible execution
-transcript, including when the agent process fails. A v2 create/status representation always
-returns the server-snapshotted
-effective diagnostics object and the immutable source-authority evidence. The status
-and evidence Task UID and diagnostics must match. A runner requires that authenticated
-`full` signal as well as the reserved files before replay; file presence alone grants
-nothing.
+Every ordinary Agent Task retains bounded stdout and stderr when its process starts, regardless
+of whether diagnostics are missing, `{}`, `executionLog: off`, or `executionLog: full`.
+`executionLog` remains in create and status representations for compatibility; it controls only
+whether the legacy output archive contains reserved diagnostic files. The authenticated task log
+route is the source for live and terminal process output. Status and evidence Task UID and
+diagnostics must still match. Provider-control operations remain structurally excluded, and a
+Task rejected before its agent process starts has no process output.
 
 ## TaskDefinition and instruction skills
 
@@ -246,10 +246,10 @@ after its Task succeeded; Steward 0.3.13 restores them. When diagnostics is miss
 delivered archive is `out/`-only.
 
 Each original process stream is retained verbatim up to 4 MiB; the combined bound is
-8 MiB. Exceeding either bound prevents a successful transcript result and returns the
-bounded `execution_transcript_too_large` failure category rather than truncating
-silently. The `.steward/diagnostics` namespace is reserved: agent output cannot create
-or replace these entries. Since Steward 0.3.11 the stored archive is validated as
+8 MiB. Output beyond either per-stream bound keeps the newest bytes after a visible truncation
+marker and never changes the agent's exit status. Delivery still rejects stored transcript data
+that exceeds these bounds. The `.steward/diagnostics` namespace is reserved: agent output cannot
+create or replace these entries. Since Steward 0.3.11 the stored archive is validated as
 `out/`-only (`steward.task-output/v1`). Since Steward 0.3.13 the runner download of a
 `full` Task is rebuilt from the validated `out/` directories and regular files with
 Steward-written ustar headers (a Steward-written PAX `path` record only for paths longer

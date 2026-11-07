@@ -24,7 +24,7 @@ Feature: J7 - User watches and stops a run
     And I choose "standard" in "Envelope"
     # The long loop exercises live logs; writing under out/ lets a successful inline run publish output.
     And I type "Print one line every 10 s for 2 min, then write the complete transcript to out/result.txt." into "Prompt"
-    And I tick "Capture execution log"
+    And I see "Sensitive output warning"
     And I press "Run now"
     Then I see the status "Running"
     And the elapsed time keeps counting
@@ -62,26 +62,26 @@ Feature: J7 - User watches and stops a run
     And I choose "standard" in "Envelope"
     # The long loop exercises complete logs; writing under out/ lets a successful inline run publish output.
     And I type "Print one line every 10 s for 2 min, then write the complete transcript to out/result.txt." into "Prompt"
-    And I tick "Capture execution log"
+    And I see "Sensitive output warning"
     And I press "Run now"
     Then the run ends as "succeeded" within 4 min
     When I open "Agent execution"
     Then the log holds every line printed before the run ended
     And I do not see "Live log · polling for new output…"
 
-  # F1. PASS on 0.3.16.
+  # F1. Updated in 0.3.27: every ordinary Agent run retains its streams.
   @extended @needs-model
-  Scenario: A run started without log capture says so
+  Scenario: Every run exposes its execution log
     When I open "Runs"
     And I press "Run now"
     # Select the Background Envelope explicitly; the Run form otherwise chooses the newest active one.
     And I choose "standard" in "Envelope"
-    And I untick "Capture execution log"
+    And I see "Sensitive output warning"
     And I press "Run now"
     Then the run ends as "succeeded" within 2 min
     When I open "Agent execution"
-    Then I see "No execution log was captured for this run."
-    And I see "Enable Capture execution log when starting a run to retain stdout and stderr. Captured output may contain sensitive data."
+    Then I see "stdout"
+    And I see "stderr"
 
   # F2. The Markdown does not say when a run rightly cannot be cancelled.
   # 0.3.16: the owner of the run sees "You don't have permission to cancel this run." (N-05).

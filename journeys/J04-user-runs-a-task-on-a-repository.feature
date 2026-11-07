@@ -1,4 +1,4 @@
-# Source: user journey J4. UI text aligned with the 0.3.20 release candidate.
+# Source: user journey J4. UI text aligned with the 0.3.28 release candidate.
 # This journey is about the repository integration, so it is switched on.
 @needs-github
 Feature: J4 - User runs a Task on a repository
@@ -39,7 +39,7 @@ Feature: J4 - User runs a Task on a repository
     And I press "Run"
     # The run form preselects the newest Envelope. The person must check it.
     And I choose "standard" in "Envelope"
-    And I tick "Capture execution log"
+    And I see "Sensitive output warning"
     And I press "Run now"
     Then I do not see "The run request was rejected."
     And I see in "Workspace":

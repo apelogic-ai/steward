@@ -5,7 +5,10 @@ contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
-Applies to Steward 0.3.20.
+Applies to Steward 0.3.28.
+
+The always-visible execution-log additions described below are part of Steward
+0.3.27. The inference-usage additions are part of Steward 0.3.28.
 
 ## Authority and privacy boundary
 
@@ -17,7 +20,7 @@ runtime identity, provider credential, or Kubernetes bearer token is not
 browser authority.
 
 The run read model contains no input or output archives, command arguments,
-provider payloads, raw logs, prompts, model output, tokens, credentials,
+provider payloads, raw logs, prompts, model output, token contents or input/output token breakdowns, credentials,
 assertions, HTTP headers or bodies. A Task failure is reduced to a bounded
 category and, for an allowlisted set of actionable failures, a fixed or
 strictly validated plain-language `failureReason`; arbitrary stored failure
@@ -37,10 +40,11 @@ bounded stream endpoint.
 | User Envelope revision | immutable Task authority snapshot | Submission snapshot | Available for v0.2 user Tasks; historical legacy-authority Tasks report unavailable. |
 | Configured models and tool grants | immutable `task_submissions.runtime_spec` snapshot | Submission snapshot | Available as configured authority only, never described as calls. |
 | Budget allocation | `task_submissions.runtime_spec.budget` | Submission snapshot | Available. |
-| Observed spend | latest append-only `spend_observations` row joined by `runtime_uid` | Observation timestamp | Available when observed; otherwise unavailable. Spend is observed, never custodied. |
+| Observed spend | LiteLLM request logs, recorded in the latest append-only `spend_observations` row joined by `runtime_uid` | Observation timestamp | Available when request logs are readable; otherwise unavailable. A virtual-key budget counter is never presented as run spend. |
+| Total tokens used | LiteLLM request logs, recorded in the latest append-only `spend_observations` row joined by `runtime_uid` | Observation timestamp | Returned as optional `observedSpend.totalTokens`. Missing, invalid, refused, or incomplete usage reports are `Not reported`; unknown request-log fields are ignored. Historical key-counter rows are not relabelled as request usage. |
 | Per-run runtime limit | immutable direct or browser Task evidence | Submission snapshot | Available as `taskRuntimeMinutesLimit` when the Task requests an explicit limit at or below its effective ceiling. |
 | Runtime-minute authority and usage | immutable User Envelope snapshot plus append-only `task_lifecycle_events` and runtime-minute observations/grants | Envelope-instance period/current observation | Available when the Envelope sets a limit. Usage is derived from running-to-terminal intervals clipped to the UTC month; it is not inferred from runtime age or added to the AgentRuntime CRD. |
-| Inference calls, actual model, input/output tokens | Not persisted by Steward | Unknown | Explicitly unavailable. Configured models are returned separately. |
+| Inference calls, actual model, input/output token breakdowns | Not persisted by Steward | Unknown | Explicitly unavailable. Configured models and the aggregate total-token count are returned separately. |
 | Tool calls and outcomes | Not persisted by Steward | Unknown | Explicitly unavailable. Granted tools are returned separately. |
 | Runtime CPU, memory, storage and network use | Not persisted by Steward | Unknown | Explicitly unavailable. |
 | GitHub repository/workflow/run URL | validated `DirectTaskBindingEvidence.sourceProvenance` submission snapshot | Submission snapshot | Available for direct GitHub Tasks; otherwise absent. The submitter idempotency key is never interpreted as GitHub metadata. |
@@ -125,6 +129,11 @@ Beginning with Steward 0.3.16, a live OpenShell transcript is readable before
 the Task becomes terminal, and terminal captured output remains readable
 afterward.
 
+Every ordinary Agent Task now retains its bounded streams after the process starts. The
+snapshotted compatibility value `executionLog: off` does not suppress capture or hide streams in
+Agent Runs. Provider-control operations remain structurally excluded, and a pre-execution
+rejection has no process output.
+
 `GET .../{taskUid}/logs/{stream}?after={byteOffset}` accepts only `stdout` or
 `stderr`. It returns
 `{ stream, content, truncated, sizeBytes, complete, partial }` and at most 64
@@ -138,6 +147,11 @@ For compatibility with the original endpoint, a request that omits `after`
 receives the complete captured stream as `text/plain; charset=utf-8`. Both
 representations are `no-store` and `nosniff`; new clients use the bounded JSON
 representation with an explicit byte offset.
+
+The task-authenticated alias
+`GET /v1/tasks/{taskUid}/logs/{stream}?after={byteOffset}` returns the same bounded JSON shape.
+It requires the Task bearer identity's exact submitter service and canonical owner; a mismatch is
+indistinguishable from an absent Task. It does not grant browser or administrator authority.
 
 ### Cancel and re-run
 

@@ -142,15 +142,30 @@ cleanup() {
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
     wait "${port_forward_pid}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${registry_mirror}" ]]; then
+    docker network disconnect kind "${registry_mirror%%:*}" >/dev/null 2>&1 || status=1
+  fi
   if [[ "${cluster_created}" == 1 ]]; then
-    kind delete cluster --name "${cluster}" >/dev/null 2>&1 || status=1
+    # Verify the owned resource state below even if deletion reports an error.
+    KUBECONFIG="${kubeconfig}" kind delete cluster --name "${cluster}" >&2 || true
   fi
   find "${run_dir}" -depth -delete 2>/dev/null || status=1
-  if kind get clusters 2>/dev/null | grep -Fxq "${cluster}" \
+  clusters=''
+  cluster_check_failed=0
+  if [[ "${cluster_created}" == 1 ]] \
+    && ! clusters="$(kind get clusters 2>/dev/null)"; then
+    echo "owned disposable cleanup could not be verified; Kind clusters could not be listed" >&2
+    if [[ "${status}" == 0 ]]; then
+      status=1
+    fi
+    cluster_check_failed=1
+  fi
+  if { [[ "${cluster_created}" == 1 && "${cluster_check_failed}" == 0 ]] \
+      && grep -Fxq "${cluster}" <<<"${clusters}"; } \
     || [[ -e "${run_dir}" ]]; then
     echo "owned disposable resources remain; check ${cluster} and ${run_dir}" >&2
     status=1
-  else
+  elif [[ "${cluster_check_failed}" == 0 ]]; then
     echo "disposable cleanup verified: ${cluster}, ${run_dir}" >&2
   fi
   exit "${status}"

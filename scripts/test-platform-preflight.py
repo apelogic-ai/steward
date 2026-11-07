@@ -324,6 +324,31 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_accepts_configured_steward_run_workflow_ref(self) -> None:
+        self.input["stewardRunRelease"]["workflowRef"] = "customer-managed"
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_blank_steward_run_workflow_ref(self) -> None:
+        for workflow_ref in ("", " \t\n", "\v", "\u00a0", "\u2028"):
+            with self.subTest(workflow_ref=workflow_ref):
+                invalid = copy.deepcopy(self.input)
+                invalid["stewardRunRelease"]["workflowRef"] = workflow_ref
+                result = self.run_validate(invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "stewardRunRelease.workflowRef must be a non-empty string",
+                    result.stderr,
+                )
+
+    def test_accepts_non_whitespace_control_and_format_workflow_refs(self) -> None:
+        for workflow_ref in ("\u001c", "\ufeff"):
+            with self.subTest(workflow_ref=workflow_ref):
+                valid = copy.deepcopy(self.input)
+                valid["stewardRunRelease"]["workflowRef"] = workflow_ref
+                result = self.run_validate(valid)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_mutable_legacy_governed_job_image_when_present(self) -> None:
         self.input["stewardRunRelease"]["governedJobContainerImage"] = (
             "registry.example.test/steward-run:latest"

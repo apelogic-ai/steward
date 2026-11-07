@@ -7,8 +7,255 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- GitHub Actions workflow generation can use the optional
+  `config.apiserver.stewardRunRelease.workflowRef` for both versioned and direct-package callers,
+  including direct-package caller pull requests created by browser publication.
+  When it is unset, generated workflows remain pinned to the verified steward-run workflow commit.
+  When it is set, generated workflows follow the configured repository and movable ref instead of
+  the verified commit so administrators can upgrade an in-organization steward-run copy without
+  editing every caller pipeline. The generated header records the verified commit as the reviewed
+  baseline and `# steward-run-workflow-ref: "<ref>"` as the effective reference, and the
+  configured `uses:` value is a quoted string. The Helm value,
+  `STEWARD_RUN_RELEASE_FILE`, `STEWARD_RUN_RELEASE_JSON`, and platform-preflight v1 input all accept
+  the optional field. Configured references are quoted so their content cannot add fields to the
+  generated YAML. Empty and whitespace-only values are refused during configuration loading. The
+  configured `version` must continue to identify the release whose reusable-workflow input contract
+  the ref provides; changing that contract requires updating `version` and regenerating affected
+  callers. `workflowRef` affects only versioned and direct-package callers in `remote` mode;
+  `vendored` callers and the lower-level v1 smoke renderer continue to use the verified commit.
+
+### Upgrade and rollback
+
+- No configuration or data migration is required. Existing installations keep exact-commit
+  rendering. Administrators who control an in-organization steward-run copy may add `workflowRef`
+  and move that ref as they upgrade the copy. Remove the field before rolling back because older
+  Steward releases reject the unknown field. Generated caller files already committed with the ref
+  continue to follow it until they are regenerated with exact-commit rendering. Setting, changing,
+  or removing `workflowRef` in `remote` mode changes the generated caller, so browser-published
+  Tasks merged before the configuration change stop matching and **Run on GitHub** remains
+  unavailable for them until the caller is updated. Moving the configured ref itself does not
+  change the caller or its match.
+
+## [0.3.28] - 2026-11-05
+
+Steward v0.3.28 preserves deployment-configured LiteLLM model aliases exactly and reports each
+governed run's spend and token usage from LiteLLM request logs, including with externally operated
+LiteLLM deployments.
+
+### Changed
+
+- Codex and Claude Code now send each configured LiteLLM model ID or alias unchanged. Steward uses
+  the same exact value for model checks, pricing, and runtime-key allowlists, so bare deployment
+  aliases work without an added provider prefix and already-qualified aliases remain compatible.
+- Agent Runs now derives per-run spend from the runtime key's LiteLLM request logs instead of the
+  key budget counter. The run list and detail show total tokens when LiteLLM reports them and show
+  `Not reported` when request logs cannot prove spend or token usage. The LiteLLM management
+  credential must be able to read request logs for runtime key hashes. Budget enforcement continues
+  if that read is refused, but spend and tokens show as `Not reported`. Reads use a 10-second
+  deadline by default; operators can change it with
+  `config.controller.litellmSpendLogTimeoutSeconds`. Agent Runs API responses add the optional
+  `observedSpend.totalTokens` field; historical rows no longer present a key budget counter as
+  `observedSpend`.
+- The pinned upstream CI lane now proves hosted aliases against digest-pinned LiteLLM v1.93.0 and
+  PostgreSQL services. It provisions separate runtime keys through Steward, sends requests using
+  the exact Claude Code and Codex launch plans, refuses cross-alias key use, verifies spend logs,
+  and checks cleanup.
+
+### Upgrade and rollback
+
+- Before upgrading, back up the database and add every bare alias used by the Steward model catalog
+  to LiteLLM with pricing while keeping the existing qualified aliases available for rollback. Stop
+  new Task submissions, then let every Task created before the upgrade finish or re-create it after
+  the upgrade before resuming submissions. Deploy the chart, component images, and reference
+  runtimes as one release unit, then update mirrored runtime digests and execution bindings to the
+  v0.3.28 artifacts.
+- Steward automatically applies additive migration 0076, which records request-log spend and
+  nullable token usage on new spend observations. Historical rows remain readable and report spend
+  and token usage as unavailable rather than presenting a virtual-key counter as per-run usage. No
+  manual data migration is required.
+- Before rolling back to v0.3.27, stop submissions and finish or re-create active Tasks against the
+  restored model names. Remove `config.controller.litellmSpendLogTimeoutSeconds` from Helm values
+  and keep the qualified LiteLLM aliases available until rollback is complete. Steward v0.3.27 does
+  not recognize migration 0076, so restore the pre-upgrade database backup to a new database target
+  and point v0.3.27 at that target before starting it. Records written after the upgrade are not in
+  the backup; preserve any audit or decision records that must be retained before rolling back.
+
+## [0.3.27] - 2026-11-05
+
+Steward v0.3.27 retains agent output for every governed run, adds a task-authenticated API for
+reading each output stream, and refreshes release dependencies and both governed reference
+runtimes to remove known security vulnerabilities.
+
+### Changed
+
+- Every governed agent run now retains bounded stdout and stderr and exposes them while the run is
+  active and after it succeeds or fails. The Agent Runs view no longer asks users to opt in, and
+  authenticated task submitters can read the same streams through the task API. Provider-control
+  operations remain excluded, and runs rejected before an agent starts have no process output.
+  Output beyond 4 MiB per stream keeps its bounded tail without changing the run result. Workflow
+  Tasks now keep their output in Agent Runs instead of also echoing it through controller logs.
+
 ### Security
 
+- Updated `pulldown-cmark` to 0.13.6 to resolve RUSTSEC-2026-0414 and RUSTSEC-2026-0433.
+- The Codex and Claude Code reference runtimes now replace the sandbox base's inherited `uv` with
+  checksum-verified `uv` 0.11.15, the first release that removes the vulnerable Rust `zip` 8.1.0
+  dependency and resolves CVE-2026-115905.
+
+### Upgrade and rollback
+
+- No database or configuration migration is required when upgrading from v0.3.26. Existing
+  `diagnostics.executionLog` values remain accepted, but `off` no longer disables bounded stream
+  retention. Deploy the chart, component images, and reference runtimes as one release unit, then
+  update mirrored runtime digests and execution bindings to the v0.3.27 artifacts.
+- Rolling back to v0.3.26 removes the task log endpoint and always-on stream retention and restores
+  the earlier dependency and reference-runtime images, including the vulnerabilities corrected in
+  v0.3.27. Previously retained output remains in existing task data; no database rollback is
+  required.
+
+## [0.3.26] - 2026-10-26
+
+Steward v0.3.26 adds an optional Mint `HTTPRoute` to the Steward chart so installations can publish
+Mint's token and JWKS endpoints through an existing Gateway without managing a separate route.
+
+### Added
+
+- The Helm chart can optionally render a Mint `HTTPRoute` on explicitly configured hostnames and
+  Gateway parents. It remains disabled by default, targets the existing Mint Service, and exposes
+  only exact `/token` and `/.well-known/jwks.json` matches.
+
+### Upgrade and rollback
+
+- No database migration is required when upgrading from v0.3.25. Deploy the chart and component
+  images as one release unit. Existing chart values keep their prior rendering.
+- Enabling `mint.httpRoute` requires governed execution, at least one hostname, and at least one
+  parent reference. The chart does not create the Gateway, listener, DNS record, or public
+  certificate.
+- Before rolling back to v0.3.25, remove the `mint.httpRoute` values before installing the older
+  chart, and restore any Mint routing the installation managed outside the chart. No database
+  rollback is required.
+
+## [0.3.25] - 2026-10-24
+
+Steward v0.3.25 contains the v0.3.24 release content plus a released-artifact acceptance fix that
+locates the single chart archive Helm writes for a digest pull and uses the same verified pull path
+in the pull-request release candidate. The v0.3.24 tag published all seven charts and all images but
+stopped at released-artifact acceptance, so no v0.3.24 GitHub release was created.
+
+This release adds a hardened `linux/amd64` Claude Code reference runtime with immutable release
+evidence, separately installable governed dependency charts for SPIRE, agent-sandbox, OpenShell,
+LiteLLM, and Actions Runner Controller, and a bundle chart that installs them with Steward as one
+release. Security maintenance updates Tokio to resolve RUSTSEC-2026-0386.
+
+### Added
+
+- Added the optional `steward-bundle` OCI chart for installations that need one
+  Helm release for Steward, SPIRE, agent-sandbox, OpenShell, LiteLLM, and
+  optionally Actions Runner Controller. Every child chart is independently
+  switchable, creates no Namespace, uses digest-pinned images, and shares one
+  existing Secret without accepting inline secret material. The bundle keeps
+  the standalone Steward render unchanged, packages CRDs before dependent
+  objects, disables SPIRE's test-only identities, and requires the shared TLS
+  certificate to be supplied in that Secret rather than generated into it. It
+  is rendered and installed in a clean cluster by the release gates before
+  publication and after pulling the published artifact.
+- Added separately installable, release-pinned charts for SPIRE, agent-sandbox,
+  OpenShell, LiteLLM, and Actions Runner Controller. They use upstream chart
+  dependencies where available, create no Namespace, accept existing Secret
+  references instead of inline secret material, pin every rendered image by
+  digest, and document cluster-wide permissions and Pod Security needs. The
+  release publishes each chart as its own OCI artifact alongside Steward and
+  lists their immutable coordinates in the release handoff. SPIRE CRDs are
+  installed before dependent resources, agent-sandbox wraps its upstream Helm
+  chart, and the LiteLLM, SPIRE, and Actions Runner Controller wrappers refuse
+  free-form environment inputs. LiteLLM also refuses database URLs containing
+  passwords; its default workload security contexts satisfy a
+  restricted Pod Security profile. OpenShell's optional GRPCRoute requires an
+  existing Gateway and hostname; streaming timeouts remain configured on the
+  Gateway or backend because GRPCRoute has no timeout field. Existing Steward
+  chart SBOM and vulnerability asset names remain available.
+- Releases now include a `linux/amd64` Claude Code reference runtime for 2.1.222, its immutable digest,
+  SBOM, vulnerability report, and provenance. The non-root image includes the same pinned read
+  tools as the Codex runtime and uses the existing `claude-code-v1` execution binding. Its launcher
+  accepts only the deployment-provided Anthropic-compatible LiteLLM URL and OpenShell placeholder,
+  disables updates and nonessential traffic, removes alternate Claude authentication paths, and
+  exits 125 before startup when those settings are missing or changed. Operators must mirror the
+  new `referenceRuntimes.claudeCode` artifact and use its digest in the binding before activation.
+
+### Security
+
+- Kept ES256 test-key generation dependencies out of shipped binaries. A production dependency
+  check now prevents `p256` and affected `crypto-bigint` 0.5 releases from entering those binaries;
+  `RUSTSEC-2026-0387` remains narrowly ignored only while test tooling requires it.
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness).
+
+### Fixed
+
+- Released-bundle acceptance now uses the single chart archive Helm writes for a digest pull,
+  instead of assuming Helm will name it with the chart version.
+- The pull-request release candidate now installs the bundle archive it retrieves from its local
+  registry by digest, using the same digest verification and archive lookup as the tag-time release.
+- Release acceptance cleanup now uses each run's kubeconfig and decides whether cleanup succeeded by
+  verifying that its owned cluster and temporary directory are absent. It now also fails when Kind
+  cannot list clusters to confirm that the owned cluster is gone.
+- Chart publication now captures Helm output from both output streams, and the pull-request release
+  candidate uses the same package, push, and digest-validation script as tag-time publication.
+- Release-candidate cleanup now disconnects its local registry before deleting the disposable Kind
+  cluster, so the pinned Kind version can remove its network without turning a successful dry-run
+  into a cleanup failure.
+- Chart publication and release artifact assembly now use the repository's pinned Helm version,
+  preventing release output from changing when a newer Helm major version becomes available.
+
+### Upgrade and rollback
+
+- No database migration is required when upgrading from v0.3.21. Deploy the chart and component
+  images as one release unit, mirror the digest-pinned Claude Code reference runtime, and update
+  `claude-code-v1` execution bindings to that digest before activating it.
+- The governed dependency charts are separate, opt-in release artifacts. Before adopting one,
+  provide its target namespaces, existing Secret references, required cluster-wide permissions,
+  and any Gateway configuration documented by that chart. The existing Steward chart keeps its
+  prior default rendering.
+- Before rolling back to v0.3.21, stop new Claude Code Tasks and let active Tasks finish, then
+  restore execution bindings to a reference runtime supported by that release. Remove dependency
+  charts only when the installation adopted them solely for v0.3.25, and restore its previous
+  dependency ownership. No database rollback is required.
+
+## [0.3.24] - 2026-10-24
+
+The v0.3.24 tag published all seven charts, component images, both reference runtimes, and auxiliary
+release artifacts. Released-artifact acceptance stopped before installing the published bundle, so
+no GitHub release was created. Use v0.3.25 for the complete release.
+
+## [0.3.23] - 2026-10-23
+
+The v0.3.23 tag pushed all seven charts, component images, both reference runtimes, and auxiliary
+release artifacts. Its chart jobs stopped before publishing complete chart evidence and
+provenance, so released-artifact acceptance was skipped and no GitHub release was created. Use
+v0.3.25 for the complete release.
+
+## [0.3.22] - 2026-10-23
+
+The v0.3.22 tag was only partly published. Component images, both reference runtimes, and the
+`steward` chart were published, but the governed dependency charts and `steward-bundle` were never
+pushed, and no GitHub release was created. Use v0.3.25 for the complete release.
+
+## [0.3.21] - 2026-10-22
+
+Steward v0.3.21 adds owner-scoped personal agents with durable conversations, resumable updates,
+and bounded execution through configured coding agents and Envelopes. Installations can also
+accept carefully scoped user access tokens from configured issuers and advertise reviewed
+Kubernetes command and remote-shell grants.
+
+The Helm chart can use independently promoted component repositories and tags, render public
+trust material, and configure optional HTTPRoute timeouts. Security maintenance pins the
+latest-upstream LiteLLM image to an immutable digest and refreshes the bundled web trust roots.
+
+### Security
+
+- Updated the web runtime to Next.js 16.4.1 while retaining Sharp 0.35.5, resolving two critical
+  unauthenticated code-execution vulnerabilities in the deployed web image.
 - Pinned the latest-upstream LiteLLM conformance image to a reviewed immutable digest. CI now
   refuses mutable LiteLLM images in scripts, workflows, Compose files, and chart values.
 - Updated certificate verification and the bundled web trust roots to reject certificates chained
@@ -67,6 +314,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Task-start attempts, unexpected restarts, retained conversation turns, leases, status checks,
   total monitoring time, and every content size. A resumable event stream sends durable status and
   final-reply updates, with heartbeat and no-buffering headers for the browser edge path.
+
+### Upgrade and rollback
+
+- Apply additive migrations 0074 and 0075 before starting v0.3.21. Migration 0074 adds the
+  owner-scoped personal-agent, turn, message, and event tables. Migration 0075 bounds retries for
+  interrupted turns. Neither migration rewrites historical rows. Deploy the chart and all
+  component images as one release unit.
+- Existing chart values retain their prior rendering unless an operator enables a new option. To
+  use user access tokens, configure the exact issuer, audience, frontend clients, token age, and
+  identity claims. Governed Kubernetes commands and remote shell require MCP-GW v0.7.0 or later
+  plus a trusted provisioner that binds the machine to the Run runtime ID.
+- Before rolling back to v0.3.20, stop new personal-agent messages and let active turns finish.
+  Remove v0.3.21-only chart values before installing the older chart, and restore externally
+  managed public ConfigMaps if the v0.3.21 chart created them. Migrations 0074 and 0075 may remain;
+  v0.3.20 ignores those tables. User access-token sign-in, personal agents, and the new command
+  grants are unavailable after rollback.
 
 ## [0.3.20] - 2026-10-18
 
@@ -1526,7 +1789,15 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.20...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.28...HEAD
+[0.3.28]: https://github.com/apelogic-ai/steward/compare/v0.3.27...v0.3.28
+[0.3.27]: https://github.com/apelogic-ai/steward/compare/v0.3.26...v0.3.27
+[0.3.26]: https://github.com/apelogic-ai/steward/compare/v0.3.25...v0.3.26
+[0.3.25]: https://github.com/apelogic-ai/steward/compare/v0.3.24...v0.3.25
+[0.3.24]: https://github.com/apelogic-ai/steward/compare/v0.3.23...v0.3.24
+[0.3.23]: https://github.com/apelogic-ai/steward/compare/v0.3.22...v0.3.23
+[0.3.22]: https://github.com/apelogic-ai/steward/compare/v0.3.21...v0.3.22
+[0.3.21]: https://github.com/apelogic-ai/steward/compare/v0.3.20...v0.3.21
 [0.3.20]: https://github.com/apelogic-ai/steward/compare/v0.3.19...v0.3.20
 [0.3.19]: https://github.com/apelogic-ai/steward/compare/v0.3.18...v0.3.19
 [0.3.18]: https://github.com/apelogic-ai/steward/compare/v0.3.17...v0.3.18

@@ -29,7 +29,7 @@ use steward_admission::{
 };
 use steward_ports::{
     DecisionChannel, DecisionRequest, INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities,
-    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest,
+    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
     MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
     TASK_AGENT_START_FAILURE, TaskAttemptId,
@@ -37,7 +37,7 @@ use steward_ports::{
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
     ApprovalDeliveryTransition, ConnectionOperationKind, ConnectionOperationRecord,
-    ConnectionRuntimeAdmissionRecord, GrantReversion, PgStore, StoreError,
+    ConnectionRuntimeAdmissionRecord, GrantReversion, PgStore, ReportedInferenceUsage, StoreError,
     TaskActivationObservation, TaskCleanupCause, TaskCleanupObservation, TaskExecutionAttemptState,
     TaskExecutionObservation, TaskExecutionTransition, TaskOrchestrationMode,
     TaskOrchestrationState, TaskOrchestrationWorkItem, TaskRecord, TaskRuntimeAdmissionRecord,
@@ -74,10 +74,12 @@ enum InferenceAction {
     Continue {
         reference: String,
         spend: steward_types::SpendSummary,
+        usage: Option<InferenceUsage>,
     },
     Suspend {
         reference: String,
         spend: steward_types::SpendSummary,
+        usage: Option<InferenceUsage>,
     },
 }
 
@@ -231,13 +233,37 @@ fn runtime_ttl_action(runtime: &AgentRuntime) -> Result<TtlAction, ReconcileErro
 fn inference_action(observation: steward_ports::InferenceObservation) -> InferenceAction {
     match observation {
         steward_ports::InferenceObservation::Absent => InferenceAction::Reprovision,
-        steward_ports::InferenceObservation::Active { reference, spend } => {
-            InferenceAction::Continue { reference, spend }
-        }
-        steward_ports::InferenceObservation::Exhausted { reference, spend } => {
-            InferenceAction::Suspend { reference, spend }
-        }
+        steward_ports::InferenceObservation::Active {
+            reference,
+            spend,
+            usage,
+        } => InferenceAction::Continue {
+            reference,
+            spend,
+            usage,
+        },
+        steward_ports::InferenceObservation::Exhausted {
+            reference,
+            spend,
+            usage,
+        } => InferenceAction::Suspend {
+            reference,
+            spend,
+            usage,
+        },
     }
+}
+
+fn reported_inference_usage(
+    usage: Option<&InferenceUsage>,
+    enforcement_currency: &str,
+) -> Option<ReportedInferenceUsage> {
+    usage
+        .filter(|usage| usage.spend.currency == enforcement_currency)
+        .map(|usage| ReportedInferenceUsage {
+            observed_amount: usage.spend.observed_amount.clone(),
+            total_tokens: usage.total_tokens,
+        })
 }
 
 fn spend_still_exhausts_runtime(
@@ -2828,14 +2854,13 @@ fn sandbox_task_workspace(
 
 fn sandbox_task_diagnostics(
     execution_class: SandboxExecutionClass,
-    evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
-    browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
+    _evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
+    _browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
 ) -> steward_types::direct_package::DiagnosticsRequest {
     if execution_class == SandboxExecutionClass::Agent {
-        evidence
-            .map(|evidence| evidence.diagnostics)
-            .or_else(|| browser_evidence.map(|evidence| evidence.diagnostics))
-            .unwrap_or_default()
+        steward_types::direct_package::DiagnosticsRequest {
+            execution_log: steward_types::direct_package::ExecutionLogMode::Full,
+        }
     } else {
         steward_types::direct_package::DiagnosticsRequest::default()
     }
@@ -3984,9 +4009,11 @@ enum InferenceReconcile {
     Active {
         reference: String,
         spend: steward_types::SpendSummary,
+        usage: Option<InferenceUsage>,
     },
     Exhausted {
         spend: steward_types::SpendSummary,
+        usage: Option<InferenceUsage>,
     },
 }
 
@@ -4223,10 +4250,18 @@ async fn reconcile_inference<I: InferencePlane>(
             .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
     }
     match inference_action(observation) {
-        InferenceAction::Continue { reference, spend } => {
-            Ok(InferenceReconcile::Active { reference, spend })
+        InferenceAction::Continue {
+            reference,
+            spend,
+            usage,
+        } => Ok(InferenceReconcile::Active {
+            reference,
+            spend,
+            usage,
+        }),
+        InferenceAction::Suspend { spend, usage, .. } => {
+            Ok(InferenceReconcile::Exhausted { spend, usage })
         }
-        InferenceAction::Suspend { spend, .. } => Ok(InferenceReconcile::Exhausted { spend }),
         InferenceAction::Reprovision => Err(ControllerError::Reconcile(ReconcileError::Runtime(
             PortError::Failed {
                 reason: "provisioned inference key was not observable".to_owned(),
@@ -4922,6 +4957,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                     .map_err(ControllerError::Reconcile)?,
                                 &spend,
                                 true,
+                                None,
                             )
                             .await
                             .map_err(|error| {
@@ -4996,7 +5032,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     Err(error) => return Err(error),
                 };
                 let per_run_failure_reason = match &inference {
-                    InferenceReconcile::Exhausted { spend } if task_uid.is_some() => {
+                    InferenceReconcile::Exhausted { spend, .. } if task_uid.is_some() => {
                         single_run_spend_failure_reason(spend, &inference_runtime.spec.budget)
                             .map_err(ControllerError::Reconcile)?
                     }
@@ -5005,12 +5041,14 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     | InferenceReconcile::Managed { .. }
                     | InferenceReconcile::Active { .. } => None,
                 };
-                if let (Some(authority), Some((spend, exhausted))) = (
+                if let (Some(authority), Some((spend, exhausted, usage))) = (
                     context.authority.as_ref(),
                     match &inference {
-                        InferenceReconcile::Active { spend, .. } => Some((spend, false)),
-                        InferenceReconcile::Exhausted { spend } => {
-                            Some((spend, per_run_failure_reason.is_none()))
+                        InferenceReconcile::Active { spend, usage, .. } => {
+                            Some((spend, false, usage.as_ref()))
+                        }
+                        InferenceReconcile::Exhausted { spend, usage } => {
+                            Some((spend, per_run_failure_reason.is_none(), usage.as_ref()))
                         }
                         InferenceReconcile::Inactive | InferenceReconcile::Managed { .. } => None,
                     },
@@ -5028,6 +5066,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             &runtime_spec_digest(&runtime).map_err(ControllerError::Reconcile)?,
                             spend,
                             exhausted,
+                            reported_inference_usage(usage, &spend.currency),
                         )
                         .await
                         .map_err(|error| {
@@ -5054,7 +5093,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     return Ok(Action::requeue(StdDuration::from_secs(2)));
                 }
                 let inference_status = match inference {
-                    InferenceReconcile::Exhausted { spend } => {
+                    InferenceReconcile::Exhausted { spend, .. } => {
                         return suspend_runtime_with_inference_cleanup(
                             &runtime,
                             &api,
@@ -5066,9 +5105,9 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         )
                         .await;
                     }
-                    InferenceReconcile::Active { reference, spend } => {
-                        Some((reference, Some(spend)))
-                    }
+                    InferenceReconcile::Active {
+                        reference, spend, ..
+                    } => Some((reference, Some(spend))),
                     InferenceReconcile::Managed { reference } => Some((reference, None)),
                     InferenceReconcile::Inactive => None,
                 };
@@ -5233,7 +5272,7 @@ async fn finalize_inference_if_required<I: InferencePlane>(
     capture: FinalSpendCapture,
 ) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
     let final_spend = match tokio::time::timeout(
-        FINAL_SPEND_CAPTURE_TIMEOUT,
+        FINAL_SPEND_CAPTURE_TIMEOUT.saturating_add(inference.usage_report_timeout()),
         observe_and_record_final_spend(runtime, inference, request, authority, capture),
     )
     .await
@@ -5303,24 +5342,21 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
     } else {
         None
     };
-    let (spend, failed_task_reason) = loop {
+    let (spend, usage, failed_task_reason) = loop {
         let observation = inference
             .observe(request)
             .await
             .map_err(ReconcileError::Runtime)?;
-        let spend = match observation {
-            InferenceObservation::Active { spend, .. }
-            | InferenceObservation::Exhausted { spend, .. } => spend,
+        let (spend, usage) = match observation {
+            InferenceObservation::Active { spend, usage, .. }
+            | InferenceObservation::Exhausted { spend, usage, .. } => (spend, usage),
             InferenceObservation::Absent => return Ok(None),
         };
         let failed_task_reason = single_run_spend_failure_reason(&spend, &runtime.spec.budget)?;
-        let should_retry = settlement_deadline.is_some_and(|deadline| {
-            failed_task_reason.is_none()
-                && runtime.spec.budget.single_run_limit.is_some()
-                && tokio::time::Instant::now() < deadline
-        });
+        let should_retry =
+            settlement_deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline);
         if !should_retry {
-            break (spend, failed_task_reason);
+            break (spend, usage, failed_task_reason);
         }
         tokio::time::sleep(FINAL_SPEND_SETTLEMENT_POLL_INTERVAL).await;
     };
@@ -5335,6 +5371,7 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
             &runtime_spec_digest(runtime)?,
             &spend,
             failed_task_reason.as_deref(),
+            reported_inference_usage(usage.as_ref(), &spend.currency),
         )
         .await
         .map_err(|error| ReconcileError::Authority(error.to_string()))?;
@@ -6386,15 +6423,15 @@ mod tests {
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest,
-        MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProviderControlExecutionBindings,
+        InferenceUsage, MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProviderControlExecutionBindings,
         ProvisionedInference, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass,
         SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation,
         SandboxTaskOutput, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
     };
     use steward_store::{
         ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
-        ConnectionOperationRecord, ConnectionOperationState, GrantReversion, StoreError,
-        TaskRecord,
+        ConnectionOperationRecord, ConnectionOperationState, GrantReversion,
+        ReportedInferenceUsage, StoreError, TaskRecord,
     };
     use steward_types::direct_package::{
         BrowserTaskEvidence, DirectTaskBindingEvidence, ExecutionLogMode,
@@ -6419,13 +6456,14 @@ mod tests {
         ensure_managed_mode_has_no_stock_credential, exhausted_spend_to_preserve,
         failed_runtime_status, inference_action, map_finalizer_error,
         provider_control_bindings_match, reconcile_once, replace_as_controller,
-        runtime_authority_action, runtime_cleanup_wait_error, runtime_start_failed,
-        runtime_ttl_action, runtime_with_remaining_spend_budget, sandbox_execution_class,
-        sandbox_task_diagnostics, server_task_runtime_manifest, should_log_controller_error,
-        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
-        task_output_archive_failure, task_output_archive_size_failure, task_runtime,
-        task_runtime_action, task_runtime_observation_is_failed, task_start_observation,
-        ttl_action, validated_failed_task_output,
+        reported_inference_usage, runtime_authority_action, runtime_cleanup_wait_error,
+        runtime_start_failed, runtime_ttl_action, runtime_with_remaining_spend_budget,
+        sandbox_execution_class, sandbox_task_diagnostics, server_task_runtime_manifest,
+        should_log_controller_error, status_merge_patch, suspend_runtime,
+        suspend_runtime_with_inference_cleanup, task_output_archive_failure,
+        task_output_archive_size_failure, task_runtime, task_runtime_action,
+        task_runtime_observation_is_failed, task_start_observation, ttl_action,
+        validated_failed_task_output,
     };
 
     #[test]
@@ -6647,6 +6685,7 @@ mod tests {
                     observed_amount: "0".to_owned(),
                     currency: request.budget.currency.clone(),
                 },
+                usage: None,
             })
         }
 
@@ -7554,35 +7593,37 @@ mod tests {
     }
 
     #[test]
-    fn task_diagnostics_come_from_persisted_evidence_and_never_provider_control()
+    fn ordinary_agent_tasks_always_capture_diagnostics_and_provider_control_never_does()
     -> Result<(), String> {
-        let evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
+        let mut evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
         ))
         .map_err(|error| format!("parse direct evidence fixture: {error}"))?;
+        evidence.diagnostics.execution_log = ExecutionLogMode::Off;
         assert_eq!(
             sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence), None)
                 .execution_log,
-            ExecutionLogMode::Full
+            ExecutionLogMode::Full,
+            "an explicit compatibility off value must not hide agent output"
         );
         assert_eq!(
             sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, None).execution_log,
-            ExecutionLogMode::Off,
-            "legacy Tasks must not opt into caller-visible transcripts"
+            ExecutionLogMode::Full,
+            "legacy workflow Tasks must retain agent output"
         );
         let browser_evidence: BrowserTaskEvidence = serde_json::from_value(serde_json::json!({
             "source": "inline",
             "revision": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "path": "task-definition.json",
             "closureDigest": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "diagnostics": { "executionLog": "full" }
+            "diagnostics": { "executionLog": "off" }
         }))
         .map_err(|error| format!("parse browser evidence fixture: {error}"))?;
         assert_eq!(
             sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, Some(&browser_evidence),)
                 .execution_log,
             ExecutionLogMode::Full,
-            "browser Tasks must honor their persisted diagnostics snapshot"
+            "browser Tasks must retain agent output"
         );
         assert_eq!(
             sandbox_task_diagnostics(
@@ -8246,12 +8287,38 @@ mod tests {
             inference_action(steward_ports::InferenceObservation::Exhausted {
                 reference: "runtime-a".to_owned(),
                 spend: spend.clone(),
+                usage: None,
             }),
             InferenceAction::Suspend {
                 reference: "runtime-a".to_owned(),
                 spend,
+                usage: None,
             },
             "budget exhaustion must select the non-human Running-to-Suspended transition"
+        );
+    }
+
+    #[test]
+    fn mismatched_usage_currency_is_not_reported() {
+        let usage = InferenceUsage {
+            spend: steward_types::SpendSummary {
+                observed_amount: "0.25".to_owned(),
+                currency: "EUR".to_owned(),
+            },
+            total_tokens: Some(250),
+        };
+
+        assert_eq!(
+            reported_inference_usage(Some(&usage), "USD"),
+            None,
+            "usage in another currency must not be presented under the enforcement currency"
+        );
+        assert_eq!(
+            reported_inference_usage(Some(&usage), "EUR"),
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.25".to_owned(),
+                total_tokens: Some(250),
+            })
         );
     }
 
@@ -8460,18 +8527,29 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum FinalSpendObservationBehavior {
+        CompleteAfter(StdDuration),
         Fail,
         Pending,
     }
 
     struct FinalSpendObservationInference {
         behavior: FinalSpendObservationBehavior,
+        observations: Arc<AtomicUsize>,
         revocations: Arc<AtomicUsize>,
     }
 
     impl InferencePlane for FinalSpendObservationInference {
         fn capabilities(&self) -> InferenceCapabilities {
             InferenceCapabilities::default()
+        }
+
+        fn usage_report_timeout(&self) -> StdDuration {
+            match self.behavior {
+                FinalSpendObservationBehavior::CompleteAfter(delay) => delay,
+                FinalSpendObservationBehavior::Fail | FinalSpendObservationBehavior::Pending => {
+                    StdDuration::ZERO
+                }
+            }
         }
 
         async fn validate_configuration(
@@ -8503,6 +8581,18 @@ mod tests {
             _request: &InferenceRequest,
         ) -> Result<InferenceObservation, PortError> {
             match self.behavior {
+                FinalSpendObservationBehavior::CompleteAfter(delay) => {
+                    tokio::time::sleep(delay).await;
+                    self.observations.fetch_add(1, Ordering::SeqCst);
+                    Ok(InferenceObservation::Active {
+                        reference: "runtime-key".to_owned(),
+                        spend: steward_types::SpendSummary {
+                            observed_amount: "0.25".to_owned(),
+                            currency: "USD".to_owned(),
+                        },
+                        usage: None,
+                    })
+                }
                 FinalSpendObservationBehavior::Fail => Err(PortError::Failed {
                     reason: "fixture final spend observation failure".to_owned(),
                 }),
@@ -8517,6 +8607,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn configured_usage_report_timeout_is_not_cut_short_by_final_capture()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: Some("key-a".to_owned()),
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        let request = super::inference_request(&runtime)
+            .map_err(|error| format!("fixture inference request must be valid: {error}"))?;
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
+        let configured_timeout = StdDuration::from_secs(17);
+        let observations = Arc::new(AtomicUsize::new(0));
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let inference = FinalSpendObservationInference {
+            behavior: FinalSpendObservationBehavior::CompleteAfter(configured_timeout),
+            observations: observations.clone(),
+            revocations,
+        };
+
+        super::finalize_inference_if_required(
+            &runtime,
+            &inference,
+            &request,
+            Some(&authority),
+            super::FinalSpendCapture::AfterSettlement,
+        )
+        .await
+        .map_err(|error| format!("configured usage report must remain best effort: {error}"))?;
+
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn final_spend_observation_failure_does_not_block_key_revocation() -> Result<(), String> {
         let runtime = fixture();
         let request = super::inference_request(&runtime)
@@ -8527,6 +8661,7 @@ mod tests {
         let revocations = Arc::new(AtomicUsize::new(0));
         let inference = FinalSpendObservationInference {
             behavior: FinalSpendObservationBehavior::Fail,
+            observations: Arc::new(AtomicUsize::new(0)),
             revocations: revocations.clone(),
         };
 
@@ -8559,6 +8694,7 @@ mod tests {
         let revocations = Arc::new(AtomicUsize::new(0));
         let inference = FinalSpendObservationInference {
             behavior: FinalSpendObservationBehavior::Pending,
+            observations: Arc::new(AtomicUsize::new(0)),
             revocations: revocations.clone(),
         };
 
@@ -10313,9 +10449,7 @@ mod webhook_tests {
         ) -> WebhookFuture<'a, Result<(), steward_ports::PortError>> {
             Box::pin(async {
                 Err(steward_ports::PortError::Rejected {
-                    reason:
-                        "models are absent from the priced inference catalog: provider-a/model-a"
-                            .to_owned(),
+                    reason: "These models are not available: model-a.".to_owned(),
                 })
             })
         }
@@ -11726,7 +11860,7 @@ mod webhook_tests {
         );
         assert_eq!(
             response.result.message,
-            "AgentRuntime inference configuration validation failed closed: models are absent from the priced inference catalog: provider-a/model-a"
+            "AgentRuntime inference configuration validation failed closed: These models are not available: model-a."
         );
         Ok(())
     }

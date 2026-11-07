@@ -50,12 +50,13 @@ Feature: J9 - Administrator oversight
     Then each decided request shows who asked, what was asked, who decided, when, the outcome and the rationale
 
   # F1.
-  Scenario: A run started without log capture says so to the administrator
-    Given another user has a run that ended as "cancelled" without a captured execution log
+  Scenario: An administrator sees retained streams for a cancelled run
+    Given another user has a run that ended as "cancelled"
     When I open "Runs"
     And I open the run that ended as "cancelled"
     And I open "Agent execution"
-    Then I see "No execution log was captured for this run."
+    Then I see "stdout"
+    And I see "stderr"
 
   # F2. Gap: no existing case; the Markdown gives no exact text.
   Scenario: A person without the administrator role cannot open an administrator page

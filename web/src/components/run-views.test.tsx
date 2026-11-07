@@ -86,6 +86,25 @@ describe("run table", () => {
     expect(html).not.toContain(">api<");
   });
 
+  test("shows reported token usage and labels missing usage", () => {
+    const html = renderToStaticMarkup(<RunCards runs={[
+      run({
+        taskUid: "task-reported",
+        observedSpend: {
+          observedAmount: "0.02",
+          currency: "USD",
+          exhausted: false,
+          totalTokens: 12_345,
+        },
+      }),
+      run({ taskUid: "task-unreported" }),
+    ]} />);
+
+    expect(html).toContain("Tokens used");
+    expect(html).toContain("12,345");
+    expect(html).toContain("Not reported");
+  });
+
   test("shows external caller context in run detail and preserves historical API runs", () => {
     const external = run({
       origin: "api",

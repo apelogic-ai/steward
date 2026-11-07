@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.20` and application `0.3.20`.
+Current release contract: chart `0.3.28` and application `0.3.28`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -211,6 +211,29 @@ web:
 networkPolicy:
   ingressNamespace: envoy-gateway-system
 ```
+
+For Mint on a separate public hostname, enable its default-off route and name
+the existing Gateway listeners explicitly:
+
+```yaml
+mint:
+  httpRoute:
+    enabled: true
+    hostnames:
+      - mint.example.com
+    parentRefs:
+      - name: shared-gateway
+        namespace: envoy-gateway-system
+        sectionName: mint-https
+```
+
+The chart then renders one `steward-mint` `HTTPRoute` to the existing
+`steward-mint` Service. It exposes only exact `/token` and
+`/.well-known/jwks.json` matches. The path set is not configurable, so the
+route cannot expose `/introspect` or a prefix. Enabling the route requires
+governed execution, at least one hostname, and at least one parent reference.
+The chart still does not create the Gateway, listener, DNS record, or public
+certificate.
 
 Gateway API `v1.4.0` or later and a controller whose selected `GatewayClass`
 reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
@@ -733,17 +756,22 @@ Steward release namespace also creates `steward-workflows`.
   justification. Steward validates model, tool, and workspace-type availability for these reviewed
   requests both when a request is created and when it is approved; deployment workspace limits
   remain enforced at Task admission.
-- `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
-  installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
-  and action commit. The deprecated `governedJobContainerImage` coordinate remains accepted for
-  compatibility but is not used by the active versioned workflow generator. The default `null`
-  value is valid while browser
+- `config.apiserver.stewardRunRelease` contains the exact verified steward-run handoff selected by
+  the installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
+  and action commit. The unreleased source after chart 0.3.28 also lets an installation add a
+  non-empty `workflowRef`; remote generated workflows then use that ref while retaining the required
+  verified commit as their reviewed baseline and recording the effective ref separately. Omit it to
+  preserve the exact-commit default. Use it only for an in-organization steward-run copy whose
+  updates are restricted to the customer's administrators. The configured `version` must still
+  identify the release whose reusable-workflow input contract the ref provides. The deprecated
+  `governedJobContainerImage` coordinate remains accepted for compatibility but is not used by the
+  active versioned workflow generator. The default `null` value is valid while browser
   administration is disabled. Enabling browser administration requires a complete v0.7.0-or-later
   object and fails schema validation when the value is absent, null, or malformed. Steward validates
   and renders these deployment coordinates; its source and chart defaults do not select them.
 - `config.apiserver.stewardRunWorkflowInstallationMode` controls only how generated callers
-  reference that verified release. `remote` is the default and renders the release handoff's exact
-  repository and workflow commit. `vendored` renders
+  reference that verified release. `remote` is the default and renders the release repository with
+  `workflowRef` when configured, or the exact workflow commit when it is not. `vendored` renders
   `./.github/workflows/steward-task-vendored.yml`; select it only after each caller repository has
   installed the checksum- and signature-verified steward-run v0.7.6-or-later release asset at that
   exact path. Older release handoffs fail closed in this mode. The local mode does not add a PAT,
@@ -872,10 +900,10 @@ Steward release namespace also creates `steward-workflows`.
   to mirror synchronous task-process stdout and stderr into controller logs;
   each record includes `runtime_uid`, `workspace`, `sandbox`, `stream`, and the
   escaped output `message`, including prompts and responses emitted by the task
-  process. Beginning with Steward 0.3.16, Agent Tasks with
-  `diagnostics.executionLog: full` run detached, so their process output is
-  available through the authenticated Run execution-log routes and is not
-  copied into controller logs.
+  process. Every ordinary Agent Task runs detached, so its process output is
+  available through the authenticated Run and Task execution-log routes and is
+  not copied into controller logs. The `diagnostics.executionLog` request field
+  remains accepted for compatibility but does not disable bounded stream retention.
   **Warning:** `full` logging copies task-controlled output without redaction
   and may expose prompts, responses, credentials, or other sensitive information
   to anyone authorized to read or retain controller-log or Run-log output.
@@ -883,6 +911,9 @@ Steward release namespace also creates `steward-workflows`.
   accepts `12` through `60`. It controls how often a running inference-backed
   runtime refreshes observed spend; Steward refuses values shorter than the
   initial final-spend delay or longer than the controller's requeue ceiling.
+- `config.controller.litellmSpendLogTimeoutSeconds` defaults to `10` seconds
+  and accepts whole values of at least `1`. It limits each LiteLLM request-log
+  read used to report a run's spend and token usage.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

@@ -1,0 +1,71 @@
+spire:
+  global:
+    spire:
+      clusterName: steward
+      trustDomain: steward.test
+      jwtIssuer: https://identity.example.test
+      caSubject:
+        country: US
+        organization: example-org
+        commonName: steward.test
+      recommendations:
+        enabled: true
+        namespaceLayout: true
+        namespacePSS: false
+        priorityClassName: false
+        strictMode: true
+        securityContexts: true
+        prometheus: false
+      namespaces:
+        create: false
+        system:
+          name: spire-system
+          create: false
+        server:
+          name: spire-server
+          create: false
+    installAndUpgradeHooks:
+      enabled: false
+    deleteHooks:
+      enabled: false
+  spire-server:
+    image:
+      tag: 1.15.2@sha256:aa74ef1be86bc8e0684007d84a4d9859d294384d842c30425048d73429f3216e
+    controllerManager:
+      image:
+        tag: 0.6.6@sha256:3f70cfa140a829e4ef456763e72b461b0fb491900efb89c4b34b6a10be1c2d7a
+      identities:
+        clusterSPIFFEIDs:
+          openshell-sandboxes:
+            enabled: true
+            spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.io/sandbox-id" }}'
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: openshell-sandboxes
+            podSelector:
+              matchLabels:
+                openshell.ai/managed-by: openshell
+    chown:
+      image:
+        tag: 1.37.0-uclibc@sha256:31b72538c3019a20336b04c4cebcd47c36511d0b45aa76666804c2845055bbd3
+    upstreamAuthority:
+      disk:
+        secret:
+          create: false
+  spire-agent:
+    image:
+      tag: 1.15.2@sha256:1d042e4040466686e0ee46f74981ff2167c86adfadca19b3835946f4d6047536
+    fsGroupFix:
+      image:
+        tag: latest@sha256:90041f375e30f41aa7e0390075d8a69dc61900771d52fa98d63ee5d03d866a58
+    socketAlternate:
+      image:
+        tag: latest@sha256:90041f375e30f41aa7e0390075d8a69dc61900771d52fa98d63ee5d03d866a58
+  spiffe-csi-driver:
+    image:
+      tag: 0.2.7@sha256:9dfe4f0caff096164fd921aa7f15319804df2fc0325f1d90bc793ef3256ab1cd
+    nodeDriverRegistrar:
+      image:
+        tag: v2.15.0@sha256:11f199f6bec47403b03cb49c79a41f445884b213b382582a60710b8c6fdc316a
+  spiffe-oidc-discovery-provider:
+    enabled: false

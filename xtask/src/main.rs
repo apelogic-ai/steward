@@ -55,10 +55,12 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "ci" if rest.is_empty() => ci(),
         "quality" if rest.is_empty() => quality(),
         "workflow-lint" if rest.is_empty() => workflow_lint(),
+        "production-deps" if rest == ["--check"] => production_dependencies_check(),
         "storage" if rest == ["check"] => storage::check(&root()),
         "storage" if rest == ["audit"] => storage::audit(&root()),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "e2e-governed-connections" if rest.is_empty() => e2e_governed_connections(),
+        "e2e-hosted-litellm-aliases" if rest.is_empty() => e2e_hosted_litellm_aliases(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "browser-e2e" if rest.is_empty() => browser_e2e(false),
         "browser-e2e" if rest == ["--browser-ready"] => browser_e2e(true),
@@ -87,9 +89,11 @@ fn usage() -> String {
         "  ci",
         "  quality",
         "  workflow-lint",
+        "  production-deps --check",
         "  storage check|audit",
         "  e2e-openshell-adapter",
         "  e2e-governed-connections",
+        "  e2e-hosted-litellm-aliases",
         "  e2e-postgres-tls",
         "  browser-e2e [--browser-ready]",
         "  journeys --tags <expression>",
@@ -124,7 +128,10 @@ fn ci() -> TaskResult {
     require_ci_tool_versions()?;
     quality_after_tool_checks()?;
     run("bash", &["scripts/check-litellm-image-pins.sh"])?;
+    run("bash", &["scripts/test-check-litellm-image-pins.sh"])?;
+    run("bash", &["scripts/test-governed-dependency-charts.sh"])?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
+    run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
     conformance(&["--pinned".to_owned()])
@@ -169,6 +176,7 @@ fn quality_after_tool_checks() -> TaskResult {
         "cargo",
         &["test", "--manifest-path", "e2e/Cargo.toml", "--no-run"],
     )?;
+    production_dependencies_check()?;
     // Vendor SDKs are introduced in later slices, so unused wrapper declarations
     // are expected here. `layering_test` below exercises the wrapper rule itself.
     run("cargo", &["deny", "check", "-A", "unused-wrapper"])?;
@@ -182,6 +190,44 @@ fn quality_after_tool_checks() -> TaskResult {
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()
+}
+
+fn production_dependencies_check() -> TaskResult {
+    for package in [
+        "steward-apiserver-bin",
+        "steward-controller-bin",
+        "steward-mint-bin",
+        "steward-trigger-receiver",
+    ] {
+        println!("+ cargo tree --edges normal --package {package}");
+        let output = checked_command("cargo")?
+            .args(["tree", "--edges", "normal", "--package", package])
+            .current_dir(root())
+            .output()
+            .map_err(|error| {
+                format!("failed to inspect production dependencies for {package}: {error}")
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo tree failed for production package {package}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        validate_production_dependency_tree(package, &String::from_utf8_lossy(&output.stdout))?;
+    }
+    println!("production-deps --check: shipped binaries exclude test-only cryptography");
+    Ok(())
+}
+
+fn validate_production_dependency_tree(package: &str, tree: &str) -> TaskResult {
+    for forbidden in ["p256 v", "crypto-bigint v0.5."] {
+        if tree.lines().any(|line| line.contains(forbidden)) {
+            return Err(format!(
+                "production package {package} includes forbidden dependency `{forbidden}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_quality_tool_versions() -> TaskResult {
@@ -241,6 +287,7 @@ fn require_ci_tool_versions() -> TaskResult {
 }
 
 fn workflow_lint() -> TaskResult {
+    validate_workflow_tool_setup(&root().join(".github/workflows"))?;
     require_tool_version(
         "actionlint",
         &["-version"],
@@ -289,6 +336,119 @@ fn workflow_lint() -> TaskResult {
     } else {
         Err(format!("shellcheck exited with {status}"))
     }
+}
+
+fn validate_workflow_tool_setup(workflows_directory: &Path) -> TaskResult {
+    let mut workflow_paths = fs::read_dir(workflows_directory)
+        .map_err(|error| {
+            format!(
+                "failed to inspect workflow directory {}: {error}",
+                workflows_directory.display()
+            )
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("failed to inspect workflow entry: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    workflow_paths.retain(|path| {
+        matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("yml" | "yaml")
+        )
+    });
+    workflow_paths.sort();
+
+    for path in workflow_paths {
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read workflow {}: {error}", path.display()))?;
+        let workflow = serde_saphyr::from_str::<serde_json::Value>(&source)
+            .map_err(|error| format!("workflow {} is not valid YAML: {error}", path.display()))?;
+        validate_workflow_actions(&path, &workflow)?;
+    }
+    Ok(())
+}
+
+fn validate_workflow_actions(path: &Path, value: &serde_json::Value) -> TaskResult {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(action)) = object.get("uses") {
+                validate_workflow_action(path, action, object.get("with"))?;
+            }
+            for nested in object.values() {
+                validate_workflow_actions(path, nested)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                validate_workflow_actions(path, nested)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_workflow_action(
+    path: &Path,
+    action: &str,
+    inputs: Option<&serde_json::Value>,
+) -> TaskResult {
+    const SETUP_TOOLS: &str = "./.github/actions/setup-tools";
+    const PINNED_TOOLS: [&str; 10] = [
+        "actionlint",
+        "cargo-deny",
+        "cargo-zigbuild",
+        "helm",
+        "kind",
+        "kubectl",
+        "opa",
+        "oras",
+        "shellcheck",
+        "zig",
+    ];
+
+    if action == SETUP_TOOLS {
+        if let Some(serde_json::Value::Object(inputs)) = inputs {
+            for tool in PINNED_TOOLS {
+                let version_input = format!("{tool}-version");
+                if inputs.contains_key(&version_input) {
+                    return Err(format!(
+                        "workflow {} overrides the central {tool} pin; update {SETUP_TOOLS} instead",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+    if action.starts_with("./") {
+        return Ok(());
+    }
+
+    let (action_name, revision) = action.rsplit_once('@').ok_or_else(|| {
+        format!(
+            "workflow {} action `{action}` must use an exact commit SHA",
+            path.display()
+        )
+    })?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "workflow {} action `{action}` must use an exact 40-character commit SHA",
+            path.display()
+        ));
+    }
+
+    let normalized = action_name.to_ascii_lowercase();
+    let installer = normalized.contains("setup") || normalized.contains("install");
+    if installer && PINNED_TOOLS.iter().any(|tool| normalized.contains(tool)) {
+        return Err(format!(
+            "workflow {} installs a centrally pinned tool through `{action_name}`; use {SETUP_TOOLS}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn m1_contracts_check() -> TaskResult {
@@ -452,6 +612,10 @@ fn e2e_openshell_adapter() -> TaskResult {
 
 fn e2e_governed_connections() -> TaskResult {
     run("bash", &["scripts/governed-connections-e2e.sh"])
+}
+
+fn e2e_hosted_litellm_aliases() -> TaskResult {
+    run("bash", &["scripts/hosted-litellm-alias-e2e.sh"])
 }
 
 fn e2e_postgres_tls() -> TaskResult {
@@ -1166,7 +1330,8 @@ mod tests {
     use super::{
         checked_command, git_command_in_repository, journey_tags, migration_changes,
         provider_profile_bundle_directory_for_inputs, root, should_skip_directory,
-        validate_conformance_test_result,
+        validate_conformance_test_result, validate_production_dependency_tree,
+        validate_workflow_action, validate_workflow_tool_setup,
     };
     use std::collections::BTreeSet;
     use std::fs;
@@ -1177,6 +1342,69 @@ mod tests {
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn production_dependency_tree_rejects_test_only_cryptography() -> Result<(), String> {
+        validate_production_dependency_tree(
+            "steward-apiserver-bin",
+            "steward-apiserver-bin v0.3.22",
+        )?;
+
+        for (forbidden, crate_name) in [
+            ("p256 v0.13.2", "p256"),
+            ("crypto-bigint v0.5.5", "crypto-bigint"),
+        ] {
+            let tree = format!("steward-apiserver-bin v0.3.22\n└── {forbidden}");
+            let Err(error) = validate_production_dependency_tree("steward-apiserver-bin", &tree)
+            else {
+                return Err(format!(
+                    "production tree accepted forbidden dependency {forbidden}"
+                ));
+            };
+            assert!(error.contains("steward-apiserver-bin"));
+            assert!(error.contains(crate_name));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflows_install_pinned_tools_only_through_setup_tools() -> Result<(), String> {
+        validate_workflow_tool_setup(&root().join(".github/workflows"))
+    }
+
+    #[test]
+    fn workflow_tool_setup_rejects_bypasses_and_floating_actions() -> Result<(), String> {
+        let path = Path::new(".github/workflows/example.yml");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let Err(bypass) = validate_workflow_action(path, &format!("azure/setup-helm@{sha}"), None)
+        else {
+            return Err("an external Helm installer was accepted".to_owned());
+        };
+        assert!(bypass.contains("use ./.github/actions/setup-tools"));
+
+        let Err(floating) = validate_workflow_action(path, "actions/checkout@v6", None) else {
+            return Err("a floating external action was accepted".to_owned());
+        };
+        assert!(floating.contains("exact 40-character commit SHA"));
+
+        let override_inputs = serde_json::json!({"helm-version": "3.17.1"});
+        let Err(override_error) = validate_workflow_action(
+            path,
+            "./.github/actions/setup-tools",
+            Some(&override_inputs),
+        ) else {
+            return Err("a workflow-specific Helm version was accepted".to_owned());
+        };
+        assert!(override_error.contains("overrides the central helm pin"));
+
+        validate_workflow_action(
+            path,
+            "./.github/actions/setup-tools",
+            Some(&serde_json::json!({"kubernetes-tools": "true"})),
+        )?;
+        validate_workflow_action(path, &format!("oven-sh/setup-bun@{sha}"), None)
+    }
+
     fn uses_user_envelope_only_contract() -> Result<bool, String> {
         let chart = fs::read_to_string(root().join("charts/steward/Chart.yaml"))
             .map_err(|error| format!("Steward chart metadata is required: {error}"))?;
@@ -1186,7 +1414,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.20" => Ok(true),
+            "0.3.28" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1341,6 +1569,8 @@ mod tests {
             .map_err(|error| format!("Bun workspace manifest is required: {error}"))?;
         let web_package = fs::read_to_string(repository.join("web/package.json"))
             .map_err(|error| format!("steward-web package manifest is required: {error}"))?;
+        let bun_lock = fs::read_to_string(repository.join("bun.lock"))
+            .map_err(|error| format!("Bun lockfile is required: {error}"))?;
         let proxy = fs::read_to_string(repository.join("web/src/proxy.ts"))
             .map_err(|error| format!("nonce-compatible Next proxy is required: {error}"))?;
         let layout = fs::read_to_string(repository.join("web/src/app/layout.tsx"))
@@ -1366,7 +1596,7 @@ mod tests {
             );
         }
         for required in [
-            "\"next\": \"16.3.6\"",
+            "\"next\": \"16.4.1\"",
             "\"react\": \"19.2.8\"",
             "\"tailwindcss\": \"4.3.3\"",
             "\"@hey-api/openapi-ts\": \"0.99.0\"",
@@ -1376,6 +1606,10 @@ mod tests {
                 "steward-web dependencies must stay exact-version pinned: {required}"
             );
         }
+        assert!(
+            bun_lock.contains("\"sharp\": [\"sharp@0.35.5\""),
+            "the web image must resolve sharp 0.35.5 or newer"
+        );
         for required in [
             "crypto.randomUUID()",
             "script-src 'self' 'nonce-${nonce}' 'strict-dynamic'",
@@ -1778,6 +2012,279 @@ mod tests {
         assert!(
             workspace.len() <= 19,
             "governed sandbox probe workspace must fit OpenShell's 19-character limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reference_runtimes_pin_fixed_uv_release() -> Result<(), String> {
+        let runtimes = [
+            (
+                "Codex",
+                "build/codex-reference.Dockerfile",
+                "docs/installation/codex-reference-runtime.md",
+            ),
+            (
+                "Claude Code",
+                "build/claude-code-reference.Dockerfile",
+                "docs/installation/claude-code-reference-runtime.md",
+            ),
+        ];
+
+        for (name, container_path, documentation_path) in runtimes {
+            let container = fs::read_to_string(root().join(container_path))
+                .map_err(|error| format!("{name} reference runtime build is required: {error}"))?;
+            let documentation =
+                fs::read_to_string(root().join(documentation_path)).map_err(|error| {
+                    format!("{name} reference runtime documentation is required: {error}")
+                })?;
+
+            for required in [
+                "UV_VERSION=0.11.15",
+                "UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7",
+                "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz",
+                "sha256sum --check --strict",
+                "/usr/local/bin/uv",
+                "/usr/local/bin/uvx",
+                "test \"$(uv --version | cut -d ' ' -f 1-2)\" = \"uv ${UV_VERSION}\"",
+                "test \"$(uvx --version | cut -d ' ' -f 1-2)\" = \"uvx ${UV_VERSION}\"",
+            ] {
+                assert!(
+                    container.contains(required),
+                    "{name} reference runtime must install and verify {required}"
+                );
+            }
+            assert!(
+                documentation.contains("| `uv` | 0.11.15 |"),
+                "{name} reference runtime documentation must list the pinned uv release"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_reference_runtime_is_fail_closed_and_released() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/claude-code-reference.Dockerfile"))
+            .map_err(|error| {
+            format!("Claude Code reference runtime build is required: {error}")
+        })?;
+        let dockerignore = fs::read_to_string(root().join(".dockerignore"))
+            .map_err(|error| format!("Docker build context policy is required: {error}"))?;
+        let launcher = fs::read_to_string(root().join("build/claude-code-launcher.sh"))
+            .map_err(|error| format!("Claude Code fail-closed launcher is required: {error}"))?;
+        let image_state_checker =
+            fs::read_to_string(root().join("build/claude-code-image-state-check.sh"))
+                .map_err(|error| format!("Claude Code image-state checker is required: {error}"))?;
+        let refusal_tests = fs::read_to_string(root().join("scripts/test-claude-code-launcher.sh"))
+            .map_err(|error| format!("Claude Code refusal tests are required: {error}"))?;
+        let governed_probe =
+            fs::read_to_string(root().join("scripts/claude-code-reference-runtime-e2e.sh"))
+                .map_err(|error| {
+                    format!("Claude Code governed runtime probe is required: {error}")
+                })?;
+        let ci_workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("CI workflow is required: {error}"))?;
+        let release_workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("release workflow is required: {error}"))?;
+        let classifier = fs::read_to_string(root().join("scripts/ci-change-class.sh"))
+            .map_err(|error| format!("CI classifier is required: {error}"))?;
+        let trivy =
+            fs::read_to_string(root().join("security/claude-code-reference-runtime.trivy.yaml"))
+                .map_err(|error| format!("Claude Code runtime scan policy is required: {error}"))?;
+        let documentation = fs::read_to_string(
+            root().join("docs/installation/claude-code-reference-runtime.md"),
+        )
+        .map_err(|error| format!("Claude Code runtime documentation is required: {error}"))?;
+        let readme = fs::read_to_string(root().join("README.md"))
+            .map_err(|error| format!("public README is required: {error}"))?;
+        let changelog = fs::read_to_string(root().join("CHANGELOG.md"))
+            .map_err(|error| format!("changelog is required: {error}"))?;
+
+        for required in [
+            "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
+            "@anthropic-ai/claude-code@2.1.222",
+            "2.1.222 (Claude Code)",
+            "tar@7.5.22",
+            "/usr/lib/node_modules/npm/node_modules/tar/package.json",
+            "node --print 'require(\"/usr/lib/node_modules/tar/package.json\").version'",
+            "node --print 'require(\"/usr/lib/node_modules/npm/node_modules/tar/package.json\").version'",
+            "RIPGREP_SHA256=c5ae63c7bee915b1cfc9f0bd07c55b4ce7f2bcd1133cba4da56719aac26101a4",
+            "JQ_SHA256=f59183392f84fe67b407b494d8ba6185e9b0e4a106ffcb369490bd20a83fd40e",
+            "FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e6672d",
+            "TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e",
+            "sha256sum --check --strict",
+            "COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude",
+            "build/claude-code-image-state-check.sh",
+            "USER sandbox",
+            "/usr/local/libexec/steward/claude-code-image-state-check \"$HOME\" /etc/claude-code/managed-settings.json",
+        ] {
+            assert!(
+                container.contains(required),
+                "Claude Code reference runtime must retain {required}"
+            );
+        }
+        for required in [
+            ".claude.json",
+            ".claude/.credentials.json",
+            ".credentials.json",
+            ".config/claude",
+            "settings*.json",
+            "apiKeyHelper",
+            "ANTHROPIC_AUTH_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "sk-ant-",
+            "settings_status",
+            "credential_status",
+        ] {
+            assert!(
+                image_state_checker.contains(required),
+                "Claude Code image-state checker must retain {required}"
+            );
+        }
+        assert!(
+            !image_state_checker.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("! find") || line.starts_with("! grep")
+            }),
+            "Claude Code image-state checks must not use set-e-immune negated commands"
+        );
+        for fixture in [
+            "clean-skills",
+            "api-key-helper",
+            "settings-env-credential",
+            "credential-shaped-string",
+            "credentials-file",
+            "managed-settings",
+        ] {
+            assert!(
+                refusal_tests.contains(fixture),
+                "Claude Code image-state tests must cover {fixture}"
+            );
+        }
+        for forbidden in [
+            "ENV ANTHROPIC_API_KEY",
+            "ENV ANTHROPIC_AUTH_TOKEN",
+            "COPY .credentials.json",
+            "ADD .credentials.json",
+            "COPY .claude.json",
+            "ADD .claude.json",
+        ] {
+            assert!(
+                !container.contains(forbidden),
+                "Claude Code reference image must not persist {forbidden}"
+            );
+        }
+        assert!(
+            dockerignore
+                .lines()
+                .any(|line| line == "!build/claude-code-launcher.sh"),
+            "the Docker build context must include the Claude Code launcher"
+        );
+        assert!(
+            dockerignore
+                .lines()
+                .any(|line| line == "!build/claude-code-image-state-check.sh"),
+            "the Docker build context must include the Claude Code image-state checker"
+        );
+
+        for required in [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "openshell-token-grant-placeholder",
+            "DISABLE_AUTOUPDATER",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "exit 125",
+            "exec /usr/bin/claude",
+        ] {
+            assert!(
+                launcher.contains(required),
+                "Claude Code launcher must enforce {required}"
+            );
+        }
+        assert!(
+            !launcher.contains("${DISABLE_UPDATES-}"),
+            "Claude Code launcher must not rely on the unused legacy update flag"
+        );
+
+        for required in [
+            "check_refusal missing-base-url",
+            "check_refusal missing-placeholder",
+            "check_refusal wrong-placeholder",
+            "check_refusal updates-enabled",
+            "check_refusal nonessential-traffic-enabled",
+            "check_refusal alternate-auth",
+            "test \\\"\\$(id -u)\\\" -ne 0",
+            "/usr/local/libexec/steward/claude-code-image-state-check \\\"\\$HOME\\\" /etc/claude-code/managed-settings.json",
+            "rg --version",
+            "jq --version",
+            "fd --version",
+            "tree --version",
+        ] {
+            assert!(
+                governed_probe.contains(required),
+                "Claude Code governed probe must retain {required}"
+            );
+        }
+
+        for required in [
+            "claude-code-reference-runtime:",
+            "release / Claude Code reference runtime",
+            "build/claude-code-reference.Dockerfile",
+            "bash scripts/claude-code-reference-runtime-e2e.sh",
+            "security/claude-code-reference-runtime.trivy.yaml",
+            "CLAUDE_CODE_REFERENCE_RUNTIME: ${{ needs.claude-code-reference-runtime.result }}",
+            "claude-code-reference-runtime=${CLAUDE_CODE_REFERENCE_RUNTIME}",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "Claude Code runtime CI must retain {required}"
+            );
+        }
+        assert!(
+            classifier.contains("claude-code-reference-runtime    run   skip  skip"),
+            "the fail-safe classifier must require the Claude Code runtime lane for full changes"
+        );
+        assert!(trivy.contains("vulnerability:"));
+
+        for required in [
+            "publish-claude-code-reference-runtime:",
+            "ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime:2.1.222-steward-${{ steps.version.outputs.version }}",
+            "provenance: mode=max",
+            "sbom: true",
+            "claude-code-reference-runtime.digest",
+            "release-claude-code-reference-runtime",
+            "claudeCode:",
+            "agentRef: \"claude-code@2.1.222\"",
+            "platform: \"linux/amd64\"",
+        ] {
+            assert!(
+                release_workflow.contains(required),
+                "release workflow must retain {required}"
+            );
+        }
+
+        for required in [
+            "claude-code@2.1.222",
+            "claude-code-v1",
+            "openshell-token-grant-placeholder",
+            "referenceRuntimes.claudeCode",
+            "docker buildx imagetools create",
+        ] {
+            assert!(
+                documentation.contains(required),
+                "Claude Code runtime documentation must include {required}"
+            );
+        }
+        assert!(
+            readme.contains("docs/installation/claude-code-reference-runtime.md"),
+            "public README must link the Claude Code runtime guide"
+        );
+        assert!(
+            changelog.contains("Claude Code reference runtime"),
+            "the Unreleased changelog must name the Claude Code reference runtime"
         );
         Ok(())
     }
@@ -3037,6 +3544,47 @@ mod tests {
             "cargo xtask quality must compile every e2e target without running it"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn real_hosted_litellm_alias_e2e_is_part_of_the_pinned_ci_lane() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let xtask_source = fs::read_to_string(root().join("xtask/src/main.rs"))
+            .map_err(|error| format!("xtask source is required: {error}"))?;
+        let harness = fs::read_to_string(root().join("scripts/hosted-litellm-alias-e2e.sh"))
+            .map_err(|error| format!("hosted LiteLLM alias harness is required: {error}"))?;
+
+        let shared_ci = xtask_source
+            .split_once("fn ci() -> TaskResult {\n")
+            .and_then(|(_before, after)| after.split_once("\n}\n\nfn quality()"))
+            .map(|(body, _after)| body)
+            .ok_or_else(|| "shared CI function could not be isolated".to_owned())?;
+        assert!(
+            !shared_ci.contains("e2e_hosted_litellm_aliases"),
+            "the real hosted LiteLLM integration must not extend the quality or release validation gate"
+        );
+        let pinned = ci
+            .split_once("  conformance-pinned:\n")
+            .and_then(|(_before, after)| after.split_once("\n  openshell-adapter:"))
+            .map(|(job, _after)| job)
+            .ok_or_else(|| "pinned conformance job could not be isolated".to_owned())?;
+        assert!(
+            pinned.contains("run: cargo xtask e2e-hosted-litellm-aliases"),
+            "the pinned LiteLLM CI lane must run the real hosted-alias integration"
+        );
+        for required in [
+            "ghcr.io/berriai/litellm-database:v1.93.0@sha256:72360d8bd5602faa49be5098a8ac3dd069d9fb74503d6bd014242d96dc753e43",
+            "steward.test/run-id",
+            "disable_spend_logs: false",
+            "--test hosted_litellm_aliases",
+        ] {
+            assert!(
+                harness.contains(required),
+                "hosted LiteLLM alias harness is missing {required}"
+            );
+        }
         Ok(())
     }
 
@@ -5217,7 +5765,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.20")
+            Some("0.3.28")
         );
         assert_eq!(
             manifest

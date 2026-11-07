@@ -62,6 +62,13 @@ case "${1:-} ${2:-}" in
           digest='sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
         fi
         ;;
+      ghcr.io/example-org/steward-claude-code:2.1.222@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+        if [[ -n "${platform}" ]]; then
+          digest='sha256:3333333333333333333333333333333333333333333333333333333333333333'
+        else
+          digest='sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+        fi
+        ;;
       *)
         digest="$(awk -F '|' -v reference="${reference}" '$1 == reference {print $2}' "${MOCK_ORAS_STATE}" | tail -n 1)"
         [[ -n "${digest}" ]] || exit 1
@@ -104,6 +111,10 @@ cat >"${temporary_directory}/handoff.json" <<'JSON'
     }
   },
   "referenceRuntimes": {
+    "claudeCode": {
+      "reference": "ghcr.io/example-org/steward-claude-code:2.1.222",
+      "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
     "codex": {
       "reference": "ghcr.io/example-org/steward-codex:0.140.0",
       "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
@@ -119,6 +130,7 @@ cat >"${temporary_directory}/mappings.json" <<'JSON'
     "chart": "registry.example.test/team-a/charts/steward:0.3.1",
     "images.apiserver": "registry.example.test/team-a/steward:0.3.1-apiserver",
     "images.triggerReceiver": "registry.example.test/team-a/steward:0.3.1-trigger-receiver",
+    "referenceRuntimes.claudeCode": "registry.example.test/team-a/steward-claude-code:2.1.222",
     "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex:0.140.0"
   }
 }
@@ -139,7 +151,7 @@ cmp "${temporary_directory}/plan-one.json" "${temporary_directory}/plan-two.json
 jq -e '
   .schemaVersion == "steward.registry-plan/v1" and
   .platform == null and
-  (.artifacts | keys) == ["chart", "images.apiserver", "images.triggerReceiver", "referenceRuntimes.codex"] and
+  (.artifacts | keys) == ["chart", "images.apiserver", "images.triggerReceiver", "referenceRuntimes.claudeCode", "referenceRuntimes.codex"] and
   .artifacts.chart.target.reference == "registry.example.test/team-a/charts/steward:0.3.1"
 ' "${temporary_directory}/plan-one.json" >/dev/null
 if grep -Fq 'cp --recursive' "${command_log}"; then
@@ -155,8 +167,8 @@ PATH="${mock_directory}:${PATH}" "${root}/scripts/steward-registry-lock.sh" mirr
   --output "${temporary_directory}/lock-two.json" >"${temporary_directory}/result-two.jsonl"
 cmp "${temporary_directory}/lock-one.json" "${temporary_directory}/lock-two.json"
 
-jq -s -e 'length == 4 and all(.status == "copied")' "${temporary_directory}/result-one.jsonl" >/dev/null
-jq -s -e 'length == 4 and all(.status == "already-present")' "${temporary_directory}/result-two.jsonl" >/dev/null
+jq -s -e 'length == 5 and all(.status == "copied")' "${temporary_directory}/result-one.jsonl" >/dev/null
+jq -s -e 'length == 5 and all(.status == "already-present")' "${temporary_directory}/result-two.jsonl" >/dev/null
 jq -e '
   .schemaVersion == "steward.deployment-lock/v1" and
   .artifacts.chart.source.digest == .artifacts.chart.target.digest and
@@ -165,6 +177,7 @@ jq -e '
   .chartValues.images.repository == "registry.example.test/team-a/steward" and
   .chartValues.images.apiserver.tag == "0.3.1-apiserver" and
   .chartValues.images.triggerReceiver.tag == "0.3.1-trigger-receiver" and
+  .executionBindingImages.claudeCode == "registry.example.test/team-a/steward-claude-code@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" and
   .executionBindingImages.codex == "registry.example.test/team-a/steward-codex@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 ' "${temporary_directory}/lock-one.json" >/dev/null
 
@@ -179,6 +192,7 @@ jq -e '
   .platform == "linux/amd64" and
   .artifacts.chart.source.digest == .artifacts.chart.source.releaseDigest and
   .artifacts["images.apiserver"].source.digest != .artifacts["images.apiserver"].source.releaseDigest and
+  .artifacts["referenceRuntimes.claudeCode"].source.digest != .artifacts["referenceRuntimes.claudeCode"].source.releaseDigest and
   .artifacts["referenceRuntimes.codex"].source.digest != .artifacts["referenceRuntimes.codex"].source.releaseDigest
 ' "${temporary_directory}/platform-plan.json" >/dev/null
 grep -Fq -- '--platform linux/amd64' "${command_log}"

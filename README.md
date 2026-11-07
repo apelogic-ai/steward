@@ -28,7 +28,7 @@ Observation or association alone grants no Task or Envelope authority. See the
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.3.20`, Kubernetes `>=1.32`, Helm 3.17+,
+Current installation contract: chart `0.3.28`, Kubernetes `>=1.32`, Helm 3.17+,
 and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
 OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
 release images and the OCI
@@ -63,6 +63,7 @@ records the limits of this tested matrix.
 | Understand the Task API and worker contract | [Task deployment](config/task/README.md) |
 | Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |
 | Obtain, mirror, or rebuild the supported Codex image | [Codex reference runtime](docs/installation/codex-reference-runtime.md) |
+| Obtain, mirror, or rebuild the supported Claude Code image | [Claude Code reference runtime](docs/installation/claude-code-reference-runtime.md) |
 | The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
 

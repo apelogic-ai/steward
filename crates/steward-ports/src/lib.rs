@@ -1,6 +1,7 @@
 //! Vendor-neutral interfaces for every replaceable Steward plane.
 
 use std::future::Future;
+use std::time::Duration;
 
 use futures::Stream;
 
@@ -279,8 +280,8 @@ pub struct SandboxTaskRequest {
     /// The exact models admitted into the immutable runtime spec for this Task.
     pub models: Vec<ModelRef>,
     pub command: Vec<String>,
-    /// Immutable caller-visible diagnostics selected by the admitted direct package.
-    /// Legacy tasks and provider-control operations always carry the default disabled value.
+    /// Server-selected execution diagnostics. Ordinary Agent Tasks always retain their bounded
+    /// streams; provider-control operations carry the disabled value.
     pub diagnostics: DiagnosticsRequest,
     /// Immutable workspace identities resolved at admission. Materializers consume only this
     /// server-authored evidence plus the separately framed workspace archive.
@@ -415,15 +416,23 @@ pub struct ProvisionedInference {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceUsage {
+    pub spend: SpendSummary,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InferenceObservation {
     Absent,
     Active {
         reference: String,
         spend: SpendSummary,
+        usage: Option<InferenceUsage>,
     },
     Exhausted {
         reference: String,
         spend: SpendSummary,
+        usage: Option<InferenceUsage>,
     },
 }
 
@@ -493,6 +502,10 @@ pub enum SessionEvent {
 
 pub trait InferencePlane: Send + Sync + 'static {
     fn capabilities(&self) -> InferenceCapabilities;
+
+    fn usage_report_timeout(&self) -> Duration {
+        Duration::ZERO
+    }
 
     fn validate_configuration(
         &self,

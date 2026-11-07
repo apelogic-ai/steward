@@ -1,6 +1,6 @@
 # Execution bindings
 
-Status: current Steward 0.3.20 installation contract
+Status: current Steward 0.3.28 installation contract
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding
@@ -62,6 +62,11 @@ Steward releases a tested `linux/amd64` image for `codex@0.140.0`. Its exact ref
 are in `release-handoff.json`; see the [Codex reference runtime guide](codex-reference-runtime.md)
 for binding, mirroring, private-build, and conformance commands.
 
+The release also includes a tested `linux/amd64` image for `claude-code@2.1.222`. Its exact
+reference and digest are in the same handoff; see the
+[Claude Code reference runtime guide](claude-code-reference-runtime.md) for the binding executable,
+LiteLLM route, fail-closed placeholder checks, mirroring, and private-build procedure.
+
 `codex-v1` defines behavior, not a product-pinned Codex release. A compatible image must be
 multi-architecture for every platform the deployment admits, contain the configured absolute
 executable on each architecture, return the exact configured stdout for the configured probe
@@ -85,10 +90,10 @@ also supply `/bin/sh`, `id`, `mkdir`, `ln`, `tee`, and `cat`, declare a non-root
 remain non-root when OpenShell starts the Task. Claude Code refuses `bypassPermissions` as root, so
 the adapter checks the effective UID and fails closed before its version probe or inference call.
 Image conformance must exercise that non-root entrypoint; a root-only image is not compatible with
-`claude-code-v1`. The adapter passes the admitted provider-qualified model group to match the
-runtime-scoped inference key; it does not select or remap a model. The binding decides which
-providers are compatible. The deployment configures the Anthropic-compatible API base URL independently from
-Codex's OpenAI-compatible Responses endpoint.
+`claude-code-v1`. Beginning with Steward 0.3.28, the adapter passes the exact admitted model ID or
+alias unchanged to match the runtime-scoped inference key; it does not add, remove, or remap a
+provider prefix. The binding decides which providers are compatible. The deployment configures the
+Anthropic-compatible API base URL independently from Codex's OpenAI-compatible Responses endpoint.
 
 Before launch, the adapter removes inherited Claude cloud-provider selectors and alternate
 authentication or custom-header variables, then supplies only the governed Anthropic-compatible
@@ -103,13 +108,20 @@ needed only for a new adapter or binding schema.
 
 ## Adding a model
 
-Add the exact `<provider>/<model>` name and pricing to the inference proxy, add the same model to
-the Steward capability catalog, and make it available through the relevant Envelope Template.
-No Steward release is required. The model is selectable for an agent when its provider appears in
-that execution binding's `models.providers`. Adding another model under an already-listed provider
-requires no binding change; adding a provider requires a reviewed binding update and a new derived
-binding digest. A Task is rejected before reservation when the selected agent does not advertise
-the selected model provider.
+For Steward 0.3.27, add the exact `<provider>/<model>` name and pricing to the inference proxy, add
+the same model to the Steward capability catalog, and make it available through the relevant
+Envelope Template.
+
+Beginning with Steward 0.3.28, the capability-catalog `model` is instead the exact model ID or
+alias sent to the inference proxy. It may be a deployment-defined alias with no provider prefix.
+The separate capability-catalog `provider` selects compatible execution bindings and is never
+added to or removed from `model`. Configure pricing under that exact alias.
+
+No Steward release is required for another model alias. The model is selectable for an agent when
+its separate provider appears in that execution binding's `models.providers`. Adding another model
+under an already-listed provider requires no binding change; adding a provider requires a reviewed
+binding update and a new derived binding digest. A Task is rejected before reservation when the
+selected agent does not advertise the selected model provider.
 
 ## OpenShell provider profiles
 

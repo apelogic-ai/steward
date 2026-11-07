@@ -86,6 +86,12 @@ web:
         key: ca.crt
         # Optional public certificate bundle rendered into the named ConfigMap.
         data: ""
+mint:
+  httpRoute:
+    # Mint Gateway API routing is opt-in and uses only the public token and JWKS paths.
+    enabled: false
+    hostnames: []
+    parentRefs: []
 triggerReceiver:
   # Opt in only after the receiver image, read-only database role, trust bundles,
   # and every referenced Jira webhook signing Secret are available.
@@ -264,11 +270,13 @@ config:
     # Deprecated compatibility key. It is accepted but ignored in this release; administrator
     # approval controls above-template and template-free requests. Remove it before the next release.
     customEnvelopeSafetyCeiling: null
-    # Exact verified steward-run release coordinates selected by the installation BOM. Required
-    # when browser administration is enabled; null keeps the source chart product-neutral.
+    # Verified steward-run release coordinates selected by the installation BOM, with an optional
+    # workflowRef selected by the installation. Required when browser administration is enabled;
+    # null keeps the source chart product-neutral.
     stewardRunRelease: null
-    # Use the immutable remote reusable workflow by default. Select vendored only after installing
-    # the verified steward-task-vendored.yml release asset in every caller repository.
+    # Use the remote reusable workflow by default: the exact verified commit unless workflowRef is
+    # set. Select vendored only after installing the verified steward-task-vendored.yml release
+    # asset in every caller repository.
     stewardRunWorkflowInstallationMode: remote
     # Optional deployment-owned browser starter task. Null uses Steward's built-in Hello World
     # task. A values change updates the apiserver pod template and rolls the Deployment.
@@ -329,6 +337,7 @@ config:
     workloadExchangeEndpoint: ""
     workloadExchangeServerName: ""
     litellmUrl: ""
+    litellmSpendLogTimeoutSeconds: 10
   mint:
     issuer: ""
     audience: steward-mcp

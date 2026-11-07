@@ -47,8 +47,8 @@ use steward_controller::{
 };
 use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, InferenceCapabilities,
-    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, PortError,
-    ProviderControlExecutionBindings, ProvisionedInference,
+    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
+    PortError, ProviderControlExecutionBindings, ProvisionedInference,
     SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
     SandboxTaskTranscript, TaskAttemptId, TaskExecutionAdapter, TaskExecutionPlan,
@@ -58,7 +58,7 @@ use steward_store::{
     AgentRunLogStream, AgentRunTimelineKind, BrowserMemberStateAction, BrowserMemberStateChange,
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
     EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER, ManagedInferenceKeyCipher,
-    PgStore, StoreError, TaskActivationObservation, TaskCleanupObservation,
+    PgStore, ReportedInferenceUsage, StoreError, TaskActivationObservation, TaskCleanupObservation,
     TaskExecutionObservation, TaskExecutionTransition, TaskOperationTransition,
     TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest, WorkflowPublication,
 };
@@ -206,7 +206,7 @@ impl TaskExecutionAdapter for PublishedWorkflowExecutionAdapter {
             command: vec![
                 "example-agent".to_owned(),
                 request.workflow_prompt.to_owned(),
-                format!("{}/{}", request.model.provider, request.model.model),
+                request.model.model.clone(),
             ],
         })
     }
@@ -930,12 +930,19 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         started_index < ended_index,
         "a synchronous terminal result must record executionStarted before executionEnded"
     );
-    assert!(
-        store
-            .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
-            .await?
-            .is_none(),
-        "execution-log: off must not persist a failed-run transcript"
+    let failed_transcript = store
+        .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("failed-run transcript is absent"))?;
+    assert_eq!(
+        failed_transcript.execution_stdout.as_deref(),
+        Some(b"failed task stdout".as_slice()),
+        "the compatibility off value must not hide an ordinary agent's stdout"
+    );
+    assert_eq!(
+        failed_transcript.execution_stderr.as_deref(),
+        Some(b"failed task stderr".as_slice()),
+        "the compatibility off value must not hide an ordinary agent's stderr"
     );
     let owner_log = store
         .agent_run_execution_log(
@@ -945,18 +952,12 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         )
         .await?
         .ok_or_else(|| io::Error::other("owner log status is absent"))?;
-    assert!(
-        owner_log.content.is_empty(),
-        "the owner log route must not expose a transcript when diagnostics are off"
-    );
+    assert_eq!(owner_log.content, b"failed task stdout");
     let admin_log = store
         .agent_run_execution_log(failed_task_uid, None, AgentRunLogStream::Stderr)
         .await?
         .ok_or_else(|| io::Error::other("administrator log status is absent"))?;
-    assert!(
-        admin_log.content.is_empty(),
-        "the administrator log route must not expose a transcript when diagnostics are off"
-    );
+    assert_eq!(admin_log.content, b"failed task stderr");
     let failed_outputs = task_api_request(
         &app,
         Method::GET,
@@ -2253,7 +2254,12 @@ impl InferencePlane for ActiveInference {
             })?
             .pop_front();
         let observed_amount = match sequenced_amount {
-            Some(amount) => amount,
+            Some(amount) => {
+                *self.observed_spend.lock().map_err(|_| PortError::Failed {
+                    reason: "fixture inference spend lock was poisoned".to_owned(),
+                })? = Some(amount.clone());
+                amount
+            }
             None => self
                 .observed_spend
                 .lock()
@@ -2270,12 +2276,20 @@ impl InferencePlane for ActiveInference {
         if self.report_exhausted.load(Ordering::SeqCst) {
             return Ok(InferenceObservation::Exhausted {
                 reference: format!("inference-{}", request.runtime.0),
-                spend: observation,
+                spend: observation.clone(),
+                usage: Some(InferenceUsage {
+                    spend: observation,
+                    total_tokens: None,
+                }),
             });
         }
         Ok(InferenceObservation::Active {
             reference: format!("inference-{}", request.runtime.0),
-            spend: observation,
+            spend: observation.clone(),
+            usage: Some(InferenceUsage {
+                spend: observation,
+                total_tokens: None,
+            }),
         })
     }
 
@@ -3466,6 +3480,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             false,
+            Some(ReportedInferenceUsage {
+                observed_amount: "40.00".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     store
@@ -3478,6 +3496,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             false,
+            Some(ReportedInferenceUsage {
+                observed_amount: "40.00".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -3501,6 +3523,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.40".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     store
@@ -3513,6 +3539,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             false,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.55".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     store
@@ -3525,6 +3555,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.40".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -3558,6 +3592,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "0.80".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -3804,8 +3842,44 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "12.50".to_owned(),
+                total_tokens: Some(250),
+            }),
         )
         .await?;
+
+    let reported_usage = store
+        .agent_run(task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("agent run with reported usage is absent"))?
+        .spend
+        .ok_or_else(|| io::Error::other("reported agent run usage is absent"))?;
+    assert_eq!(reported_usage.observed_amount, "12.50");
+    assert_eq!(reported_usage.total_tokens, Some(250));
+
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "110.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+            None,
+        )
+        .await?;
+    assert!(
+        store
+            .agent_run(task_uid)
+            .await?
+            .ok_or_else(|| io::Error::other("agent run with unavailable usage is absent"))?
+            .spend
+            .is_none(),
+        "an enforcement-only key counter must not be reported as run usage"
+    );
 
     let escalation = store
         .admin_escalations()
@@ -3902,6 +3976,10 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 currency: "USD".to_owned(),
             },
             true,
+            Some(ReportedInferenceUsage {
+                observed_amount: "130.00".to_owned(),
+                total_tokens: None,
+            }),
         )
         .await?;
     assert_eq!(
@@ -5498,6 +5576,28 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         assert_eq!(log.content, expected);
         assert!(log.complete);
     }
+    let runner_stdout = store
+        .task_execution_log_for_submitter(
+            successful_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("submitter-scoped execution log is absent"))?;
+    assert_eq!(runner_stdout.content, b"successful task stdout");
+    assert!(
+        store
+            .task_execution_log_for_submitter(
+                successful_task_uid,
+                "other-service",
+                identity.user_id.as_str(),
+                AgentRunLogStream::Stdout,
+            )
+            .await?
+            .is_none(),
+        "the same owner through another service must not read the Task log"
+    );
     let runner_transcript = store
         .task_output_transcript_for_submitter(
             successful_task_uid,

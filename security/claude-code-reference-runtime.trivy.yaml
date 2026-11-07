@@ -1,0 +1,3 @@
+vulnerability:
+  vex:
+    - security/codex-reference-runtime.openvex.json

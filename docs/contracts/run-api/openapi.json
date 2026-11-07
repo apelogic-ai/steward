@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.3.20"
+    "version": "0.3.28"
   },
   "paths": {
     "/admin/api/v1/all-runs": {
@@ -6457,6 +6457,105 @@
         ]
       }
     },
+    "/v1/tasks/{taskUid}/logs/{stream}": {
+      "get": {
+        "tags": [],
+        "operationId": "task_logs_contract",
+        "parameters": [
+          {
+            "name": "taskUid",
+            "in": "path",
+            "description": "Task lifecycle identity",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "path",
+            "description": "Exact execution stream: stdout or stderr",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Byte offset for the next bounded JSON chunk; omit for the complete text stream",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserExecutionLogResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "taskUid or byte offset is invalid",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Identity assertion is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task or stream is not owned by the resolved submitter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Identity or persistence dependency unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "taskBearer": []
+          }
+        ]
+      }
+    },
     "/v1/tasks/{taskUid}/outputs": {
       "get": {
         "tags": [],
@@ -7003,6 +7102,13 @@
           },
           "observedAmount": {
             "type": "string"
+          },
+          "totalTokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },

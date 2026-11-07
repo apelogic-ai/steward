@@ -870,7 +870,7 @@ async fn verify_attempt_failure_semantics(
             "/bin/sh".to_owned(),
             "-c".to_owned(),
             format!(
-                "yes x | head -c {}; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"",
+                "yes x | head -c {}; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf complete > \"$STEWARD_OUTPUT_DIR/out/result.txt\"",
                 MAX_EXECUTION_STREAM_BYTES + 1
             ),
         ],
@@ -886,14 +886,7 @@ async fn verify_attempt_failure_semantics(
             SandboxTaskObservation::Accepted { .. }
             | SandboxTaskObservation::Running { .. }
             | SandboxTaskObservation::RunningWithTranscript { .. } => {}
-            SandboxTaskObservation::FailedWithTranscript {
-                reason, transcript, ..
-            } => {
-                if reason != "The execution log exceeded the 4 MiB limit per stream." {
-                    return Err(format!(
-                        "oversized transcript had unsafe reason: {reason:?}"
-                    ));
-                }
+            SandboxTaskObservation::SucceededWithTranscript { transcript, .. } => {
                 if transcript.stdout.len()
                     != usize::try_from(MAX_EXECUTION_STREAM_BYTES)
                         .map_err(|_| "execution stream bound does not fit usize".to_owned())?
@@ -910,7 +903,7 @@ async fn verify_attempt_failure_semantics(
             }
             other => {
                 return Err(format!(
-                    "oversized transcript did not terminalize as a bounded failure: {other:?}"
+                    "successful oversized-output task did not retain a bounded tail: {other:?}"
                 ));
             }
         }

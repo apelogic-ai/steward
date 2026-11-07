@@ -117,7 +117,7 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 reason: "tool-bearing Codex execution requires a governed tool endpoint".to_owned(),
             });
         }
-        let model = format!("{}/{}", request.model.provider, request.model.model);
+        let model = request.model.model.clone();
         let mut adapter_config = format!(
             concat!(
                 "model_provider = \"litellm\"\n",
@@ -269,7 +269,7 @@ mod tests {
         assert!(config.contains("https://tools.example.test/mcp"));
         assert!(config.contains("bearer_token_env_var = \"STEWARD_MCP_GW_BEARER_TOKEN\""));
         assert_eq!(plan.command[4], "Review the repository state.");
-        assert_eq!(plan.command[5], "example-model/large");
+        assert_eq!(plan.command[5], "large");
         assert_eq!(plan.command[7], binding.executable);
         assert_eq!(plan.command[8], binding.version_probe.expected_stdout);
         assert_eq!(plan.command[9], "--version");
@@ -297,6 +297,29 @@ mod tests {
         assert!(!plan.command[6].contains("[mcp_servers."));
         assert!(!plan.command[6].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
         assert!(!plan.command[2].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_an_explicitly_qualified_model_alias_exact() -> Result<(), String> {
+        let adapter =
+            CodexTaskExecutionAdapter::new("https://inference.example.test/v1".to_owned())
+                .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        let plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &ModelRef {
+                    provider: "example-model".to_owned(),
+                    model: "example-model/legacy-alias".to_owned(),
+                },
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render adapter plan: {error:?}"))?;
+
+        assert_eq!(plan.command[5], "example-model/legacy-alias");
         Ok(())
     }
 

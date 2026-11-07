@@ -524,14 +524,15 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
     { key: "envelope", label: "Envelope", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => run.userEnvelopeRevision ? `rev ${run.userEnvelopeRevision}` : "—" },
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
     { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },
-    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "—" },
+    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Not reported" },
+    { key: "tokens", label: "Tokens used", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : "Not reported" },
     { key: "updated", label: "Updated", className: "text-right text-muted-ink", render: (run: BrowserRunView) => relativeTime(run.updatedAt) },
   ];
   return <DataTable
     ariaLabel={admin ? "All runs" : "Runs"}
     columns={columns}
-    gridTemplateColumns={admin ? "minmax(180px,1.2fr) minmax(160px,1fr) minmax(220px,1.4fr) 90px 110px 110px 90px 150px" : "minmax(190px,1.2fr) minmax(220px,1.4fr) 90px 110px 110px 90px 150px"}
-    minWidth={admin ? "1280px" : "1100px"}
+    gridTemplateColumns={admin ? "minmax(180px,1.2fr) minmax(160px,1fr) minmax(220px,1.4fr) 90px 110px 110px 110px 120px 150px" : "minmax(190px,1.2fr) minmax(220px,1.4fr) 90px 110px 110px 110px 120px 150px"}
+    minWidth={admin ? "1390px" : "1210px"}
     rowHref={(run) => `${admin ? "/admin/runs" : "/runs"}/${run.taskUid}`}
     rowKey={(run) => run.taskUid}
     rows={newestRuns}
@@ -705,17 +706,17 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <div className="mx-5 border-t border-line-soft py-4 text-xs text-muted-ink"><p className="font-mono">{taskUid}</p><p className="mt-2">Created {dateTime(run.createdAt)}</p></div>
               </nav>
               <main className="min-w-0">
-                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-5">{[
+                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-6">{[
                   ["Workflow version", pinnedWorkflow],
                   ["User envelope revision", admitted?.kind === "admitted" ? admitted.envelopeRevision ?? "—" : run.userEnvelopeRevision ?? "—"],
                   ["Runtime", runtimeBound?.kind === "runtimeBound" ? runtimeBound.runtimeUid : run.runtimeUid ?? "unassigned"],
-                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "—"],
+                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Not reported"],
+                  ["Tokens used", run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : "Not reported"],
                   ["Agent", run.codingAgentRuntime],
                 ].map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
                 <section aria-labelledby="selected-stage" className="p-5">
                   <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
-                  {selectedStage?.id === "agent_execution" && run.executionLog === "off" ? <div className="mt-5 rounded-card border p-4"><p className="text-sm font-semibold">No execution log was captured for this run.</p><p className="mt-1 text-sm text-muted-ink">Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr. Captured output may contain sensitive data.</p></div> : null}
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStream} showLiveStreams={run.phase === "running"} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
                   {!admin && run.phase === "succeeded" && run.finalized ? <RunOutputs taskUid={taskUid} /> : null}
                   {!admin && run.origin === "browser" && run.package?.source === "inline" && run.package.contentDigest ? <p className="mt-5 text-sm"><Link className="font-semibold text-brand" href={`/tasks/${encodeURIComponent(run.package.contentDigest)}`}>Open Task</Link> · package definition and run history</p> : null}

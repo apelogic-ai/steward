@@ -175,7 +175,7 @@ jobs:
       - name: Upload image release evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: release-${{ matrix.component }}
+          name: release-image-${{ matrix.component }}
           path: dist/*
           if-no-files-found: error
 
@@ -284,6 +284,113 @@ jobs:
           path: |
             dist/codex-reference-runtime.digest
             dist/codex-reference-runtime.spdx.json
+          if-no-files-found: error
+
+  publish-claude-code-reference-runtime:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve release version
+        id: version
+        run: printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish Claude Code reference runtime
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: build/claude-code-reference.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime:2.1.222-steward-${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=2.1.222-steward-${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=steward-claude-code-runtime
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=steward-claude-code-reference-runtime
+          cache-to: type=gha,mode=max,scope=steward-claude-code-reference-runtime
+
+      - name: Record Claude Code reference runtime digest
+        run: |
+          mkdir -p dist
+          printf '%s\n' '${{ steps.build.outputs.digest }}' > dist/claude-code-reference-runtime.digest
+
+      - name: Generate Claude Code reference runtime SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime@${{ steps.build.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          output-file: dist/claude-code-reference-runtime.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate Claude Code reference runtime vulnerability report
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime@${{ steps.build.outputs.digest }}
+          trivy-config: security/claude-code-reference-runtime.trivy.yaml
+          format: json
+          output: dist/claude-code-reference-runtime.vulnerabilities.json
+          exit-code: "0"
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Retain Claude Code reference runtime vulnerability report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-claude-code-reference-runtime-vulnerability-report
+          path: dist/claude-code-reference-runtime.vulnerabilities.json
+          if-no-files-found: error
+
+      - name: Enforce critical Claude Code reference runtime vulnerability policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime@${{ steps.build.outputs.digest }}
+          trivy-config: security/claude-code-reference-runtime.trivy.yaml
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Attest Claude Code reference runtime provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/steward-claude-code-runtime
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload Claude Code reference runtime evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-claude-code-reference-runtime
+          path: |
+            dist/claude-code-reference-runtime.digest
+            dist/claude-code-reference-runtime.spdx.json
           if-no-files-found: error
 
   publish-provider-profile-bundle:
@@ -421,9 +528,13 @@ jobs:
         run: cargo xtask e2e-openshell-adapter
 
   publish-chart:
-    needs: validate
+    needs: [validate, publish-images]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: [steward, steward-bundle, spire, agent-sandbox, openshell, litellm, arc]
     permissions:
       contents: read
       packages: write
@@ -435,8 +546,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Helm
-        uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a
+      - name: Install pinned Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Download released image digests for bundle
+        if: matrix.chart == 'steward-bundle'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          pattern: release-image-*
+          path: dist
+          merge-multiple: true
 
       - name: Log in to GHCR for Helm
         env:
@@ -455,22 +576,49 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist "$RUNNER_TEMP/chart-scan"
-          helm package charts/steward --destination dist --version "$version" --app-version "$version"
-          tar -xzf "dist/steward-$version.tgz" -C "$RUNNER_TEMP/chart-scan"
-          push_output="$(helm push "dist/steward-$version.tgz" 'oci://ghcr.io/${{ github.repository_owner }}/charts')"
-          printf '%s\n' "$push_output"
-          digest="$(printf '%s\n' "$push_output" | awk '$1 == "Digest:" {print $2}')"
-          test -n "$digest"
-          printf '%s\n' "$digest" > dist/helm-chart.digest
+          chart='${{ matrix.chart }}'
+          case "$chart" in
+            steward)
+              chart_root="$GITHUB_WORKSPACE"
+              ;;
+            steward-bundle)
+              mkdir -p "$RUNNER_TEMP/release"
+              STEWARD_BUNDLE_RELEASE_VERSION="$version" \
+                STEWARD_BUNDLE_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)" \
+                STEWARD_BUNDLE_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)" \
+                STEWARD_BUNDLE_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)" \
+                STEWARD_BUNDLE_RELEASE_WEB_DIGEST="$(cat dist/web.digest)" \
+                STEWARD_BUNDLE_RELEASE_TRIGGER_RECEIVER_DIGEST="$(cat dist/trigger-receiver.digest)" \
+                bash scripts/prepare-steward-bundle-chart.sh "$RUNNER_TEMP/release/charts/steward-bundle"
+              chart_root="$RUNNER_TEMP/release"
+              ;;
+            *)
+              mkdir -p "$RUNNER_TEMP/release"
+              bash scripts/prepare-governed-dependency-charts.sh "$RUNNER_TEMP/release/charts"
+              chart_root="$RUNNER_TEMP/release"
+              ;;
+          esac
+          mkdir -p dist "$RUNNER_TEMP/chart-scan/$chart"
+          digest="$(
+            cd "$chart_root"
+            bash "$GITHUB_WORKSPACE/scripts/publish-chart.sh" "$chart" "$version" \
+              'oci://ghcr.io/${{ github.repository_owner }}/charts' "$GITHUB_WORKSPACE/dist"
+          )"
+          tar -xzf "dist/$chart-$version.tgz" -C "$RUNNER_TEMP/chart-scan/$chart"
+          if [[ "$chart" == steward ]]; then
+            digest_file=dist/helm-chart.digest
+          else
+            digest_file="dist/helm-chart-$chart.digest"
+          fi
+          printf '%s\n' "$digest" > "$digest_file"
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Generate chart SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          path: ${{ runner.temp }}/chart-scan
+          path: ${{ runner.temp }}/chart-scan/${{ matrix.chart }}
           format: spdx-json
-          output-file: dist/helm-chart.spdx.json
+          output-file: dist/helm-chart-${{ matrix.chart }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
 
@@ -478,25 +626,31 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           scan-type: fs
-          scan-ref: ${{ runner.temp }}/chart-scan
+          scan-ref: ${{ runner.temp }}/chart-scan/${{ matrix.chart }}
           format: json
-          output: dist/helm-chart.vulnerabilities.json
+          output: dist/helm-chart-${{ matrix.chart }}.vulnerabilities.json
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Preserve Steward chart release asset names
+        if: matrix.chart == 'steward'
+        run: |
+          cp "dist/helm-chart-steward.spdx.json" dist/helm-chart.spdx.json
+          cp "dist/helm-chart-steward.vulnerabilities.json" dist/helm-chart.vulnerabilities.json
 
       - name: Retain complete chart vulnerability report
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: release-helm-chart-vulnerability-report
-          path: dist/helm-chart.vulnerabilities.json
+          name: release-helm-chart-${{ matrix.chart }}-vulnerability-report
+          path: dist/helm-chart-${{ matrix.chart }}.vulnerabilities.json
           if-no-files-found: error
 
       - name: Enforce critical chart vulnerability policy
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           scan-type: fs
-          scan-ref: ${{ runner.temp }}/chart-scan
+          scan-ref: ${{ runner.temp }}/chart-scan/${{ matrix.chart }}
           format: table
           exit-code: "1"
           severity: CRITICAL
@@ -504,14 +658,14 @@ jobs:
       - name: Attest chart provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/charts/steward
+          subject-name: ghcr.io/${{ github.repository_owner }}/charts/${{ matrix.chart }}
           subject-digest: ${{ steps.chart.outputs.digest }}
           push-to-registry: true
 
       - name: Upload chart release evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: release-helm-chart
+          name: release-helm-chart-${{ matrix.chart }}
           path: dist/*
           if-no-files-found: error
 
@@ -568,14 +722,27 @@ jobs:
           export STEWARD_RELEASE_WEB_DIGEST
           bash scripts/customer-core-install-e2e.sh
 
+      - name: Install released bundle in a clean cluster
+        env:
+          STEWARD_RELEASE_BUNDLE_CHART_REPOSITORY: oci://ghcr.io/${{ github.repository_owner }}/charts/steward-bundle
+        run: |
+          set -euo pipefail
+          digest="$(cat dist/helm-chart-steward-bundle.digest)"
+          bundle_dir="$(mktemp -d "${RUNNER_TEMP%/}/steward-bundle-release.XXXXXX")"
+          trap 'find "${bundle_dir}" -depth -delete' EXIT
+          bundle_archive="$(bash scripts/pull-chart-by-digest.sh \
+            "${STEWARD_RELEASE_BUNDLE_CHART_REPOSITORY}" "${digest}" "${bundle_dir}")"
+          bash scripts/steward-bundle-kind-smoke.sh "${bundle_archive}"
+
   release:
-    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, publish-claude-code-reference-runtime, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
         needs.publish-images.result == 'success' &&
         needs.publish-provider-profile-bundle.result == 'success' &&
         needs.publish-codex-reference-runtime.result == 'success' &&
+        needs.publish-claude-code-reference-runtime.result == 'success' &&
         needs.publish-platform-preflight-bundle.result == 'success' &&
         needs.registry-mirror-conformance.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
@@ -598,8 +765,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
-      - name: Set up Helm
-        uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a
+      - name: Install pinned Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
 
       - name: Log in to GHCR for bridge provenance bundle
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
@@ -633,12 +802,14 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.20"
+          test "$version" = "0.3.28"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
+          claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           bridge_digest="$(cat dist/bridge.digest)"
           codex_digest="$(cat dist/codex-reference-runtime.digest)"
+          claude_code_digest="$(cat dist/claude-code-reference-runtime.digest)"
           provider_profile_bundle_asset="steward-runtime-providers-${version}.tar.gz"
           provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
           platform_preflight_bundle_digest="$(cat dist/platform-preflight-bundle.digest)"
@@ -658,9 +829,18 @@ jobs:
             --arg commit "$GITHUB_SHA" \
             --arg chart_reference "oci://${chart}:${version}" \
             --arg chart_digest "$(cat dist/helm-chart.digest)" \
+            --arg bundle_chart_digest "$(cat dist/helm-chart-steward-bundle.digest)" \
+            --arg dependency_chart_repository "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts" \
+            --arg spire_chart_digest "$(cat dist/helm-chart-spire.digest)" \
+            --arg agent_sandbox_chart_digest "$(cat dist/helm-chart-agent-sandbox.digest)" \
+            --arg openshell_chart_digest "$(cat dist/helm-chart-openshell.digest)" \
+            --arg litellm_chart_digest "$(cat dist/helm-chart-litellm.digest)" \
+            --arg arc_chart_digest "$(cat dist/helm-chart-arc.digest)" \
             --arg image_repository "$repository" \
             --arg codex_reference "${codex_repository}:0.140.0-steward-${version}" \
             --arg codex_digest "$codex_digest" \
+            --arg claude_code_reference "${claude_code_repository}:2.1.222-steward-${version}" \
+            --arg claude_code_digest "$claude_code_digest" \
             --arg apiserver_digest "$(cat dist/apiserver.digest)" \
             --arg controller_digest "$(cat dist/controller.digest)" \
             --arg mint_digest "$(cat dist/mint.digest)" \
@@ -683,6 +863,20 @@ jobs:
                 reference: $chart_reference,
                 digest: $chart_digest
               },
+              bundleChart: {
+                reference: ($dependency_chart_repository + "/steward-bundle:" + $version),
+                digest: $bundle_chart_digest
+              },
+              dependencyCharts: {
+                spire: {
+                  reference: ($dependency_chart_repository + "/spire:" + $version),
+                  digest: $spire_chart_digest
+                },
+                "agent-sandbox": {reference: ($dependency_chart_repository + "/agent-sandbox:" + $version), digest: $agent_sandbox_chart_digest},
+                openshell: {reference: ($dependency_chart_repository + "/openshell:" + $version), digest: $openshell_chart_digest},
+                litellm: {reference: ($dependency_chart_repository + "/litellm:" + $version), digest: $litellm_chart_digest},
+                arc: {reference: ($dependency_chart_repository + "/arc:" + $version), digest: $arc_chart_digest}
+              },
               images: {
                 apiserver: {reference: ($image_repository + ":" + $version + "-apiserver"), digest: $apiserver_digest},
                 controller: {reference: ($image_repository + ":" + $version + "-controller"), digest: $controller_digest},
@@ -697,6 +891,13 @@ jobs:
                   version: "0.140.0",
                   reference: $codex_reference,
                   digest: $codex_digest,
+                  platform: "linux/amd64"
+                },
+                claudeCode: {
+                  agentRef: "claude-code@2.1.222",
+                  version: "2.1.222",
+                  reference: $claude_code_reference,
+                  digest: $claude_code_digest,
                   platform: "linux/amd64"
                 }
               },
@@ -758,7 +959,10 @@ jobs:
                 "0070_template_one_boundary.sql",
                 "0071_browser_task_preferred_envelope.sql",
                 "0072_api_task_origin.sql",
-                "0073_task_caller_reference.sql"
+                "0073_task_caller_reference.sql",
+                "0074_personal_agents.sql",
+                "0075_personal_agent_claim_attempts.sql",
+                "0076_agent_run_token_usage.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -766,22 +970,20 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.20 adds governed external Run API callers and signed Jira webhook Triggers. The isolated trigger receiver validates signatures and configured filters, checks a read-only Envelope, starts Tasks idempotently, polls within a fixed deadline, and cleans up each completed delivery.\n\n'
-            printf 'Run views can show bounded caller context without using it to decide whether a request is accepted. API Runs carry an explicit origin, and failed Tasks can offer validated partial output plus requested bounded diagnostics.\n\n'
-            printf 'Receiver startup, delivery recovery, numeric chart settings, caller refusal coverage, coding-agent execution evidence, and the Codex reference runtime vulnerability policy are hardened.\n\n'
+            printf 'Steward v0.3.28 sends deployment-configured LiteLLM model IDs and aliases unchanged through Codex, Claude Code, model checks, pricing, and runtime-key allowlists. Bare deployment aliases work without an added provider prefix, while already-qualified aliases remain compatible.\n\n'
+            printf 'Agent Runs now derives each run\x27s spend from the runtime key\x27s LiteLLM request logs instead of its key budget counter. The run list and detail show total tokens when LiteLLM reports them and show Not reported when request logs cannot prove spend or token usage. The LiteLLM management credential must be able to read logs for runtime key hashes. Budget enforcement continues if that read is refused, but spend and tokens show as Not reported. Reads default to a 10-second deadline configurable through config.controller.litellmSpendLogTimeoutSeconds.\n\n'
+            printf 'The pinned upstream lane now proves bare aliases against digest-pinned LiteLLM v1.93.0 and PostgreSQL services using separate Steward-provisioned Claude Code and Codex runtime keys, reciprocal cross-alias refusals, request-log evidence, revocation, and owned-resource cleanup.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Apply additive migrations 0072 and 0073 before starting v0.3.20. Migration 0072 accepts the new api Task origin without rewriting historical rows. Migration 0073 adds nullable immutable caller-reference context without rewriting historical rows. Deploy the chart, API, web, and receiver images together.\n\n'
-            printf 'Configure the receiver signing Secret, pinned certificate authority, read-only Envelope reference, filters, run limits, cooldowns, and exact public /hooks/jira/<id> edge path before enabling a Jira Trigger. Set config.apiserver.jiraBaseUrl only to the validated HTTPS Jira site used for optional issue links.\n\n'
-            printf 'Jira Connections retain the v0.3.18 prerequisite: MCP-GW v0.6.0 with its read-only Jira REST preset and the exact Jira wrapper under connectionsBridge.providerOrigins.\n\n'
-            printf 'Jenkins callers require a github-oidc-exchange release that supports generic OIDC exchange. Temporal and Jira callers use their documented short-lived token exchange.\n\n'
-            printf 'Before rolling back to v0.3.19, stop Task submission and prove that no stored Task has the api origin; v0.3.19 cannot read that new immutable value. If any such row exists, restore the pre-upgrade database or keep v0.3.20 API readers. The nullable caller-reference column may remain. A full chart rollback removes the receiver and its configuration.\n\n'
+            printf 'Before upgrading, back up the database and add every bare alias used by the Steward model catalog to LiteLLM with pricing while keeping the existing qualified aliases available for rollback. Stop new Task submissions, then let every Task created before the upgrade finish or re-create it after the upgrade before resuming submissions. Deploy the chart, component images, and reference runtimes as one release unit, then update mirrored runtime digests and execution bindings to the v0.3.28 artifacts.\n\n'
+            printf 'Steward automatically applies additive migration 0076 for request-log spend and nullable token usage on new spend observations. Historical rows remain readable and show unavailable spend and token usage instead of presenting virtual-key counters as per-run usage; no manual data migration is required.\n\n'
+            printf 'Before rolling back to v0.3.27, stop submissions and finish or re-create active Tasks against the restored model names. Remove config.controller.litellmSpendLogTimeoutSeconds from Helm values and keep qualified LiteLLM aliases available until rollback is complete. Steward v0.3.27 does not recognize migration 0076, so restore the pre-upgrade database backup to a new database target and point v0.3.27 at that target before starting it. Records written after the upgrade are not in the backup; preserve any audit or decision records that must be retained before rolling back.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
             printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
-            printf 'Before upgrading governed installations, set spire.className to the installed SPIRE controller class and choose exactly one owner for the OpenShell sandbox registration: keep the chart default, or disable spire.sandboxRegistration only when the platform retains the equivalent registration. Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
+            printf 'Back up the database before upgrading. Add bare LiteLLM aliases with pricing, retain qualified aliases for rollback, confirm the management credential can read request logs, and adjust config.controller.litellmSpendLogTimeoutSeconds only if the default 10-second deadline is unsuitable. Stop new Task submissions and finish or re-create every pre-upgrade Task. After deployment, update mirrored v0.3.27 reference runtimes and execution bindings to the v0.3.28 artifacts before resuming governed runs.\n\n'
             printf '## Acceptance\n\n'
-            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
+            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job. Pinned CI separately exercises the real LiteLLM alias, key-isolation, and spend proof.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
             for component in apiserver controller mint trigger-receiver bridge web; do
               printf '| %s | %s:%s-%s | %s |\n' \
@@ -789,10 +991,20 @@ jobs:
             done
             printf '| chart | oci://%s:%s | %s |\n' \
               "$chart" "$version" "$(cat dist/helm-chart.digest)"
+            printf '| steward-bundle chart | oci://ghcr.io/%s/charts/steward-bundle:%s | %s |\n' \
+              "$GITHUB_REPOSITORY_OWNER" "$version" \
+              "$(cat dist/helm-chart-steward-bundle.digest)"
+            for dependency_chart in spire agent-sandbox openshell litellm arc; do
+              printf '| %s chart | oci://ghcr.io/%s/charts/%s:%s | %s |\n' \
+                "$dependency_chart" "$GITHUB_REPOSITORY_OWNER" "$dependency_chart" \
+                "$version" "$(cat "dist/helm-chart-$dependency_chart.digest")"
+            done
             printf '\n## Reference runtimes\n\n'
             printf '| Agent | Platform | Reference | Digest |\n|---|---|---|---|\n'
             printf '| codex@0.140.0 | linux/amd64 | %s:0.140.0-steward-%s | %s |\n' \
               "$codex_repository" "$version" "$codex_digest"
+            printf '| claude-code@2.1.222 | linux/amd64 | %s:2.1.222-steward-%s | %s |\n' \
+              "$claude_code_repository" "$version" "$claude_code_digest"
             printf '\n## Stable bridge provenance inputs\n\n'
             printf 'Bridge image: %s@%s\n\n' "$repository" "$bridge_digest"
             printf 'Bridge signer identity: %s\n\n' "$bridge_signer_identity"
@@ -849,7 +1061,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.20.json
+          subject-path: dist/steward-product-compatibility-0.3.28.json
 
       - name: Archive product compatibility verification material
         env:
@@ -859,7 +1071,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.20.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.28.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
@@ -878,9 +1090,13 @@ jobs:
           done
           docker buildx imagetools inspect \
             "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)"
-          helm pull "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward" \
-            --version "${GITHUB_REF_NAME#v}" \
-            --destination "$RUNNER_TEMP"
+          docker buildx imagetools inspect \
+            "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime@$(cat dist/claude-code-reference-runtime.digest)"
+          for chart in steward steward-bundle spire agent-sandbox openshell litellm arc; do
+            helm pull "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/$chart" \
+              --version "${GITHUB_REF_NAME#v}" \
+              --destination "$RUNNER_TEMP"
+          done
 
       - name: Create GitHub Release
         env:

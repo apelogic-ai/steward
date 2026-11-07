@@ -1,6 +1,7 @@
 # Steward GitHub Actions generator contract
 
-Status: current contract for Steward v0.3.20
+Status: current contract for Steward v0.3.28, plus the unreleased
+`workflowRef` option planned for the next release
 
 The generator turns one authoritative Steward envelope selection and one bounded task template
 into workflow YAML that a developer may inspect, copy, commit, and dispatch. It never selects a
@@ -48,13 +49,32 @@ packaging verifies steward-run's signed release handoff, records its exact
 coordinates in the installation BOM, and supplies that object through
 `config.apiserver.stewardRunRelease`. The object contains OSS release-manifest
 schema 3, semantic version, reusable-workflow repository and commit, and action
-commit. The versioned generator requires structurally immutable coordinates and
-steward-run v0.7.0 or later. The deprecated `governedJobContainerImage` field
-remains accepted, but the versioned generator does not emit or consume it.
+commit. The versioned generator requires structurally valid signed commit
+coordinates and steward-run v0.7.0 or later. The deprecated
+`governedJobContainerImage` field remains accepted, but the versioned generator
+does not emit or consume it.
+
+The installation may also add the optional non-empty `workflowRef` field to
+that object. When it is absent, remote generated workflows use the verified
+`workflowCommit`, preserving the default behavior. When it is present, both
+the versioned and direct-package generators in `remote` mode use
+`<workflowRepository>/.github/workflows/<workflow-file>@<workflowRef>` while
+retaining the verified commit in generated provenance as the reviewed baseline.
+The effective ref is recorded separately as `steward-run-workflow-ref`. The
+lower-level v1 smoke renderer remains pinned to `workflowCommit` and does not
+use this setting. Use this choice for an
+in-organization steward-run copy whose updates are restricted to the customer's
+administrators, so those administrators can upgrade the copy without requiring
+changes in every caller pipeline. An empty or whitespace-only value is refused
+during configuration loading. The configured `version` must continue to name
+the steward-run release whose reusable-workflow input contract the ref serves;
+if that input contract changes, update `version` and regenerate affected
+callers.
 
 `config.apiserver.stewardRunWorkflowInstallationMode` is a separate deployment
-choice. Its `remote` default renders the release's immutable repository and
-workflow commit. Explicit `vendored` mode renders
+choice. Its `remote` default renders the release repository with either the
+optional `workflowRef` or, when unset, the immutable workflow commit. Explicit
+`vendored` mode renders
 `./.github/workflows/steward-task-vendored.yml` while retaining the verified
 remote coordinates in generated provenance. Operators install that exact
 checksum- and signature-verified release asset before committing or dispatching

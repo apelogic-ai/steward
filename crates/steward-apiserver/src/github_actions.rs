@@ -56,6 +56,8 @@ pub struct StewardRunRelease {
     pub manifest_schema_version: u32,
     pub version: String,
     pub workflow_repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_ref: Option<String>,
     pub workflow_commit: String,
     pub action_commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,7 +174,7 @@ pub fn render_direct_package_github_actions_workflow(
             "# steward-run-workflow-repository: {}",
             release.workflow_repository
         ),
-        format!("# steward-run-workflow-commit: {}", release.workflow_commit),
+        steward_run_workflow_provenance(release, context.workflow_installation_mode),
         String::new(),
         "name: Steward governed task".to_owned(),
         String::new(),
@@ -319,7 +321,7 @@ pub fn render_versioned_github_actions_workflow(
             "# steward-run-workflow-repository: {}",
             release.workflow_repository
         ),
-        format!("# steward-run-workflow-commit: {}", release.workflow_commit),
+        steward_run_workflow_provenance(release, context.workflow_installation_mode),
         String::new(),
         "name: Steward governed repository review".to_owned(),
         String::new(),
@@ -670,14 +672,57 @@ fn steward_run_uses_line(
     remote_workflow_filename: &str,
 ) -> String {
     match mode {
-        StewardRunWorkflowInstallationMode::Remote => format!(
-            "    uses: {}/.github/workflows/{}@{}",
-            release.workflow_repository, remote_workflow_filename, release.workflow_commit
-        ),
+        StewardRunWorkflowInstallationMode::Remote => {
+            let uses = format!(
+                "{}/.github/workflows/{}@{}",
+                release.workflow_repository,
+                remote_workflow_filename,
+                release
+                    .workflow_ref
+                    .as_deref()
+                    .unwrap_or(&release.workflow_commit)
+            );
+            if release.workflow_ref.is_some() {
+                format!("    uses: {}", json_string(&uses))
+            } else {
+                format!("    uses: {uses}")
+            }
+        }
         StewardRunWorkflowInstallationMode::Vendored => {
             "    uses: ./.github/workflows/steward-task-vendored.yml".to_owned()
         }
     }
+}
+
+fn steward_run_workflow_provenance(
+    release: &StewardRunRelease,
+    mode: StewardRunWorkflowInstallationMode,
+) -> String {
+    let mut provenance = format!("# steward-run-workflow-commit: {}", release.workflow_commit);
+    if mode == StewardRunWorkflowInstallationMode::Remote
+        && let Some(workflow_ref) = release.workflow_ref.as_deref()
+    {
+        provenance.push_str("\n# steward-run-workflow-ref: ");
+        provenance.push_str(&json_string(workflow_ref));
+    }
+    provenance
+}
+
+fn json_string(value: &str) -> String {
+    let json = serde_json::Value::String(value.to_owned()).to_string();
+    let mut escaped = String::with_capacity(json.len());
+    for character in json.chars() {
+        if matches!(
+            character,
+            '\u{007f}'
+                ..='\u{009f}' | '\u{2028}' | '\u{2029}' | '\u{feff}' | '\u{fffe}' | '\u{ffff}'
+        ) {
+            escaped.push_str(&format!("\\u{:04x}", character as u32));
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 fn omit_legacy_identity_inputs(mut yaml: String, discovery_enabled: bool) -> String {
@@ -764,6 +809,10 @@ fn validate_release(release: &StewardRunRelease) -> Result<(), GithubActionsRend
     if release.manifest_schema_version != 3
         || !valid_semver(&release.version)
         || !valid_repository(&release.workflow_repository)
+        || release
+            .workflow_ref
+            .as_deref()
+            .is_some_and(|workflow_ref| workflow_ref.trim().is_empty())
         || !valid_full_sha(&release.workflow_commit)
         || !valid_full_sha(&release.action_commit)
     {
@@ -938,6 +987,7 @@ mod tests {
         assert!(generated.yaml.contains(
             "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
         ));
+        assert!(!generated.yaml.contains("# steward-run-workflow-ref:"));
         assert!(
             generated
                 .yaml
@@ -1129,6 +1179,7 @@ mod tests {
             ),
             "versioned runs must preserve reusable-workflow OIDC provenance without inheriting the ARC ECR container"
         );
+        assert!(!generated.yaml.contains("# steward-run-workflow-ref:"));
         assert!(!generated.yaml.contains("steward-task.yml@"));
         assert!(!generated.yaml.contains("coding-agent-runtime"));
         assert!(!generated.yaml.contains("TARGET_REVISION"));
@@ -1159,6 +1210,8 @@ mod tests {
     #[test]
     fn versioned_generator_renders_explicit_vendored_workflow_reference()
     -> Result<(), GithubActionsRenderError> {
+        let mut release = vendored_release();
+        release.workflow_ref = Some("customer-managed".to_owned());
         let generated = render_versioned_github_actions_workflow(
             "repository-review@1",
             &VersionedGithubActionsWorkflowContext {
@@ -1168,7 +1221,7 @@ mod tests {
                 workflow_digest:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_owned(),
-                reviewed_release: vendored_release(),
+                reviewed_release: release,
                 workflow_installation_mode: StewardRunWorkflowInstallationMode::Vendored,
                 task_identity_discovery_enabled: false,
             },
@@ -1187,6 +1240,7 @@ mod tests {
         assert!(!generated.yaml.contains(
             "    uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@"
         ));
+        assert!(!generated.yaml.contains("# steward-run-workflow-ref:"));
         Ok(())
     }
 
@@ -1220,6 +1274,7 @@ mod tests {
             manifest_schema_version: 3,
             version: "0.7.0".to_owned(),
             workflow_repository: "example-org/steward-run".to_owned(),
+            workflow_ref: None,
             workflow_commit: WORKFLOW_COMMIT.to_owned(),
             action_commit: ACTION_COMMIT.to_owned(),
             governed_job_container_image: Some(JOB_CONTAINER.to_owned()),
@@ -1231,6 +1286,7 @@ mod tests {
             manifest_schema_version: 3,
             version: "0.7.0".to_owned(),
             workflow_repository: "example-org/steward-run".to_owned(),
+            workflow_ref: None,
             workflow_commit: VERSIONED_WORKFLOW_COMMIT.to_owned(),
             action_commit: VERSIONED_ACTION_COMMIT.to_owned(),
             governed_job_container_image: Some(JOB_CONTAINER.to_owned()),
@@ -1299,6 +1355,163 @@ mod tests {
             },
         )
         .map_err(|error| format!("versioned workflow failed to render: {error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn installation_bom_release_uses_configured_workflow_ref_for_every_remote_generator()
+    -> Result<(), String> {
+        let release = format!(
+            r#"{{"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"{VERSIONED_WORKFLOW_COMMIT}","workflowRef":"customer-managed","actionCommit":"{VERSIONED_ACTION_COMMIT}"}}"#
+        );
+        let release = steward_run_release_from_installation_bom(&release)?;
+
+        let versioned = render_versioned_github_actions_workflow(
+            "repository-review@1",
+            &VersionedGithubActionsWorkflowContext {
+                envelope: envelope(),
+                workflow_name: "repository-review".to_owned(),
+                workflow_version: 1,
+                workflow_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                reviewed_release: release.clone(),
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: false,
+            },
+        )
+        .map_err(|error| format!("versioned workflow failed to render: {error}"))?;
+        let direct = render_direct_package_github_actions_workflow(
+            &DirectPackageGithubActionsWorkflowContext {
+                envelope: envelope(),
+                invocation_path: Some(".steward/invocations/browser-task.json".to_owned()),
+                package_path: None,
+                execution_log: ExecutionLogMode::Off,
+                reviewed_release: release,
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: false,
+            },
+        )
+        .map_err(|error| format!("direct-package workflow failed to render: {error}"))?;
+
+        for generated in [versioned, direct] {
+            assert!(generated.yaml.contains(
+                "uses: \"example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@customer-managed\""
+            ));
+            assert!(
+                generated
+                    .yaml
+                    .contains("# steward-run-workflow-ref: \"customer-managed\"")
+            );
+            assert!(
+                !generated
+                    .yaml
+                    .contains(&format!("@{VERSIONED_WORKFLOW_COMMIT}"))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_workflow_ref_cannot_add_generated_yaml_fields() -> Result<(), String> {
+        let release = format!(
+            r#"{{"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"{VERSIONED_WORKFLOW_COMMIT}","workflowRef":"customer-managed\n    secrets: inherit","actionCommit":"{VERSIONED_ACTION_COMMIT}"}}"#
+        );
+        let release = steward_run_release_from_installation_bom(&release)?;
+        let generated = render_direct_package_github_actions_workflow(
+            &DirectPackageGithubActionsWorkflowContext {
+                envelope: envelope(),
+                invocation_path: Some(".steward/invocations/browser-task.json".to_owned()),
+                package_path: None,
+                execution_log: ExecutionLogMode::Off,
+                reviewed_release: release,
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: false,
+            },
+        )
+        .map_err(|error| format!("direct-package workflow failed to render: {error}"))?;
+
+        assert!(generated.yaml.contains(
+            "uses: \"example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@customer-managed\\n    secrets: inherit\""
+        ));
+        assert!(
+            generated.yaml.contains(
+                "# steward-run-workflow-ref: \"customer-managed\\n    secrets: inherit\""
+            )
+        );
+        assert!(!generated.yaml.contains("\n    secrets: inherit\n"));
+        serde_saphyr::from_str::<serde_json::Value>(&generated.yaml)
+            .map_err(|error| format!("generated workflow was not valid YAML: {error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn configured_workflow_ref_escapes_characters_yaml_cannot_safely_embed() -> Result<(), String> {
+        for (line_break, escaped) in [
+            ('\u{007f}', "\\u007f"),
+            ('\u{0080}', "\\u0080"),
+            ('\u{0085}', "\\u0085"),
+            ('\u{009f}', "\\u009f"),
+            ('\u{2028}', "\\u2028"),
+            ('\u{2029}', "\\u2029"),
+            ('\u{feff}', "\\ufeff"),
+            ('\u{fffe}', "\\ufffe"),
+            ('\u{ffff}', "\\uffff"),
+        ] {
+            let mut release = versioned_release();
+            release.workflow_ref = Some(format!(
+                "customer-managed{line_break}permissions: write-all"
+            ));
+            let generated = render_direct_package_github_actions_workflow(
+                &DirectPackageGithubActionsWorkflowContext {
+                    envelope: envelope(),
+                    invocation_path: Some(".steward/invocations/browser-task.json".to_owned()),
+                    package_path: None,
+                    execution_log: ExecutionLogMode::Off,
+                    reviewed_release: release,
+                    workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                    task_identity_discovery_enabled: false,
+                },
+            )
+            .map_err(|error| format!("direct-package workflow failed to render: {error}"))?;
+
+            assert!(!generated.yaml.contains(line_break));
+            assert!(generated.yaml.contains(escaped));
+            serde_saphyr::from_str::<serde_json::Value>(&generated.yaml)
+                .map_err(|error| format!("generated workflow was not valid YAML: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installation_bom_release_rejects_blank_workflow_ref() -> Result<(), String> {
+        for workflow_ref in ["", " \t\n"] {
+            let mut release = serde_json::to_value(versioned_release())
+                .map_err(|error| format!("release fixture failed to serialize: {error}"))?;
+            release["workflowRef"] = serde_json::Value::String(workflow_ref.to_owned());
+            let release = serde_json::to_string(&release)
+                .map_err(|error| format!("release fixture failed to serialize: {error}"))?;
+
+            assert_eq!(
+                steward_run_release_from_installation_bom(&release),
+                Err("steward-run release coordinates are invalid".to_owned())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installation_bom_release_accepts_non_whitespace_control_and_format_characters()
+    -> Result<(), String> {
+        for workflow_ref in ["\u{001c}", "\u{feff}"] {
+            let mut release = serde_json::to_value(versioned_release())
+                .map_err(|error| format!("release fixture failed to serialize: {error}"))?;
+            release["workflowRef"] = serde_json::Value::String(workflow_ref.to_owned());
+            let release = serde_json::to_string(&release)
+                .map_err(|error| format!("release fixture failed to serialize: {error}"))?;
+
+            steward_run_release_from_installation_bom(&release)?;
+        }
         Ok(())
     }
 

@@ -36,6 +36,7 @@ output processing:
 | `tree` | 2.1.1 | Directory-tree inspection |
 | `kubectl` | MCP-GW 0.7.0 helper | Governed Kubernetes commands |
 | `remote-shell` | MCP-GW 0.7.0 helper | Governed commands on a run-bound machine |
+| `uv` | 0.11.15 | Python project and package management |
 
 ## Governed commands and sign-in
 
