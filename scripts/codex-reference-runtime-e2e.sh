@@ -138,7 +138,41 @@ check_helper_refusal \"Remote shell request failed\" \
   remote-shell machine.test -- uname -a
 
 rm -f /tmp/steward-cli-refusal-ready /tmp/steward-cli-refusal-reason
-node -e 'const fs = require("node:fs"); const http = require("node:http"); const server = http.createServer((request, response) => { let body = ""; request.setEncoding("utf8"); request.on("data", (chunk) => { body += chunk; }); request.on("end", () => { let parsed; try { parsed = JSON.parse(body); } catch { parsed = {}; } const refused = request.method === "POST" && request.url === "/cli/run" && request.headers.authorization === "Bearer openshell-token-grant-placeholder" && parsed.cli === "kubectl" && Array.isArray(parsed.args) && parsed.args[0] === "delete"; if (!refused) { response.writeHead(500); response.end(); return; } const reason = "This command is not approved for this run."; fs.writeFileSync("/tmp/steward-cli-refusal-reason", reason); response.writeHead(403, { "content-type": "application/json" }); response.end(JSON.stringify({ error: "task_not_authorized", message: reason })); }); }); server.listen(18080, "127.0.0.1", () => { fs.writeFileSync("/tmp/steward-cli-refusal-ready", "ready"); });' &
+node <<'NODE' &
+const fs = require('node:fs');
+const http = require('node:http');
+const server = http.createServer((request, response) => {
+  let body = '';
+  request.setEncoding('utf8');
+  request.on('data', (chunk) => { body += chunk; });
+  request.on('end', () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = {};
+    }
+    const refused = request.method === 'POST'
+      && request.url === '/cli/run'
+      && request.headers.authorization === 'Bearer openshell-token-grant-placeholder'
+      && parsed.cli === 'kubectl'
+      && Array.isArray(parsed.args)
+      && parsed.args[0] === 'delete';
+    if (!refused) {
+      response.writeHead(500);
+      response.end();
+      return;
+    }
+    const reason = 'This command is not approved for this run.';
+    fs.writeFileSync('/tmp/steward-cli-refusal-reason', reason);
+    response.writeHead(403, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'task_not_authorized', message: reason }));
+  });
+});
+server.listen(18080, '127.0.0.1', () => {
+  fs.writeFileSync('/tmp/steward-cli-refusal-ready', 'ready');
+});
+NODE
 server_pid=\$!
 trap 'kill \"\${server_pid}\" 2>/dev/null || true' EXIT INT TERM
 for attempt in \$(seq 1 100); do
