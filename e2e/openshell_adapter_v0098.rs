@@ -177,6 +177,7 @@ fn codex_task_command(prompt: &str) -> Result<Vec<String>, String> {
         models: Some(ExecutionModelCompatibility {
             providers: vec!["example-model".to_owned()],
         }),
+        remote_shell_targets: Default::default(),
         provider_profiles: ExecutionProviderProfiles {
             tools: None,
             inference: Some(ExecutionProviderProfile {
@@ -687,6 +688,7 @@ fn bound_agent_execution_binding(image: String) -> Result<DisposableExecutionBin
             expected_stdout: "example-agent 1.0.0".to_owned(),
         },
         models: None,
+        remote_shell_targets: Default::default(),
         provider_profiles: ExecutionProviderProfiles::default(),
     };
     let mut digest = Sha256::new();

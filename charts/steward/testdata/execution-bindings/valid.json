@@ -11,6 +11,7 @@
       "expectedStdout": "codex 1.2.3"
     },
     "models": {"providers": ["anthropic", "openai"]},
+    "remoteShellTargets": {"engineer": "i-0123456789abcdef0"},
     "providerProfiles": {
       "tools": {
         "id": "example-tools-profile-v7",

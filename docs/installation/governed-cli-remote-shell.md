@@ -1,6 +1,6 @@
 # Governed CLI and remote shell
 
-> **Release scope: Unreleased.** This guide requires MCP-GW 0.7.0 or later. Earlier Steward and
+> **Release scope: Unreleased.** This guide requires MCP-GW 0.8.0 or later. Earlier Steward and
 > MCP-GW releases do not ship the complete helper and route set.
 
 Steward uses its existing exact tool-grant tuples for governed command-line access. MCP-GW
@@ -31,27 +31,28 @@ do not maintain a second list in the web deployment.
 
 ## Bind a machine to one Run
 
-Remote shell accepts a configured target role rather than an address or instance ID. MCP-GW maps
-that role to a machine and, before every command, requires the machine tag value to equal the
-immutable runtime UID in the runtime-bound MCP-GW credential minted for the sandbox.
+Remote shell accepts a configured target role rather than an address or instance ID. Declare the
+static role-to-instance mapping in the deployment-owned execution binding:
 
-1. Submit and execute the Task through the normal Task API. Keep the returned `taskUid` only as
-   the Task lookup key.
-2. Poll `GET /v1/tasks/{taskUid}` with the same authenticated caller. Wait until `runtimeUid` is a
-   non-empty string. The native Run details page shows the same API value as **Runtime**.
-3. From a trusted provisioning pipeline, set the configured MCP-GW run tag on the target machine.
-   The default key is `hypershell:run-id`; the value is the exact `runtimeUid`, not `taskUid`, a
-   runtime name, or a value chosen by the caller.
-4. Configure MCP-GW to map the Task identity and target role to that machine. Keep machine IDs,
-   cloud credentials, and tag-writing permission out of the sandbox and agent-visible output.
-5. Remove or replace the run tag during cleanup before assigning the machine to another Run.
+```yaml
+remoteShellTargets:
+  engineer: i-0123456789abcdef0
+```
 
-Until both the role mapping and exact tag are present, MCP-GW refuses the remote command. A
-missing tag, another Run's value, a tag lookup failure, a target role outside the Task identity's
-mapping, or a Task without `remote-shell/remote_shell_run/write` remains refused. The trusted
-provisioner should be the only identity allowed to change the run tag; the remote-shell service
-needs read-only tag access and the narrowly scoped Systems Manager permissions documented by
-MCP-GW.
+The apiserver validates the mapping, incorporates it into the binding digest, and snapshots the
+exact binding with the Task. The controller projects that snapshot into an immutable runtime
+annotation writable only by trusted Steward identities. Mint reads only that trusted annotation
+and signs the mapping as `steward.remote_shell_targets` when the runtime also has the exact
+`remote-shell/remote_shell_run/write` grant.
 
-Static long-lived host targets and signed bindings are not part of this release. Do not substitute
-an Envelope ID, Task ID, instance ID, or sandbox-held credential for the runtime-UID tag check.
+MCP-GW v0.8.0 resolves the requested role only from that verified signed claim. A missing or
+malformed binding, a role absent from the mapping, a sibling grant tuple, or a Task without the
+remote-shell grant remains refused before any Systems Manager command runs. The agent can select a
+declared role but cannot provide an instance ID, edit the mapping, or borrow another runtime's
+binding. Keep cloud credentials and instance IDs out of Task input, harness configuration, agent
+output, and logs.
+
+This first slice is static per deployment binding. Dynamic per-run allocation through an
+authenticated provisioner is tracked separately in
+[hypershell-platform#78](https://github.com/apelogic-ai/hypershell-platform/issues/78); do not put a
+dynamic target in the Task spec while that path is absent.

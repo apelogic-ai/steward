@@ -41,6 +41,7 @@ fn binding(adapter: &str, provider: &str) -> DisposableExecutionBinding {
         models: Some(ExecutionModelCompatibility {
             providers: vec![provider.to_owned()],
         }),
+        remote_shell_targets: Default::default(),
         provider_profiles: ExecutionProviderProfiles::default(),
     }
 }

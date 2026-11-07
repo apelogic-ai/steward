@@ -19,6 +19,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   run routes. Prefix paths, sibling paths, detached-job routes, other
   methods and hosts, unrelated grants, and unapproved command classes remain
   refused.
+- Deployment-owned execution bindings may declare a static `remoteShellTargets` role-to-EC2-instance
+  mapping. Steward validates and content-binds the mapping, snapshots it with the run, and signs it
+  as `steward.remote_shell_targets` only when the runtime has the exact
+  `remote-shell/remote_shell_run/write` grant. Agent, Task, and harness inputs cannot supply or
+  widen the mapping; missing, malformed, sibling-grant, and cross-runtime bindings mint no target
+  authority. This is the issuer contract required by MCP-GW v0.8.0.
 - GitHub Actions workflow generation can use the optional
   `config.apiserver.stewardRunRelease.workflowRef` for both versioned and direct-package callers,
   including direct-package caller pull requests created by browser publication.
@@ -38,6 +44,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade and rollback
 
+- Upgrade MCP-GW to v0.8.0 and Steward together before enabling remote shell. Add
+  `remoteShellTargets` to the selected deployment execution binding and regenerate its digest; the
+  old mutable tag/Secret target binding is no longer authority. Removing the mapping disables new
+  remote-shell target claims. Roll back by disabling remote shell first, then restore the previous
+  Steward and MCP-GW configuration together because MCP-GW v0.8.0 refuses tokens without the signed
+  mapping while older gateways do not consume it.
 - No configuration or data migration is required. Existing installations keep exact-commit
   rendering. Administrators who control an in-organization steward-run copy may add `workflowRef`
   and move that ref as they upgrade the copy. Remove the field before rolling back because older

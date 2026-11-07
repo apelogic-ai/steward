@@ -1127,6 +1127,17 @@
                           }
                         }
                       },
+                      "remoteShellTargets": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "propertyNames": {
+                          "pattern": "^[a-z][a-z0-9-]{0,62}$"
+                        },
+                        "additionalProperties": {
+                          "type": "string",
+                          "pattern": "^i-[0-9a-f]{8}(?:[0-9a-f]{9})?$"
+                        }
+                      },
                       "providerProfiles": {
                         "type": "object",
                         "additionalProperties": false,

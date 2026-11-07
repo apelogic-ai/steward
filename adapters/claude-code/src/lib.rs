@@ -271,6 +271,7 @@ mod tests {
             models: Some(ExecutionModelCompatibility {
                 providers: vec!["anthropic".to_owned(), "example-provider".to_owned()],
             }),
+            remote_shell_targets: Default::default(),
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),

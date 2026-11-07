@@ -26,6 +26,8 @@ struct CatalogEntry {
     executable: String,
     version_probe: ExecutionVersionProbe,
     models: ExecutionModelCompatibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_shell_targets: Option<BTreeMap<String, String>>,
     provider_profiles: ExecutionProviderProfiles,
 }
 
@@ -36,6 +38,13 @@ impl CatalogEntry {
         self.models.providers.dedup();
         if self.models.providers.len() != provider_count {
             return Err("execution model providers must be unique bounded identifiers".to_owned());
+        }
+        if self
+            .remote_shell_targets
+            .as_ref()
+            .is_some_and(BTreeMap::is_empty)
+        {
+            return Err("remote-shell target authority must not be empty".to_owned());
         }
         self.models.validate()?;
         let mut binding = DisposableExecutionBinding {
@@ -49,6 +58,7 @@ impl CatalogEntry {
             executable: self.executable,
             version_probe: self.version_probe,
             models: Some(self.models),
+            remote_shell_targets: self.remote_shell_targets.unwrap_or_default(),
             provider_profiles: self.provider_profiles,
         };
         binding.validate()?;
@@ -286,6 +296,52 @@ mod tests {
     fn empty_versioned_catalog_is_valid_and_advertises_no_agents() -> Result<(), String> {
         let catalog = ExecutionBindingCatalog::from_json(&catalog_json(Vec::new())?)?;
         assert!(catalog.agent_refs().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_shell_targets_are_validated_and_bound_into_execution_identity() -> Result<(), String>
+    {
+        let mut first = entry("agent@1.0.0", 'a');
+        first["remoteShellTargets"] = json!({
+            "engineer": "i-0123456789abcdef0"
+        });
+        let catalog = ExecutionBindingCatalog::from_json(&catalog_json(vec![first.clone()])?)?;
+        let binding = catalog
+            .resolve("agent@1.0.0")
+            .ok_or_else(|| "target-bearing binding did not resolve".to_owned())?;
+        let serialized = serde_json::to_value(binding).map_err(|error| error.to_string())?;
+        assert_eq!(
+            serialized.pointer("/remoteShellTargets/engineer"),
+            Some(&json!("i-0123456789abcdef0"))
+        );
+        let first_digest = binding.binding_digest.clone();
+
+        let mut changed = first.clone();
+        changed["remoteShellTargets"]["engineer"] = json!("i-0fedcba9876543210");
+        let changed_digest = ExecutionBindingCatalog::from_json(&catalog_json(vec![changed])?)?
+            .resolve("agent@1.0.0")
+            .ok_or_else(|| "changed target-bearing binding did not resolve".to_owned())?
+            .binding_digest
+            .clone();
+        assert_ne!(
+            first_digest, changed_digest,
+            "remote-shell target authority must be content-bound"
+        );
+
+        for targets in [
+            json!({"Controller": "i-0123456789abcdef0"}),
+            json!({"engineer": "i-0123456789abcdef"}),
+            json!({"engineer": "host.example.com"}),
+            json!({}),
+        ] {
+            let mut invalid = entry("agent@1.0.0", 'a');
+            invalid["remoteShellTargets"] = targets;
+            assert!(
+                ExecutionBindingCatalog::from_json(&catalog_json(vec![invalid])?).is_err(),
+                "malformed or empty remote-shell target authority must fail closed"
+            );
+        }
         Ok(())
     }
 

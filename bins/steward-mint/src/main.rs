@@ -650,6 +650,7 @@ mod tests {
             llms: Vec::new(),
             inference_reference: None,
             tools: Vec::new(),
+            remote_shell_targets: BTreeMap::new(),
             state: AuthorityState::Active,
         }
     }

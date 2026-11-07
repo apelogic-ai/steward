@@ -779,6 +779,8 @@ Steward release namespace also creates `steward-workflows`.
   [the installation guide](../../docs/installation/installation-guide.md#vendored-steward-run-workflow).
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
+  An optional `remoteShellTargets` map binds approved role names to EC2 instance IDs; Steward
+  content-binds and signs it only for runs with the exact remote-shell grant.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
   mounts it read-only in the apiserver, and rolls the apiserver when its checksum
   changes. See [Execution bindings](../../docs/installation/execution-bindings.md).

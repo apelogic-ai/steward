@@ -5332,6 +5332,7 @@ mod tests {
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
             models: None,
+            remote_shell_targets: Default::default(),
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -5503,6 +5504,7 @@ mod tests {
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
             models: None,
+            remote_shell_targets: Default::default(),
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -5577,6 +5579,7 @@ mod tests {
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
             models: None,
+            remote_shell_targets: Default::default(),
             provider_profiles: ExecutionProviderProfiles::default(),
         };
         let command = output_archive_command(
@@ -6298,6 +6301,7 @@ mod tests {
                     expected_stdout: "example-agent 1.0.0".to_owned(),
                 },
                 models: None,
+                remote_shell_targets: Default::default(),
                 provider_profiles: ExecutionProviderProfiles::default(),
             }),
         };

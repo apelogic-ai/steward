@@ -5,6 +5,7 @@ pub mod task_input_archive;
 pub mod task_output_archive;
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -876,6 +877,8 @@ pub struct DisposableExecutionBinding {
     /// Absent only on historical persisted bindings created before compatibility was content-bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<ExecutionModelCompatibility>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_shell_targets: BTreeMap<String, String>,
     pub provider_profiles: ExecutionProviderProfiles,
 }
 
@@ -898,6 +901,9 @@ impl DisposableExecutionBinding {
                 .models
                 .as_ref()
                 .is_some_and(|models| models.validate().is_err())
+            || self.remote_shell_targets.iter().any(|(role, instance_id)| {
+                !valid_remote_shell_role(role) || !valid_ec2_instance_id(instance_id)
+            })
             || self.provider_profiles.validate().is_err()
         {
             return Err("disposable execution binding is incomplete or mutable".to_owned());
@@ -916,6 +922,8 @@ impl DisposableExecutionBinding {
             version_probe: &'a ExecutionVersionProbe,
             #[serde(skip_serializing_if = "Option::is_none")]
             models: &'a Option<ExecutionModelCompatibility>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            remote_shell_targets: &'a BTreeMap<String, String>,
             provider_profiles: &'a ExecutionProviderProfiles,
         }
 
@@ -926,6 +934,7 @@ impl DisposableExecutionBinding {
             executable: &self.executable,
             version_probe: &self.version_probe,
             models: &self.models,
+            remote_shell_targets: &self.remote_shell_targets,
             provider_profiles: &self.provider_profiles,
         })
         .map_err(|error| format!("execution binding cannot be canonicalized: {error}"))
@@ -1075,6 +1084,25 @@ fn valid_binding_slug(value: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn valid_remote_shell_role(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn valid_ec2_instance_id(value: &str) -> bool {
+    value.strip_prefix("i-").is_some_and(|identifier| {
+        matches!(identifier.len(), 8 | 17)
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn valid_sha256_digest(value: &str) -> bool {
@@ -1392,10 +1420,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION, CANONICAL_PRINCIPAL_SCHEMA_VERSION,
-        CallerReference, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId,
-        DisposableExecutionBinding, Email, ModelRef, OrganizationId, OrganizationIdentityPolicy,
-        Principal, ResidentExecutionBinding, ResidentExecutionContext, RuntimeId,
+        AgentRuntimeSpec, AgentType, Budget, CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION,
+        CANONICAL_PRINCIPAL_SCHEMA_VERSION, CallerReference, CanonicalAuthorityBinding,
+        CanonicalPrincipal, CanonicalUserId, DisposableExecutionBinding, Duration, Email, ModelRef,
+        OrganizationId, OrganizationIdentityPolicy, Principal, ResidentExecutionBinding,
+        ResidentExecutionContext, RunnerRequirements, RuntimeId,
         TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, agent_runtime_crd,
         valid_digest_pinned_image,
     };
@@ -1470,6 +1499,46 @@ mod tests {
             provider: "historical-provider".to_owned(),
             model: "historical-model".to_owned(),
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_runtime_spec_cannot_carry_remote_shell_targets() -> Result<(), String> {
+        let spec = AgentRuntimeSpec {
+            principal: Principal::User {
+                acting_user: Email::parse("alice@example.com")?,
+            },
+            owner: Email::parse("alice@example.com")?,
+            canonical_authority: None,
+            agent_type: AgentType {
+                name: "example-agent@1.0.0".to_owned(),
+            },
+            llms: Vec::new(),
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "10.00".to_owned(),
+                single_run_limit: None,
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("30m".to_owned()),
+            runner: RunnerRequirements::default(),
+            bindings: None,
+        };
+        let mut value = serde_json::to_value(&spec).map_err(|error| error.to_string())?;
+        value["remoteShellTargets"] = json!({
+            "engineer": "i-0123456789abcdef0"
+        });
+        let parsed = serde_json::from_value::<AgentRuntimeSpec>(value)
+            .map_err(|error| format!("parse runtime spec with ignored unknown field: {error}"))?;
+        assert_eq!(
+            parsed, spec,
+            "an agent-facing key must not enter the typed runtime authority"
+        );
+        let serialized = serde_json::to_value(parsed).map_err(|error| error.to_string())?;
+        assert!(
+            serialized.get("remoteShellTargets").is_none(),
+            "agent-facing runtime input must not retain remote-shell target authority"
+        );
         Ok(())
     }
 

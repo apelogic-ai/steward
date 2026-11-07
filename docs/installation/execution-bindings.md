@@ -1,12 +1,14 @@
 # Execution bindings
 
-Status: current Steward 0.3.28 installation contract
+Status: current Steward 0.3.28 installation contract, with the Unreleased `remoteShellTargets`
+extension called out below
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding
 resolution, durable Task snapshots, adapter behavior, and fail-closed execution. The deployment
 owns every agent reference, label, version, image digest, executable, version probe, provider
-profile ID and profile digest, supported model providers, and installs those OpenShell profiles. Workflow administrators may
+profile ID and profile digest, supported model providers, optional remote-shell target mapping, and
+installs those OpenShell profiles. Workflow administrators may
 select only an advertised `agentRef`; browser and Task requests cannot provide any execution field.
 
 A clean installation has an empty catalog. It starts normally, advertises zero coding agents,
@@ -31,6 +33,7 @@ The top-level object and every nested object reject unknown fields.
 | `versionProbe.arguments` | yes | One to eight process arguments, each 1–128 characters with no control characters. No shell parsing occurs. |
 | `versionProbe.expectedStdout` | yes | Exact trimmed stdout, 1–255 characters with no control characters. Any difference fails execution before the agent runs. |
 | `models.providers` | yes | One to 64 unique provider identifiers supported by this exact agent image and adapter deployment. Steward intersects this list with the selected Envelope; model names remain deployment configuration. |
+| `remoteShellTargets` | no | Non-empty role-to-EC2-instance mapping signed into runtime HOP-1 only when the Task has `remote-shell/remote_shell_run/write`. Roles match `^[a-z][a-z0-9-]{0,62}$`; instance IDs match the EC2 `i-` form accepted by MCP-GW v0.8.0. The mapping contains no credential. |
 | `providerProfiles.tools` | conditional | Required for Tasks with approved tools. |
 | `providerProfiles.inference` | conditional | Required for Tasks with approved models. |
 | `providerProfiles.*.id` | conditional | Exact OpenShell provider-profile ID, 1–255 characters, no whitespace or control characters. |
@@ -38,7 +41,9 @@ The top-level object and every nested object reject unknown fields.
 
 The catalog is limited to 1 MiB. Steward serializes each validated execution entry in schema field
 order, excludes presentation-only `displayName`, prefixes the schema domain, and derives a SHA-256
-`bindingId`/`bindingDigest`. Operators do not provide those values. Use the exact released
+`bindingId`/`bindingDigest`. `remoteShellTargets` is execution authority and therefore changes that
+digest; an empty or omitted mapping preserves the historical binding identity. Operators do not
+provide those values. Use the exact released
 apiserver image digest from the release handoff to calculate and print them offline:
 
 ```sh
@@ -179,6 +184,8 @@ config:
             expectedStdout: example-agent 1.2.3
           models:
             providers: [example]
+          remoteShellTargets:
+            engineer: i-0123456789abcdef0
           providerProfiles:
             tools:
               id: example-tools-profile-v7

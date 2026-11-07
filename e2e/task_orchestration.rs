@@ -1675,6 +1675,7 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
             expected_stdout: "example-agent 1".to_owned(),
         },
         models: None,
+        remote_shell_targets: Default::default(),
         provider_profiles: ExecutionProviderProfiles::default(),
     };
     let digest = format!(
