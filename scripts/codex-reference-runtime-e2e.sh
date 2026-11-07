@@ -232,6 +232,8 @@ network_policies:
               path: /shell/run
     binaries:
       - path: /usr/local/bin/mcp-gw-sandbox-helper
+      - path: /usr/local/bin/kubectl
+      - path: /usr/local/bin/remote-shell
 YAML
 
 "${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
