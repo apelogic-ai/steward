@@ -307,10 +307,13 @@ check_helper_refusal() {
     echo \"remote shell helper did not return exit code 125\" >&2
     exit 1
   fi
-  if ! printf '%s\\n' \"\$output\" | grep -Fx \"\$expected\" >/dev/null; then
-    echo \"remote shell helper did not return its plain refusal\" >&2
-    exit 1
-  fi
+  case \"\$output\" in
+    *\"\$expected\"*) ;;
+    *)
+      echo \"remote shell helper did not return its plain refusal\" >&2
+      exit 1
+      ;;
+  esac
   case \"\$output\" in
     *openshell-token-grant-placeholder*)
       echo \"remote shell helper exposed its substitution marker\" >&2
@@ -332,10 +335,13 @@ if test \"\${status}\" -ne 125; then
   echo \"CLI helper did not return exit code 125\" >&2
   exit 1
 fi
-if ! printf '%s\\n' \"\${output}\" | grep -Fx \"CLI request failed\" >/dev/null; then
-  echo \"CLI helper did not return its plain refusal\" >&2
-  exit 1
-fi
+case \"\${output}\" in
+  *\"CLI request failed\"*) ;;
+  *)
+    echo \"CLI helper did not return its plain refusal\" >&2
+    exit 1
+    ;;
+esac
 case \"\${output}\" in
   *openshell-token-grant-placeholder*)
     echo \"CLI helper exposed its substitution marker\" >&2
