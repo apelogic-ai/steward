@@ -5936,6 +5936,10 @@ mod tests {
             !e2e.contains("MCP_GW_CLI_URL=http://127.0.0.1:18080"),
             "OpenShell always blocks loopback; the governed CLI refusal fixture must use an exact in-cluster route"
         );
+        assert!(
+            !e2e.contains("http://codex-refusal.openshell.svc.cluster.local"),
+            "the sandbox helper permits non-loopback command routes only over HTTPS"
+        );
         for required in [
             "/cli/run",
             "/cli/jobs",

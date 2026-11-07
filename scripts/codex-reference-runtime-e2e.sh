@@ -65,8 +65,17 @@ curl --fail --location --silent --show-error \
 )
 
 refusal_server="${STEWARD_RUN_DIR}/codex-refusal-server.py"
+refusal_certificate="${STEWARD_RUN_DIR}/codex-refusal.crt"
+refusal_private_key="${STEWARD_RUN_DIR}/codex-refusal.key"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj '/CN=codex-refusal.openshell.svc.cluster.local' \
+  -addext 'subjectAltName=DNS:codex-refusal.openshell.svc.cluster.local' \
+  -keyout "${refusal_private_key}" \
+  -out "${refusal_certificate}" \
+  >/dev/null 2>&1
 cat >"${refusal_server}" <<'PYTHON'
 import json
+import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -111,9 +120,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+server = ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
+server.socket = context.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
 PYTHON
 
+"${KUBECTL[@]}" -n openshell create secret tls codex-refusal-tls \
+  --cert="${refusal_certificate}" \
+  --key="${refusal_private_key}" \
+  --dry-run=client \
+  -o yaml |
+  "${KUBECTL[@]}" label --local -f - \
+    "steward.test/run-id=${run_id}" \
+    -o yaml |
+  "${KUBECTL[@]}" apply -f -
 "${KUBECTL[@]}" -n openshell create configmap codex-refusal \
   --from-file=server.py="${refusal_server}" \
   --dry-run=client \
@@ -148,9 +170,9 @@ spec:
           env:
             - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
           ports:
-            - { name: http, containerPort: 8080 }
+            - { name: https, containerPort: 8443 }
           readinessProbe:
-            tcpSocket: { port: http }
+            tcpSocket: { port: https }
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
@@ -159,9 +181,12 @@ spec:
             runAsUser: 65534
           volumeMounts:
             - { name: server, mountPath: /srv, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
       volumes:
         - name: server
           configMap: { name: codex-refusal }
+        - name: tls
+          secret: { secretName: codex-refusal-tls }
 ---
 apiVersion: v1
 kind: Service
@@ -174,7 +199,7 @@ spec:
   selector:
     app: codex-refusal
   ports:
-    - { name: http, port: 8080, targetPort: http }
+    - { name: https, port: 8443, targetPort: https }
 YAML
 "${KUBECTL[@]}" -n openshell rollout status deployment/codex-refusal --timeout=300s
 
@@ -195,7 +220,7 @@ network_policies:
     name: governed-cli-refusal
     endpoints:
       - host: codex-refusal.openshell.svc.cluster.local
-        port: 8080
+        port: 8443
         protocol: rest
         enforcement: enforce
         rules:
@@ -243,6 +268,10 @@ sandbox_exec() {
     --workspace "${workspace}" sandbox exec --name "${sandbox}" --no-tty -- "$@"
 }
 
+refusal_certificate_base64="$(openssl base64 -A -in "${refusal_certificate}")"
+sandbox_exec /bin/sh -c \
+  "printf '%s' '${refusal_certificate_base64}' | base64 -d > /sandbox/codex-refusal-ca.crt"
+
 sandbox_exec rg --version
 sandbox_exec jq --version
 sandbox_exec fd --version
@@ -266,8 +295,9 @@ check_helper_refusal() {
   shift
   set +e
   output=\$(env \
-    MCP_GW_CLI_URL=http://codex-refusal.openshell.svc.cluster.local:8080/cli/run \
-    MCP_GW_SHELL_URL=http://codex-refusal.openshell.svc.cluster.local:8080/shell/run \
+    NODE_EXTRA_CA_CERTS=/sandbox/codex-refusal-ca.crt \
+    MCP_GW_CLI_URL=https://codex-refusal.openshell.svc.cluster.local:8443/cli/run \
+    MCP_GW_SHELL_URL=https://codex-refusal.openshell.svc.cluster.local:8443/shell/run \
     \"\$@\" 2>&1)
   status=\$?
   set -e
@@ -290,7 +320,10 @@ check_helper_refusal \"Remote shell request failed\" \
   remote-shell machine.test -- uname -a
 
 set +e
-output=\$(MCP_GW_CLI_URL=http://codex-refusal.openshell.svc.cluster.local:8080/cli/run kubectl delete pods 2>&1)
+output=\$(env \
+  NODE_EXTRA_CA_CERTS=/sandbox/codex-refusal-ca.crt \
+  MCP_GW_CLI_URL=https://codex-refusal.openshell.svc.cluster.local:8443/cli/run \
+  kubectl delete pods 2>&1)
 status=\$?
 set -e
 if test \"\${status}\" -ne 125; then
