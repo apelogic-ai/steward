@@ -5658,20 +5658,22 @@ mod tests {
         let script = fs::read_to_string(&script_path)
             .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
 
-        for (method, path) in [
-            ("POST", "/mcp"),
-            ("DELETE", "/mcp"),
-            ("POST", "/cli/run"),
-            ("POST", "/cli/jobs"),
-            ("POST", "/shell/run"),
-            ("POST", "/shell/jobs"),
+        for (method, path, status) in [
+            ("POST", "/mcp", 501),
+            ("DELETE", "/mcp", 501),
+            ("GET", "/connections/github/status", 404),
+            ("GET", "/oauth/github/status", 404),
+            ("POST", "/oauth/github/start", 501),
+            ("POST", "/oauth/github/disconnect", 501),
+            ("POST", "/cli/run", 501),
+            ("POST", "/shell/run", 501),
         ] {
             assert!(
                 script.contains(&format!("method: {method}\n              path: {path}")),
                 "G-1 must configure the exact {method} {path} route"
             );
             assert!(
-                script.contains(&format!("assert_allowed_route {method} {path}")),
+                script.contains(&format!("assert_allowed_route {method} {path} {status}")),
                 "G-1 must prove that the exact {method} {path} route reaches the controlled upstream"
             );
         }
@@ -5680,6 +5682,12 @@ mod tests {
             "assert_denied_route POST /cli/run/extra",
             "assert_denied_route GET /cli/run",
             "assert_denied_route POST /cli/other",
+            "assert_denied_route POST /cli/jobs",
+            "assert_denied_route POST /shell/jobs",
+            "assert_denied_route GET /connections/github/status/extra",
+            "assert_denied_route GET /connections/github/other",
+            "assert_denied_route POST /connections/github/status",
+            "assert_denied_route GET /oauth/github/start",
         ] {
             assert!(
                 script.contains(refused_probe),
@@ -5907,12 +5915,14 @@ mod tests {
             Some(&serde_json::json!([
                 {"method": "POST", "path": "/mcp"},
                 {"method": "DELETE", "path": "/mcp"},
+                {"method": "GET", "path": "/connections/github/status"},
+                {"method": "GET", "path": "/oauth/github/status"},
+                {"method": "POST", "path": "/oauth/github/start"},
+                {"method": "POST", "path": "/oauth/github/disconnect"},
                 {"method": "POST", "path": "/cli/run"},
-                {"method": "POST", "path": "/cli/jobs"},
-                {"method": "POST", "path": "/shell/run"},
-                {"method": "POST", "path": "/shell/jobs"}
+                {"method": "POST", "path": "/shell/run"}
             ])),
-            "the command profile must preserve only the existing MCP transport and exact command routes"
+            "the command profile must preserve only the existing MCP and bridge operations plus exact run routes"
         );
         for required in [
             "openshell-token-grant-placeholder",
@@ -5942,10 +5952,12 @@ mod tests {
             "the sandbox helper permits non-loopback command routes only over HTTPS"
         );
         for required in [
+            "/connections/github/status",
+            "/oauth/github/status",
+            "/oauth/github/start",
+            "/oauth/github/disconnect",
             "/cli/run",
-            "/cli/jobs",
             "/shell/run",
-            "/shell/jobs",
             "/usr/local/bin/mcp-gw-sandbox-helper",
         ] {
             assert!(
@@ -5953,9 +5965,16 @@ mod tests {
                 "provider profile must bind {required}"
             );
         }
+        for refused in ["/cli/jobs", "/shell/jobs"] {
+            assert!(
+                !profile.contains(refused),
+                "provider profile must not expose unusable detached-job start {refused}"
+            );
+        }
         for required in [
             "MCP-GW 0.7.5",
-            "not present in the agent environment",
+            "`MCP_GW_RUN_TOKEN` is not present in the agent environment",
+            "non-secret `openshell-token-grant-placeholder` marker",
             "MCP_GW_CLI_URL",
             "MCP_GW_SHELL_URL",
         ] {

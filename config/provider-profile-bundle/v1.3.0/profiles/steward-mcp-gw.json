@@ -14,10 +14,12 @@
     "allowedRoutes": [
       {"method": "POST", "path": "/mcp"},
       {"method": "DELETE", "path": "/mcp"},
+      {"method": "GET", "path": "/connections/github/status"},
+      {"method": "GET", "path": "/oauth/github/status"},
+      {"method": "POST", "path": "/oauth/github/start"},
+      {"method": "POST", "path": "/oauth/github/disconnect"},
       {"method": "POST", "path": "/cli/run"},
-      {"method": "POST", "path": "/cli/jobs"},
-      {"method": "POST", "path": "/shell/run"},
-      {"method": "POST", "path": "/shell/jobs"}
+      {"method": "POST", "path": "/shell/run"}
     ]
   },
   "authorization": {

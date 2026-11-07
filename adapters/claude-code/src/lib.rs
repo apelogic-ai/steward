@@ -1,8 +1,12 @@
 //! Claude Code command rendering for immutable disposable Task execution.
 
-use steward_ports::{PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest};
+use steward_ports::{
+    PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
+    governed_command_grants,
+};
 
 pub const CLAUDE_CODE_V1_ADAPTER: &str = "claude-code-v1";
+const ABSENT_COMMAND_URL: &str = "-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeCodeTaskExecutionAdapter {
@@ -71,13 +75,13 @@ impl ClaudeCodeTaskExecutionAdapter {
         } else {
             "set --; "
         };
-        let governed_command_setup = governed_command_setup(&request, tool_transport_endpoint)?;
+        let (cli_url, shell_url) = governed_command_urls(&request, tool_transport_endpoint)?;
         let shell_command = format!(
             concat!(
                 "set -eu; umask 077; ",
-                "test \"$#\" -ge 8; ",
+                "test \"$#\" -ge 10; ",
                 "prompt=$1; model=$2; inference_endpoint=$3; mcp_config=$4; ",
-                "config_dir=$5; executable=$6; expected_version=$7; shift 7; ",
+                "config_dir=$5; executable=$6; expected_version=$7; cli_url=$8; shell_url=$9; shift 9; ",
                 "repository_context=${{STEWARD_REPOSITORY_CONTEXT-}}; ",
                 "if [ -n \"$repository_context\" ]; then prompt=$(printf '%s\\n\\n%s' \"$repository_context\" \"$prompt\"); fi; ",
                 "command -v id >/dev/null 2>&1; test \"$(id -u)\" -ne 0; ",
@@ -97,7 +101,8 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "test \"$(\"$executable\" \"$@\")\" = \"$expected_version\"; ",
                 "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; ",
                 "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
-                "{}",
+                "if [ \"$cli_url\" != \"-\" ]; then export MCP_GW_CLI_URL=\"$cli_url\"; fi; ",
+                "if [ \"$shell_url\" != \"-\" ]; then export MCP_GW_SHELL_URL=\"$shell_url\"; fi; ",
                 "{}",
                 "status_file=\"$CLAUDE_CONFIG_DIR/exit-status\"; ",
                 "( set +e; ",
@@ -108,7 +113,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "| tee \"$STEWARD_OUTPUT_DIR/result.txt\"; ",
                 "status=$(cat \"$status_file\"); exit \"$status\"",
             ),
-            tool_setup, governed_command_setup,
+            tool_setup,
         );
         let mut command = vec![
             "/bin/sh".to_owned(),
@@ -122,28 +127,21 @@ impl ClaudeCodeTaskExecutionAdapter {
             config_dir.to_owned(),
             request.binding.executable.clone(),
             request.binding.version_probe.expected_stdout.clone(),
+            cli_url,
+            shell_url,
         ];
         command.extend(request.binding.version_probe.arguments.iter().cloned());
         Ok(TaskExecutionPlan { command })
     }
 }
 
-fn governed_command_setup(
+fn governed_command_urls(
     request: &TaskExecutionPlanRequest<'_>,
     endpoint: Option<&str>,
-) -> Result<String, PortError> {
-    let cli = request.tools.iter().any(|tool| {
-        tool.provider == "cli"
-            && tool.resource == "kubectl"
-            && matches!(tool.action.as_str(), "read" | "write" | "destructive")
-    });
-    let shell = request.tools.iter().any(|tool| {
-        tool.provider == "remote-shell"
-            && tool.resource == "remote_shell_run"
-            && tool.action == "write"
-    });
-    if !cli && !shell {
-        return Ok(String::new());
+) -> Result<(String, String), PortError> {
+    let grants = governed_command_grants(request.tools);
+    if !grants.cli && !grants.remote_shell {
+        return Ok((ABSENT_COMMAND_URL.to_owned(), ABSENT_COMMAND_URL.to_owned()));
     }
     let endpoint = endpoint.ok_or_else(|| PortError::Rejected {
         reason: "governed command execution requires a governed tool endpoint".to_owned(),
@@ -151,20 +149,19 @@ fn governed_command_setup(
     let mut endpoint = reqwest::Url::parse(endpoint).map_err(|_| PortError::Rejected {
         reason: "Claude Code tool endpoint must be an exact HTTP(S) URL".to_owned(),
     })?;
-    let mut setup = String::new();
-    if cli {
+    let cli_url = if grants.cli {
         endpoint.set_path("/cli/run");
-        setup.push_str("export MCP_GW_CLI_URL=");
-        setup.push_str(endpoint.as_str());
-        setup.push_str("; ");
-    }
-    if shell {
+        endpoint.to_string()
+    } else {
+        ABSENT_COMMAND_URL.to_owned()
+    };
+    let shell_url = if grants.remote_shell {
         endpoint.set_path("/shell/run");
-        setup.push_str("export MCP_GW_SHELL_URL=");
-        setup.push_str(endpoint.as_str());
-        setup.push_str("; ");
-    }
-    Ok(setup)
+        endpoint.to_string()
+    } else {
+        ABSENT_COMMAND_URL.to_owned()
+    };
+    Ok((cli_url, shell_url))
 }
 
 fn validate_endpoint(value: &str, reason: &'static str) -> Result<String, PortError> {
@@ -355,7 +352,7 @@ mod tests {
         assert_eq!(plan.command[8], "/sandbox/steward-claude");
         assert_eq!(plan.command[9], binding.executable);
         assert_eq!(plan.command[10], binding.version_probe.expected_stdout);
-        assert_eq!(plan.command[11], "--version");
+        assert_eq!(plan.command[13], "--version");
         assert!(mcp_config.contains("https://tools.example.test/mcp"));
         assert!(mcp_config.contains("Bearer ${STEWARD_MCP_GW_BEARER_TOKEN}"));
         assert!(!mcp_config.contains("openshell-token-grant-placeholder"));
@@ -634,8 +631,8 @@ mod tests {
             })
             .map_err(|error| format!("render unrelated tool plan: {error:?}"))?;
         assert!(!unrelated_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
-        assert!(!unrelated_plan.command[2].contains("MCP_GW_CLI_URL"));
-        assert!(!unrelated_plan.command[2].contains("MCP_GW_SHELL_URL"));
+        assert_eq!(unrelated_plan.command[11], "-");
+        assert_eq!(unrelated_plan.command[12], "-");
 
         let over_class_tools = [ToolGrant {
             provider: "cli".to_owned(),
@@ -652,7 +649,8 @@ mod tests {
             })
             .map_err(|error| format!("render over-class tool plan: {error:?}"))?;
         assert!(!over_class_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
-        assert!(!over_class_plan.command[2].contains("MCP_GW_CLI_URL"));
+        assert_eq!(over_class_plan.command[11], "-");
+        assert_eq!(over_class_plan.command[12], "-");
         Ok(())
     }
 

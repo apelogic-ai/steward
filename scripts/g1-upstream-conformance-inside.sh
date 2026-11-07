@@ -146,6 +146,7 @@ governed_origin="http://oidc.openshell.svc.cluster.local:8000"
 assert_allowed_route() {
   method="$1"
   path="$2"
+  expected_status="$3"
   set +e
   status="$("${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
     --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
@@ -153,8 +154,8 @@ assert_allowed_route() {
       --write-out '%{http_code}' "${governed_origin}${path}" 2>/dev/null)"
   route_exit="$?"
   set -e
-  if [[ "${route_exit}" -ne 0 || "${status}" != "501" ]]; then
-    echo "OpenShell exact ${method} ${path} probe returned HTTP ${status:-none} with curl exit ${route_exit}; expected controlled upstream HTTP 501 with exit 0" >&2
+  if [[ "${route_exit}" -ne 0 || "${status}" != "${expected_status}" ]]; then
+    echo "OpenShell exact ${method} ${path} probe returned HTTP ${status:-none} with curl exit ${route_exit}; expected controlled upstream HTTP ${expected_status} with exit 0" >&2
     exit 1
   fi
 }
@@ -191,14 +192,14 @@ assert_upstream_rejects_query() {
   fi
 }
 
-assert_allowed_route POST /mcp
-assert_allowed_route DELETE /mcp
-assert_allowed_route GET /connections/github/status
-assert_allowed_route GET /oauth/github/status
-assert_allowed_route POST /oauth/github/start
-assert_allowed_route POST /oauth/github/disconnect
-assert_allowed_route POST /cli/run
-assert_allowed_route POST /shell/run
+assert_allowed_route POST /mcp 501
+assert_allowed_route DELETE /mcp 501
+assert_allowed_route GET /connections/github/status 404
+assert_allowed_route GET /oauth/github/status 404
+assert_allowed_route POST /oauth/github/start 501
+assert_allowed_route POST /oauth/github/disconnect 501
+assert_allowed_route POST /cli/run 501
+assert_allowed_route POST /shell/run 501
 
 assert_denied_route POST /cli/run/extra
 assert_denied_route GET /cli/run

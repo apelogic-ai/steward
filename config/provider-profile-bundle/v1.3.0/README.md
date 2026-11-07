@@ -3,17 +3,20 @@
 This immutable bundle supersedes `steward-runtime-providers@1.2.2`. It keeps
 the existing profile identities, endpoint hosts, token grants, Mint audience,
 CIDRs, and inference policy. The MCP-GW profile replaces its broad HTTP method
-policy with exact `POST` and `DELETE` rules for the existing `/mcp` transport
-and four exact `POST` routes: `/cli/run`, `/cli/jobs`, `/shell/run`, and
-`/shell/jobs`. It also requires the sandbox helper executable at
+policy with exact `POST` and `DELETE` rules for the existing `/mcp` transport,
+the four routes used by the GitHub connections bridge, and the two helper run
+routes: `POST /cli/run` and `POST /shell/run`. It also requires the sandbox helper executable at
 `/usr/local/bin/mcp-gw-sandbox-helper`.
 
-The network profile only permits the helper to reach those routes. MCP-GW
+The network profile only permits the existing transport and bridge operations
+plus the helper run routes. MCP-GW
 still checks the run-bound command class or remote-shell grant, target, and run
 identifier for every request. The fixed runtime wrappers provide
-`openshell-token-grant-placeholder` only while starting the helper; it is not
-present in the agent environment. OpenShell substitutes a short-lived token on
-the network request and never exposes a usable token to the agent.
+explicit helper operations, while the adapters provide
+`openshell-token-grant-placeholder` when governed tools are granted. The marker
+is not a credential. OpenShell replaces it with
+a short-lived token only on the network request and never exposes that usable
+token to the agent.
 
 `mint-audience` must equal `config.mint.audience`. Service CIDRs must be
 canonical and must not overlap OpenShell's always-blocked IPv4, IPv6, or
@@ -36,7 +39,7 @@ cargo xtask provider-profile-bundle upgrade \
 Re-apply both profiles under their existing IDs, rerun the platform preflight,
 update Steward with the regenerated profile digests, and then restart the
 controller and apiserver. The transition accepts only an exact 1.2.2
-predecessor and rejects any delta beyond the four command routes and helper
+predecessor and rejects any delta beyond the exact bridge and run routes and helper
 binary.
 
 The standalone installer supports fresh install and reconcile, not this

@@ -1,8 +1,12 @@
 //! Codex command rendering for immutable disposable Task execution.
 
-use steward_ports::{PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest};
+use steward_ports::{
+    PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
+    governed_command_grants,
+};
 
 pub const CODEX_V1_ADAPTER: &str = "codex-v1";
+const ABSENT_COMMAND_URL: &str = "-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexTaskExecutionAdapter {
@@ -40,21 +44,12 @@ impl CodexTaskExecutionAdapter {
     }
 }
 
-fn governed_command_environment(
+fn governed_command_urls(
     request: &TaskExecutionPlanRequest<'_>,
-) -> Result<String, PortError> {
-    let cli = request.tools.iter().any(|tool| {
-        tool.provider == "cli"
-            && tool.resource == "kubectl"
-            && matches!(tool.action.as_str(), "read" | "write" | "destructive")
-    });
-    let shell = request.tools.iter().any(|tool| {
-        tool.provider == "remote-shell"
-            && tool.resource == "remote_shell_run"
-            && tool.action == "write"
-    });
-    if !cli && !shell {
-        return Ok(String::new());
+) -> Result<(String, String), PortError> {
+    let grants = governed_command_grants(request.tools);
+    if !grants.cli && !grants.remote_shell {
+        return Ok((ABSENT_COMMAND_URL.to_owned(), ABSENT_COMMAND_URL.to_owned()));
     }
     let endpoint = request
         .tool_transport_endpoint
@@ -76,20 +71,19 @@ fn governed_command_environment(
             reason: "Codex tool endpoint must be an exact HTTP(S) URL".to_owned(),
         });
     }
-    let mut environment = String::new();
-    if cli {
+    let cli_url = if grants.cli {
         endpoint.set_path("/cli/run");
-        environment.push_str("MCP_GW_CLI_URL=");
-        environment.push_str(endpoint.as_str());
-        environment.push(' ');
-    }
-    if shell {
+        endpoint.to_string()
+    } else {
+        ABSENT_COMMAND_URL.to_owned()
+    };
+    let shell_url = if grants.remote_shell {
         endpoint.set_path("/shell/run");
-        environment.push_str("MCP_GW_SHELL_URL=");
-        environment.push_str(endpoint.as_str());
-        environment.push(' ');
-    }
-    Ok(environment)
+        endpoint.to_string()
+    } else {
+        ABSENT_COMMAND_URL.to_owned()
+    };
+    Ok((cli_url, shell_url))
 }
 
 fn invalid_inference_endpoint() -> PortError {
@@ -147,13 +141,13 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
         } else {
             ""
         };
-        let governed_command_environment = governed_command_environment(&request)?;
+        let (cli_url, shell_url) = governed_command_urls(&request)?;
         let shell_command = format!(
             concat!(
                 "set -eu; umask 077; ",
-                "test \"$#\" -ge 6; ",
-                "prompt=$1; model=$2; adapter_config=$3; executable=$4; expected_version=$5; ",
-                "shift 5; ",
+                "test \"$#\" -ge 8; ",
+                "prompt=$1; model=$2; adapter_config=$3; executable=$4; expected_version=$5; cli_url=$6; shell_url=$7; ",
+                "shift 7; ",
                 "repository_context=${{STEWARD_REPOSITORY_CONTEXT-}}; ",
                 "if [ -n \"$repository_context\" ]; then prompt=$(printf '%s\\n\\n%s' \"$repository_context\" \"$prompt\"); fi; ",
                 "test \"$(\"$executable\" \"$@\")\" = \"$expected_version\"; ",
@@ -161,14 +155,15 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
                 "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
                 "printf '%s' \"$adapter_config\" > \"$CODEX_HOME/config.toml\"; ",
-                "{}",
+                "if [ \"$cli_url\" != \"-\" ]; then export MCP_GW_CLI_URL=\"$cli_url\"; fi; ",
+                "if [ \"$shell_url\" != \"-\" ]; then export MCP_GW_SHELL_URL=\"$shell_url\"; fi; ",
                 "{}",
                 "OPENAI_API_KEY=openshell-token-grant-placeholder ",
                 "\"$executable\" exec --ephemeral --skip-git-repo-check ",
                 "--sandbox danger-full-access --model \"$model\" ",
                 "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$prompt\""
             ),
-            tool_bearer_environment, governed_command_environment,
+            tool_bearer_environment,
         );
         let mut command = vec![
             "/bin/sh".to_owned(),
@@ -180,6 +175,8 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
             adapter_config,
             request.binding.executable.clone(),
             request.binding.version_probe.expected_stdout.clone(),
+            cli_url,
+            shell_url,
         ];
         command.extend(request.binding.version_probe.arguments.iter().cloned());
         Ok(TaskExecutionPlan { command })
@@ -272,7 +269,7 @@ mod tests {
         assert_eq!(plan.command[5], "large");
         assert_eq!(plan.command[7], binding.executable);
         assert_eq!(plan.command[8], binding.version_probe.expected_stdout);
-        assert_eq!(plan.command[9], "--version");
+        assert_eq!(plan.command[11], "--version");
         Ok(())
     }
 
@@ -387,8 +384,8 @@ mod tests {
             })
             .map_err(|error| format!("render unrelated tool plan: {error:?}"))?;
         assert!(!unrelated_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
-        assert!(!unrelated_plan.command[2].contains("MCP_GW_CLI_URL"));
-        assert!(!unrelated_plan.command[2].contains("MCP_GW_SHELL_URL"));
+        assert_eq!(unrelated_plan.command[9], "-");
+        assert_eq!(unrelated_plan.command[10], "-");
 
         let over_class_tools = [ToolGrant {
             provider: "cli".to_owned(),
@@ -405,7 +402,8 @@ mod tests {
             })
             .map_err(|error| format!("render over-class tool plan: {error:?}"))?;
         assert!(!over_class_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
-        assert!(!over_class_plan.command[2].contains("MCP_GW_CLI_URL"));
+        assert_eq!(over_class_plan.command[9], "-");
+        assert_eq!(over_class_plan.command[10], "-");
         Ok(())
     }
 

@@ -56,9 +56,9 @@ matching route values to the agent process:
 The URLs are derived from the Task's configured MCP endpoint. An unrelated or
 unrecognized grant adds none of these values.
 
-`MCP_GW_RUN_TOKEN` is not present in the agent environment.
-The fixed wrapper adds the non-secret OpenShell
-substitution marker only to the helper child process, and OpenShell substitutes
+`MCP_GW_RUN_TOKEN` is not present in the agent environment. The adapter uses
+the non-secret `openshell-token-grant-placeholder` marker when governed tools
+are granted, and OpenShell substitutes
 a short-lived, run-bound token only on the allowed network request. MCP-GW then
 checks the token's run identifier, target, and approved command class. A
 missing grant, a command classified above the approved class, or a machine not
@@ -68,8 +68,9 @@ placeholder or substituted token.
 
 Use `steward-runtime-providers@1.3.0` with an image containing the helper. Its
 MCP-GW profile preserves exact `POST /mcp` and `DELETE /mcp` access for the
-existing tool transport and adds exactly `POST /cli/run`, `POST /cli/jobs`,
-`POST /shell/run`, and `POST /shell/jobs` on the configured gateway host.
+existing tool transport, preserves the four exact GitHub connections-bridge
+operations, and adds only `POST /cli/run` and `POST /shell/run` on the
+configured gateway host.
 Prefix and sibling paths, other hosts, and all other methods remain blocked.
 The route policy matches the HTTP method and URL path; query input is handled
 by the endpoint without broadening that route. The same Task and Envelope API

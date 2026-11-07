@@ -736,10 +736,12 @@ fn validate_provider_profile_upgrade_delta(
                 expected["endpoints"][0]["rules"] = serde_json::json!([
                     {"allow": {"method": "POST", "path": "/mcp"}},
                     {"allow": {"method": "DELETE", "path": "/mcp"}},
+                    {"allow": {"method": "GET", "path": "/connections/github/status"}},
+                    {"allow": {"method": "GET", "path": "/oauth/github/status"}},
+                    {"allow": {"method": "POST", "path": "/oauth/github/start"}},
+                    {"allow": {"method": "POST", "path": "/oauth/github/disconnect"}},
                     {"allow": {"method": "POST", "path": "/cli/run"}},
-                    {"allow": {"method": "POST", "path": "/cli/jobs"}},
-                    {"allow": {"method": "POST", "path": "/shell/run"}},
-                    {"allow": {"method": "POST", "path": "/shell/jobs"}}
+                    {"allow": {"method": "POST", "path": "/shell/run"}}
                 ]);
                 expected["binaries"]
                     .as_array_mut()
@@ -750,7 +752,7 @@ fn validate_provider_profile_upgrade_delta(
             }
             if &expected != replacement_profile {
                 return Err(format!(
-                    "provider profile upgrade for {profile_id} permits only the declared governed command routes and helper binary"
+                    "provider profile upgrade for {profile_id} permits only the declared gateway routes and helper binary"
                 ));
             }
             continue;
@@ -3347,10 +3349,12 @@ mod tests {
             "allowedRoutes": [
               {"method": "POST", "path": "/mcp"},
               {"method": "DELETE", "path": "/mcp"},
+              {"method": "GET", "path": "/connections/github/status"},
+              {"method": "GET", "path": "/oauth/github/status"},
+              {"method": "POST", "path": "/oauth/github/start"},
+              {"method": "POST", "path": "/oauth/github/disconnect"},
               {"method": "POST", "path": "/cli/run"},
-              {"method": "POST", "path": "/cli/jobs"},
-              {"method": "POST", "path": "/shell/run"},
-              {"method": "POST", "path": "/shell/jobs"}
+              {"method": "POST", "path": "/shell/run"}
             ]
           },
           "authorization": {
@@ -3397,10 +3401,12 @@ mod tests {
             Some(&serde_json::json!([
                 {"allow": {"method": "POST", "path": "/mcp"}},
                 {"allow": {"method": "DELETE", "path": "/mcp"}},
+                {"allow": {"method": "GET", "path": "/connections/github/status"}},
+                {"allow": {"method": "GET", "path": "/oauth/github/status"}},
+                {"allow": {"method": "POST", "path": "/oauth/github/start"}},
+                {"allow": {"method": "POST", "path": "/oauth/github/disconnect"}},
                 {"allow": {"method": "POST", "path": "/cli/run"}},
-                {"allow": {"method": "POST", "path": "/cli/jobs"}},
-                {"allow": {"method": "POST", "path": "/shell/run"}},
-                {"allow": {"method": "POST", "path": "/shell/jobs"}}
+                {"allow": {"method": "POST", "path": "/shell/run"}}
             ]))
         );
         assert_eq!(
