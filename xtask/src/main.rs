@@ -5871,6 +5871,19 @@ mod tests {
         let guide = fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
             .map_err(|error| format!("Codex reference runtime guide is required: {error}"))?;
 
+        let curl_downloads = container.matches("curl --fail").count();
+        let retried_downloads = container
+            .matches("curl --fail --retry 3 --retry-all-errors")
+            .count();
+        assert!(
+            curl_downloads > 0,
+            "runtime image must download pinned artifacts"
+        );
+        assert_eq!(
+            retried_downloads, curl_downloads,
+            "every runtime artifact download must retry transport failures"
+        );
+
         for required in [
             "ARG TARGETARCH",
             "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-amd64.tar.gz",

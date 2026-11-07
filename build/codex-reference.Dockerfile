@@ -27,28 +27,28 @@ RUN case "${TARGETARCH}" in \
         ;; \
       *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
         --output /tmp/uv.tar.gz \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/jq_${JQ_VERSION}_amd64.deb" \
         --output /tmp/jq.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/libjq1_${LIBJQ_VERSION}_amd64.deb" \
         --output /tmp/libjq1.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/libonig5_${LIBONIG_VERSION}_amd64.deb" \
         --output /tmp/libonig5.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/fd-find_${FD_FIND_VERSION}_amd64.deb" \
         --output /tmp/fd-find.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
-    && curl --fail --silent --show-error --location "${helper_url}" \
+    && curl --fail --retry 3 --retry-all-errors --silent --show-error --location "${helper_url}" \
         --output /tmp/mcp-gw-sandbox-helper.tar.gz \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${JQ_SHA256}" /tmp/jq.deb | sha256sum --check --strict \
