@@ -57,10 +57,12 @@ class PlatformPreflightTests(unittest.TestCase):
                 "allowedRoutes": [
                     {"method": "POST", "path": "/mcp"},
                     {"method": "DELETE", "path": "/mcp"},
+                    {"method": "GET", "path": "/connections/github/status"},
+                    {"method": "GET", "path": "/oauth/github/status"},
+                    {"method": "POST", "path": "/oauth/github/start"},
+                    {"method": "POST", "path": "/oauth/github/disconnect"},
                     {"method": "POST", "path": "/cli/run"},
-                    {"method": "POST", "path": "/cli/jobs"},
                     {"method": "POST", "path": "/shell/run"},
-                    {"method": "POST", "path": "/shell/jobs"},
                 ]
             }
         else:
@@ -111,10 +113,12 @@ class PlatformPreflightTests(unittest.TestCase):
             "        endpoint['rules'] = [\n"
             "          {'allow': {'method': 'POST', 'path': '/mcp'}},\n"
             "          {'allow': {'method': 'DELETE', 'path': '/mcp'}},\n"
+            "          {'allow': {'method': 'GET', 'path': '/connections/github/status'}},\n"
+            "          {'allow': {'method': 'GET', 'path': '/oauth/github/status'}},\n"
+            "          {'allow': {'method': 'POST', 'path': '/oauth/github/start'}},\n"
+            "          {'allow': {'method': 'POST', 'path': '/oauth/github/disconnect'}},\n"
             "          {'allow': {'method': 'POST', 'path': '/cli/run'}},\n"
-            "          {'allow': {'method': 'POST', 'path': '/cli/jobs'}},\n"
             "          {'allow': {'method': 'POST', 'path': '/shell/run'}},\n"
-            "          {'allow': {'method': 'POST', 'path': '/shell/jobs'}},\n"
             "        ]\n"
             f"        if {extra_route!r}: endpoint['rules'].append({{'allow': {{'method': 'POST', 'path': '/cli/**'}}}})\n"
             "      else:\n"

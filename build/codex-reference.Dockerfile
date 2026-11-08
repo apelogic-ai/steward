@@ -18,11 +18,11 @@ ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 RUN case "${TARGETARCH}" in \
       amd64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
         helper_sha256="26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34" \
         ;; \
       arm64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
         helper_sha256="0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4" \
         ;; \
       *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \

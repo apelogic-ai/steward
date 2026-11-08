@@ -1,6 +1,6 @@
 # Governed CLI and remote shell
 
-> **Release scope: Unreleased.** This guide requires MCP-GW 0.8.0 or later. Earlier Steward and
+> **Release scope: Steward v0.3.29.** This guide requires MCP-GW 0.8.0 or later. Earlier Steward and
 > MCP-GW releases do not ship the complete helper and route set.
 
 Steward uses its existing exact tool-grant tuples for governed command-line access. MCP-GW

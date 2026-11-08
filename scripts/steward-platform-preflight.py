@@ -976,10 +976,12 @@ def provider_profile_bundle_contract(
         governed_routes = [
             {"allow": {"method": "POST", "path": "/mcp"}},
             {"allow": {"method": "DELETE", "path": "/mcp"}},
+            {"allow": {"method": "GET", "path": "/connections/github/status"}},
+            {"allow": {"method": "GET", "path": "/oauth/github/status"}},
+            {"allow": {"method": "POST", "path": "/oauth/github/start"}},
+            {"allow": {"method": "POST", "path": "/oauth/github/disconnect"}},
             {"allow": {"method": "POST", "path": "/cli/run"}},
-            {"allow": {"method": "POST", "path": "/cli/jobs"}},
             {"allow": {"method": "POST", "path": "/shell/run"}},
-            {"allow": {"method": "POST", "path": "/shell/jobs"}},
         ]
         if expected_rules != governed_routes:
             raise ValidationError(

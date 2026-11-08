@@ -55,5 +55,30 @@ cp "$bundle/examples/inputs.json" inputs-1.3.0.json
 "$tool" reconcile --bundle "$bundle" --inputs inputs-1.3.0.json --output rendered-profiles
 ```
 
+## Rollback to 1.2.2
+
+Disable remote shell first, then stop the Steward controller and apiserver.
+Restore the retained 1.2.2 rendered profiles under their existing IDs and
+restore the previous profile digests in Steward. Restore the previous Steward
+and MCP-GW configuration together, then restart the controller and apiserver.
+Do not use the standalone installer for this same-ID rollback.
+
 Verify the release asset digest and GitHub attestation against the exact
 repository and source commit before rendering or installation.
+
+## Verify a released bundle before rendering or installation
+
+Use the release handoff's exact asset digest, source repository and exact source commit,
+plus the signer identity:
+
+```sh
+gh attestation verify "$asset" \
+  --repo "$repository" \
+  --cert-identity "$signer_identity" \
+  --format json > "${asset}.provenance.json"
+actual_digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+test "$actual_digest" = "$expected_digest"
+```
+
+Confirm the provenance binds the expected repository and commit. A source-only validation
+does not make an asset eligible for release.

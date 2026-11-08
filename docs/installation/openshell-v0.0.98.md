@@ -1,6 +1,6 @@
 # OpenShell 0.0.98 governed execution
 
-Steward v0.3.28 supports the stock OpenShell v0.0.98 release with the
+Steward v0.3.29 supports the stock OpenShell v0.0.98 release with the
 sidecar supervisor topology. This is the supported compatibility shape for
 this patch line; it does not require a patched OpenShell image.
 

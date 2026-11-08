@@ -7,10 +7,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.29] - 2026-11-08
+
+Steward v0.3.29 adds governed CLI and remote-shell commands to agent sandboxes, signs
+deployment-owned remote-shell targets for MCP-GW v0.8.0, and lets administrators select a reviewed
+steward-run workflow reference without editing every generated caller.
+
 ### Added
 
 - The Codex reference sandbox now includes checksum-pinned `kubectl` and
-  `remote-shell` wrappers from MCP-GW 0.7.5. Approved Task grants expose only
+  `remote-shell` wrappers from MCP-GW 0.8.0. Approved Task grants expose only
   the matching same-origin command URLs in the agent environment; the wrappers
   select explicit helper operations, and the adapters provide the non-secret
   network substitution marker that OpenShell replaces only
@@ -50,18 +56,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   mapping affects only Tasks created afterward; a running Task keeps its snapshotted mapping and may
   continue receiving tokens for it. Revoke remote shell from a running Task by cancelling or
   terminating it, removing its grant, or disabling remote shell at the gateway. Roll back by
-  disabling remote shell first, then restore the previous Steward and MCP-GW configuration together
-  because MCP-GW v0.8.0 refuses tokens without the signed mapping while older gateways do not consume
-  it.
-- No configuration or data migration is required. Existing installations keep exact-commit
-  rendering. Administrators who control an in-organization steward-run copy may add `workflowRef`
-  and move that ref as they upgrade the copy. Remove the field before rolling back because older
-  Steward releases reject the unknown field. Generated caller files already committed with the ref
-  continue to follow it until they are regenerated with exact-commit rendering. Setting, changing,
-  or removing `workflowRef` in `remote` mode changes the generated caller, so browser-published
-  Tasks merged before the configuration change stop matching and **Run on GitHub** remains
-  unavailable for them until the caller is updated. Moving the configured ref itself does not
-  change the caller or its match.
+  disabling remote shell first. Stop the controller and apiserver, restore the retained 1.2.2
+  rendered profiles under their existing IDs and their previous digests, restore the previous
+  Steward and MCP-GW configuration together, and then restart both consumers. MCP-GW v0.8.0 refuses
+  tokens without the signed mapping while older gateways do not consume it.
+- Existing installations must migrate the runtime-provider profiles from 1.2.2 to 1.3.0; the
+  standalone installer cannot perform this same-ID transition. Enable OpenShell's global
+  `providers_v2_enabled=true` setting, stop the controller and apiserver, retain the prior rendered
+  profiles, and run `cargo xtask provider-profile-bundle upgrade --from-inputs inputs-1.2.2.json
+  --inputs inputs-1.3.0.json --output rendered-profiles` from the exact v0.3.29 source revision.
+  Re-apply both profiles under their existing IDs, rerun the platform preflight, update Steward with
+  the regenerated profile digests, and then restart both consumers. No database migration is
+  required.
+- Existing installations keep exact-commit rendering. Administrators who control an
+  in-organization steward-run copy may add `workflowRef` and move that ref as they upgrade the copy.
+  Remove the field before rolling back because older Steward releases reject the unknown field.
+  Generated caller files already committed with the ref continue to follow it until they are
+  regenerated with exact-commit rendering. Setting, changing, or removing `workflowRef` in `remote`
+  mode changes the generated caller, so browser-published Tasks merged before the configuration
+  change stop matching and **Run on GitHub** remains unavailable for them until the caller is
+  updated. Moving the configured ref itself does not change the caller or its match.
 
 ## [0.3.28] - 2026-11-05
 
@@ -1807,7 +1821,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.28...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.29...HEAD
+[0.3.29]: https://github.com/apelogic-ai/steward/compare/v0.3.28...v0.3.29
 [0.3.28]: https://github.com/apelogic-ai/steward/compare/v0.3.27...v0.3.28
 [0.3.27]: https://github.com/apelogic-ai/steward/compare/v0.3.26...v0.3.27
 [0.3.26]: https://github.com/apelogic-ai/steward/compare/v0.3.25...v0.3.26

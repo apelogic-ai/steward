@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.28`. The release workflow pulls the published OCI
+Release contract: chart `0.3.29`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -279,7 +279,7 @@ v0.7.0 or later and immutable commits. The deprecated
 `governedJobContainerImage` field remains accepted for older installation
 values, but the active versioned workflow generator does not use it. This value
 records the reviewed steward-run release selected for the installation. The
-`workflowRef` option below is an unreleased addition after chart 0.3.28.
+`workflowRef` option below is available beginning with chart 0.3.29.
 
 For the default `remote` mode, omit the optional `workflowRef` to keep generated
 callers pinned to `workflowCommit`. An installation may instead set a non-empty
@@ -671,7 +671,7 @@ preserve the same immutable coordinates and cross-component relationships.
    versioned bundle, extract the attested release asset and use its bundled
    `bin/steward-provider-profile` executable to validate, install, and reconcile
    the deployment-neutral inputs as shown in the
-   [bundle guide](../../config/provider-profile-bundle/v1.2.2/README.md). The
+   [bundle guide](../../config/provider-profile-bundle/v1.3.0/README.md). The
    released tool is self-contained for `linux/amd64`; no Steward checkout or
    Rust toolchain is required.
    Record each installed profile ID and immutable policy digest in the
@@ -684,27 +684,29 @@ preserve the same immutable coordinates and cross-component relationships.
    `providers_v2_enabled=true` setting. Both the controller and apiserver are
    profile consumers: stop both for the bounded in-place transition, then
    restart both only after the profiles and regenerated execution-binding
-   digests agree. Bundle 1.2.2 uses the single `config.mint.audience` for both
-   inference and MCP token grants; permits the complete MCP transport set,
-   including `DELETE` for session close; and rejects unsupported unrestricted,
+   digests agree. Bundle 1.3.0 uses the single `config.mint.audience` for both
+   inference and MCP token grants; permits only the exact MCP transport,
+   connections-bridge, governed CLI, and remote-shell routes; requires the
+   bridge and sandbox-helper binaries; and rejects unsupported unrestricted,
    IPv4 loopback, IPv4 link-local, IPv6 unspecified, IPv6 loopback, IPv6
    link-local, and IPv4-mapped blocked CIDRs. For a fresh installation, do not
    mutate an installed profile ID in place.
 
    Upgrading an existing installation is a governed exception. Before the Helm
    upgrade, stop both profile consumers and use a checkout of the exact
-   Steward v0.3.4 tag to run every required transition. A v0.3.2 installation
-   runs 1.2.0-to-1.2.1 and then 1.2.1-to-1.2.2; it does not require an
-   intermediate Helm upgrade to Steward v0.3.3. A v0.3.3 installation runs only
-   1.2.1-to-1.2.2. Re-apply the rendered profiles under their existing IDs,
-   rerun platform preflight with
+   Steward v0.3.4 tag to reach bundle 1.2.2. A v0.3.2 installation runs
+   1.2.0-to-1.2.1 and then 1.2.1-to-1.2.2; it does not require an intermediate
+   Helm upgrade to Steward v0.3.3. A v0.3.3 installation runs only
+   1.2.1-to-1.2.2. Then use the exact Steward v0.3.29 source to run the
+   1.2.2-to-1.3.0 transition. Re-apply the rendered profiles under their
+   existing IDs, rerun platform preflight with
    `execution.endpoints.mintAudience` equal to `config.mint.audience`, and use
    the regenerated Helm values and execution-binding digests for `helm
    upgrade`. Restart both consumers only after the upgrade succeeds. The
    released standalone installer remains the no-checkout path for fresh
-   installs; it does not implement either transition. A v0.3.2 installation
-   must apply both transitions in order. See the
-   [current upgrade sequence](../../config/provider-profile-bundle/v1.2.2/README.md).
+   installs; it does not implement same-ID transitions. A v0.3.2 installation
+   must apply all three transitions in order. See the
+   [current upgrade sequence](../../config/provider-profile-bundle/v1.3.0/README.md).
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
