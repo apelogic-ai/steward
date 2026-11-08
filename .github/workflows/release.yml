@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.28"
+          test "$version" = "0.3.29"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -902,10 +902,10 @@ jobs:
                 }
               },
               providerProfileBundle: {
-                identity: "steward-runtime-providers@1.2.2",
+                identity: "steward-runtime-providers@1.3.0",
                 digest: $provider_digest,
                 installer: {
-                  path: "provider-profile-bundle/v1.2.2/bin/steward-provider-profile",
+                  path: "provider-profile-bundle/v1.3.0/bin/steward-provider-profile",
                   os: "linux",
                   architecture: "amd64"
                 }
@@ -970,20 +970,19 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.28 sends deployment-configured LiteLLM model IDs and aliases unchanged through Codex, Claude Code, model checks, pricing, and runtime-key allowlists. Bare deployment aliases work without an added provider prefix, while already-qualified aliases remain compatible.\n\n'
-            printf 'Agent Runs now derives each run\x27s spend from the runtime key\x27s LiteLLM request logs instead of its key budget counter. The run list and detail show total tokens when LiteLLM reports them and show Not reported when request logs cannot prove spend or token usage. The LiteLLM management credential must be able to read logs for runtime key hashes. Budget enforcement continues if that read is refused, but spend and tokens show as Not reported. Reads default to a 10-second deadline configurable through config.controller.litellmSpendLogTimeoutSeconds.\n\n'
-            printf 'The pinned upstream lane now proves bare aliases against digest-pinned LiteLLM v1.93.0 and PostgreSQL services using separate Steward-provisioned Claude Code and Codex runtime keys, reciprocal cross-alias refusals, request-log evidence, revocation, and owned-resource cleanup.\n\n'
+            printf 'Steward v0.3.29 adds checksum-pinned kubectl and remote-shell commands from MCP-GW 0.8.0 to the Codex reference sandbox. Approved Task grants expose only their matching same-origin command URLs. Provider-profile bundle 1.3.0 permits the existing MCP and connections routes plus exact POST /cli/run and POST /shell/run routes; prefix, sibling, detached-job, alternate-method, alternate-host, unrelated-grant, and unapproved-command requests remain refused.\n\n'
+            printf 'Deployment execution bindings may now map remote-shell roles to EC2 instance IDs. Steward validates and snapshots that mapping and signs it into a runtime token only with the exact remote-shell/remote_shell_run/write grant. Agent, Task, and harness inputs cannot add or widen targets, and missing, malformed, sibling-grant, cross-runtime, control-plane, and mismatched-agent cases receive no usable target claim. MCP-GW v0.8.0 consumes this signed mapping.\n\n'
+            printf 'Administrators may optionally configure config.apiserver.stewardRunRelease.workflowRef for versioned and direct-package remote callers. Generated workflows then use the configured repository and ref while recording the verified commit as their reviewed baseline. Empty references and values that could add YAML fields are refused; vendored callers remain exact-commit rendered.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Before upgrading, back up the database and add every bare alias used by the Steward model catalog to LiteLLM with pricing while keeping the existing qualified aliases available for rollback. Stop new Task submissions, then let every Task created before the upgrade finish or re-create it after the upgrade before resuming submissions. Deploy the chart, component images, and reference runtimes as one release unit, then update mirrored runtime digests and execution bindings to the v0.3.28 artifacts.\n\n'
-            printf 'Steward automatically applies additive migration 0076 for request-log spend and nullable token usage on new spend observations. Historical rows remain readable and show unavailable spend and token usage instead of presenting virtual-key counters as per-run usage; no manual data migration is required.\n\n'
-            printf 'Before rolling back to v0.3.27, stop submissions and finish or re-create active Tasks against the restored model names. Remove config.controller.litellmSpendLogTimeoutSeconds from Helm values and keep qualified LiteLLM aliases available until rollback is complete. Steward v0.3.27 does not recognize migration 0076, so restore the pre-upgrade database backup to a new database target and point v0.3.27 at that target before starting it. Records written after the upgrade are not in the backup; preserve any audit or decision records that must be retained before rolling back.\n\n'
-            printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
-            printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
+            printf 'Upgrade MCP-GW to v0.8.0 and Steward together before enabling remote shell. Add remoteShellTargets to the selected deployment execution binding and regenerate its digest. Mapping changes affect only Tasks created afterward because a running Task keeps its snapshot. Revoke remote shell from a running Task by cancelling or terminating it, removing its grant, or disabling remote shell at the gateway. Before rollback, disable remote shell; stop the controller and apiserver; restore the retained 1.2.2 profiles under their existing IDs and their previous digests; restore the previous Steward and MCP-GW configuration together; and then restart both consumers.\n\n'
+            printf 'Existing installations must perform the 1.2.2 to 1.3.0 same-ID provider-profile transition; the standalone installer cannot perform it. Enable the OpenShell providers_v2_enabled setting, stop the controller and apiserver, retain the prior rendered profiles, and run cargo xtask provider-profile-bundle upgrade with the 1.2.2 and 1.3.0 inputs from the exact v0.3.29 source revision. Re-apply both profiles under their existing IDs, rerun the platform preflight, update Steward with the regenerated profile digests, and then restart both consumers. No database migration is added by this release.\n\n'
+            printf 'Existing installations keep exact-commit workflow rendering. An installation that enables workflowRef must remove the field before rolling back because v0.3.28 rejects it. Generated caller files already committed with the ref continue to follow it until they are regenerated.\n\n'
+            printf 'The provider-profile bundle is 1.3.0. It retains the existing MCP transport and GitHub connections-bridge routes and adds only the exact governed CLI and remote-shell run routes.\n\n'
             printf '## Required action\n\n'
-            printf 'Back up the database before upgrading. Add bare LiteLLM aliases with pricing, retain qualified aliases for rollback, confirm the management credential can read request logs, and adjust config.controller.litellmSpendLogTimeoutSeconds only if the default 10-second deadline is unsuitable. Stop new Task submissions and finish or re-create every pre-upgrade Task. After deployment, update mirrored v0.3.27 reference runtimes and execution bindings to the v0.3.28 artifacts before resuming governed runs.\n\n'
+            printf 'Update mirrored v0.3.28 reference runtimes and execution bindings to the v0.3.29 artifacts. Fresh installations install provider-profile bundle 1.3.0; existing installations follow its documented 1.2.2 to 1.3.0 same-ID transition. Install MCP-GW v0.8.0 before enabling remote shell, then configure the deployment-owned target mapping and exact grant. If workflowRef is enabled, review its repository, ref, and reusable-workflow version together before regenerating callers.\n\n'
             printf '## Acceptance\n\n'
-            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job. Pinned CI separately exercises the real LiteLLM alias, key-isolation, and spend proof.\n\n'
+            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, exact command-route and signed-target refusals, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
             for component in apiserver controller mint trigger-receiver bridge web; do
               printf '| %s | %s:%s-%s | %s |\n' \
@@ -1013,12 +1012,12 @@ jobs:
             printf 'Bridge attestation bundle: bridge-attestation-bundle.jsonl\n\n'
             printf '\n## Provider-profile bundle provenance inputs\n\n'
             printf 'Provider profile bundle asset: %s\n\n' "$provider_profile_bundle_asset"
-            printf 'Provider profile bundle identity: steward-runtime-providers@1.2.2\n\n'
+            printf 'Provider profile bundle identity: steward-runtime-providers@1.3.0\n\n'
             printf 'Provider profile bundle SHA-256: %s\n\n' "$provider_profile_bundle_digest"
             printf 'Provider profile bundle signer identity: %s\n\n' "$bridge_signer_identity"
             printf 'Provider profile bundle source repository: %s\n\n' "$bridge_source_repository"
             printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
-            printf 'Provider profile installer: provider-profile-bundle/v1.2.2/bin/steward-provider-profile (linux/amd64)\n\n'
+            printf 'Provider profile installer: provider-profile-bundle/v1.3.0/bin/steward-provider-profile (linux/amd64)\n\n'
             printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
             printf '\n## Registry mirror and deployment lock\n\n'
             printf 'Mirror tool asset: %s\n\n' "$mirror_asset"
@@ -1061,7 +1060,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.28.json
+          subject-path: dist/steward-product-compatibility-0.3.29.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1071,7 +1070,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.28.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.29.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

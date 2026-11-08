@@ -34,13 +34,13 @@ output processing:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
-| `kubectl` | MCP-GW 0.7.5 helper | Governed Kubernetes commands |
-| `remote-shell` | MCP-GW 0.7.5 helper | Governed commands on a run-bound machine |
+| `kubectl` | MCP-GW 0.8.0 helper | Governed Kubernetes commands |
+| `remote-shell` | MCP-GW 0.8.0 helper | Governed commands on a run-bound machine |
 | `uv` | 0.11.15 | Python project and package management |
 
 ## Governed commands and sign-in
 
-The reference image installs the checksum-pinned MCP-GW 0.7.5 sandbox helper
+The reference image installs the checksum-pinned MCP-GW 0.8.0 sandbox helper
 at `/usr/local/bin/mcp-gw-sandbox-helper`. The `kubectl` and `remote-shell`
 wrappers select the matching helper operation explicitly; the helper does not
 contain a gateway credential or implement a second sign-in flow.

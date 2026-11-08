@@ -1,7 +1,7 @@
 # Execution bindings
 
-Status: current Steward 0.3.28 installation contract, with the Unreleased `remoteShellTargets`
-extension called out below
+Status: current Steward 0.3.29 installation contract, including the `remoteShellTargets`
+extension described below
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding
@@ -137,14 +137,16 @@ under the exact configured IDs. Compute the configured digest from the immutable
 used by that installation and promote ID plus digest together; never mutate an installed ID in
 place.
 
-The documented 1.2.0-to-1.2.1 and 1.2.1-to-1.2.2 provider-profile transitions
-are the sole exceptions for this release. Connection operations select the
-fixed `steward-mcp-gw` ID without an execution binding, so each transition must
-stop both consumers (controller and apiserver), replace the bounded policies
-under their existing IDs, rerun platform preflight to regenerate the binding
-digests, upgrade Steward, and then restart both consumers. Bundle 1.2.2 adds
-only the missing MCP `DELETE` session-close transport rule. Do not generalize
-these bounded transitions to other profile changes.
+The documented 1.2.0-to-1.2.1, 1.2.1-to-1.2.2, and 1.2.2-to-1.3.0
+provider-profile transitions are the sole exceptions for this release.
+Connection operations select the fixed `steward-mcp-gw` ID without an execution
+binding, so each transition must stop both consumers (controller and apiserver),
+replace the bounded policies under their existing IDs, rerun platform preflight
+to regenerate the binding digests, upgrade Steward, and then restart both
+consumers. Bundle 1.3.0 replaces the broad MCP transport policy with the exact
+MCP, connections-bridge, governed CLI, and remote-shell routes and requires the
+sandbox helper. Do not generalize these bounded transitions to other profile
+changes.
 
 For an interpreted or launcher-based agent, conformance must identify the process that actually
 opens the governed connection. The provider profile must authorize that executable identity; do

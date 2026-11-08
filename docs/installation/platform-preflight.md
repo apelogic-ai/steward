@@ -1,8 +1,8 @@
 # Platform preflight bundle
 
-Status: **Supported for Steward v0.3.28**
+Status: **Supported for Steward v0.3.29**
 
-The release asset `steward-platform-preflight-0.3.28.tar.gz` contains a
+The release asset `steward-platform-preflight-0.3.29.tar.gz` contains a
 dependency-free Python validator and generator, its input schema, and neutral
 examples. It converts one reviewed non-secret input into deterministic Steward
 Helm values, a Flux-compatible values `ConfigMap`, machine diagnostics, and a
@@ -17,12 +17,12 @@ and NetworkPolicy API/PostgreSQL destinations. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
-tar -xzf steward-platform-preflight-0.3.28.tar.gz
-tar -xzf steward-runtime-providers-0.3.28.tar.gz
+tar -xzf steward-platform-preflight-0.3.29.tar.gz
+tar -xzf steward-runtime-providers-0.3.29.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/governed-complete.json \
-  --provider-profile-bundle ../../provider-profile-bundle/v1.2.2 \
+  --provider-profile-bundle ../../provider-profile-bundle/v1.3.0 \
   --chart /path/to/steward-chart \
   --output rendered
 ```
@@ -38,11 +38,12 @@ installer in validation mode and puts its computed profile digests into the
 execution binding; deployment input cannot substitute unrelated profile
 digests. It also inspects the rendered profiles: the MCP-GW endpoint must
 match the connections-bridge origin by host and effective port, the MCP
-transport must admit `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`, and
-`DELETE`, every token grant must use the configured single Mint audience,
-OpenShell always-blocked CIDR overlaps are rejected, and the
-bridge binary must be present. Mismatched MCP origins, Mint audiences, or
-provider CIDRs fail before Helm output is emitted. The input
+transport must admit only its exact MCP, connections-bridge, governed CLI, and
+remote-shell routes, every token grant must use the configured single Mint
+audience, OpenShell always-blocked CIDR overlaps are rejected, and both the
+bridge and sandbox-helper binaries must be present. Mismatched MCP origins,
+Mint audiences, provider routes, or provider CIDRs fail before Helm output is
+emitted. The input
 embeds the exact
 `steward.deployment-lock/v1` document produced by the released registry mirror
 tool, so component, bridge, and coding-agent coordinates require no manual

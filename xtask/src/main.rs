@@ -1414,7 +1414,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.28" => Ok(true),
+            "0.3.29" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -3676,7 +3676,7 @@ mod tests {
             "Verify authenticated OpenShell adapter on linux/amd64",
             "cargo xtask e2e-openshell-adapter",
             "Provider profile bundle asset:",
-            "Provider profile bundle identity: steward-runtime-providers@1.2.2",
+            "Provider profile bundle identity: steward-runtime-providers@1.3.0",
             "Provider profile bundle SHA-256:",
             "Provider profile bundle signer identity:",
             "Provider profile bundle source repository:",
@@ -3726,9 +3726,9 @@ mod tests {
             "--numeric-owner",
             "--format=ustar",
             "gzip -n",
-            "provider-profile-bundle/v1.2.2/bundle.json",
-            "provider-profile-bundle/v1.2.2/profiles/steward-litellm.json",
-            "provider-profile-bundle/v1.2.2/profiles/steward-mcp-gw.json",
+            "provider-profile-bundle/v1.3.0/bundle.json",
+            "provider-profile-bundle/v1.3.0/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json",
             "sha256sum",
         ] {
             assert!(
@@ -3748,7 +3748,7 @@ mod tests {
             );
         }
         let bundle_readme =
-            fs::read_to_string(root().join("config/provider-profile-bundle/v1.2.2/README.md"))
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1.3.0/README.md"))
                 .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
         for required in [
             "Verify a released bundle before rendering or installation",
@@ -5773,7 +5773,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.28")
+            Some("0.3.29")
         );
         assert_eq!(
             manifest
@@ -5894,8 +5894,8 @@ mod tests {
 
         for required in [
             "ARG TARGETARCH",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.7.5/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
             "26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34",
             "0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4",
             "sha256sum --check --strict",
@@ -5972,7 +5972,7 @@ mod tests {
             );
         }
         for required in [
-            "MCP-GW 0.7.5",
+            "MCP-GW 0.8.0",
             "`MCP_GW_RUN_TOKEN` is not present in the agent environment",
             "non-secret `openshell-token-grant-placeholder` marker",
             "MCP_GW_CLI_URL",

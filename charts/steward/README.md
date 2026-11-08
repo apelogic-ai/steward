@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.28` and application `0.3.28`.
+Current release contract: chart `0.3.29` and application `0.3.29`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -758,7 +758,7 @@ Steward release namespace also creates `steward-workflows`.
   remain enforced at Task admission.
 - `config.apiserver.stewardRunRelease` contains the exact verified steward-run handoff selected by
   the installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
-  and action commit. The unreleased source after chart 0.3.28 also lets an installation add a
+  and action commit. Chart 0.3.29 also lets an installation add a
   non-empty `workflowRef`; remote generated workflows then use that ref while retaining the required
   verified commit as their reviewed baseline and recording the effective ref separately. Omit it to
   preserve the exact-commit default. Use it only for an in-organization steward-run copy whose
