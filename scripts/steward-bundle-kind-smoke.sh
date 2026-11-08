@@ -17,6 +17,8 @@ kubeconfig="${run_dir}/kubeconfig"
 prepared="${run_dir}/steward-bundle"
 rendered="${run_dir}/rendered.yaml"
 inventory="${run_dir}/ownership.txt"
+helm_status="${run_dir}/helm-status.txt"
+spiffe_identities="${run_dir}/clusterspiffeids.txt"
 cluster_created=0
 
 cleanup() {
@@ -100,8 +102,9 @@ helm template bundle "${bundle_chart}" --namespace steward-test \
 helm --kubeconfig "${kubeconfig}" --kube-context "${context}" \
   install bundle "${bundle_chart}" --namespace steward-test --timeout 5m
 
-if ! helm --kubeconfig "${kubeconfig}" --kube-context "${context}" \
-  status bundle --namespace steward-test | grep -Fq 'STATUS: deployed'; then
+helm --kubeconfig "${kubeconfig}" --kube-context "${context}" \
+  status bundle --namespace steward-test >"${helm_status}"
+if ! grep -Fq 'STATUS: deployed' "${helm_status}"; then
   echo 'steward-bundle Helm release did not reach deployed status' >&2
   exit 1
 fi
@@ -120,8 +123,8 @@ while IFS= read -r crd; do
   "${K[@]}" get customresourcedefinition "${crd}" >/dev/null
 done <"${run_dir}/crds.txt"
 
-if ! "${K[@]}" get clusterspiffeids.spire.spiffe.io -o name \
-  | grep -Fq 'clusterspiffeid.spire.spiffe.io/'; then
+"${K[@]}" get clusterspiffeids.spire.spiffe.io -o name >"${spiffe_identities}"
+if ! grep -Fq 'clusterspiffeid.spire.spiffe.io/' "${spiffe_identities}"; then
   echo 'steward-bundle installed SPIRE CRDs but no governed identity object' >&2
   exit 1
 fi
