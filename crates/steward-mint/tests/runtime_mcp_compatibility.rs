@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::future::{Future, ready};
+use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 use jwt_compact::alg::Ed25519;
@@ -253,6 +254,26 @@ async fn remote_shell_targets_require_the_exact_grant_and_trusted_binding() -> R
             resource: "remote_shell_run".to_owned(),
             action: "write".to_owned(),
         },
+        ToolGrant {
+            provider: "Remote-Shell".to_owned(),
+            resource: "remote_shell_run".to_owned(),
+            action: "write".to_owned(),
+        },
+        ToolGrant {
+            provider: "remote-shell ".to_owned(),
+            resource: "remote_shell_run".to_owned(),
+            action: "write".to_owned(),
+        },
+        ToolGrant {
+            provider: "remote-shell".to_owned(),
+            resource: "REMOTE_SHELL_RUN".to_owned(),
+            action: "write".to_owned(),
+        },
+        ToolGrant {
+            provider: "remote-shell".to_owned(),
+            resource: "remote_shell_run".to_owned(),
+            action: "WRITE".to_owned(),
+        },
     ] {
         let mut sibling = remote_shell_runtime(false, Some(targets.clone()))?;
         sibling.spec.tools = vec![grant];
@@ -341,6 +362,134 @@ impl AuthorityResolver for S5Resolver {
         };
         ready(authority)
     }
+}
+
+#[derive(Clone)]
+struct MutableS5Resolver(Arc<Mutex<AgentRuntime>>);
+
+impl AuthorityResolver for MutableS5Resolver {
+    fn resolve(
+        &self,
+        workload: &ValidatedWorkload,
+    ) -> impl Future<Output = Result<AuthorityBinding, MintError>> + Send {
+        let authority = if workload.spiffe_id == S5_WORKLOAD {
+            self.0
+                .lock()
+                .map_err(|_| MintError::AuthorityUnavailable)
+                .and_then(|runtime| {
+                    authority_from_runtime_refs(
+                        workload,
+                        S5_WORKSPACE,
+                        S5_SANDBOX,
+                        std::slice::from_ref(&*runtime),
+                    )
+                })
+        } else {
+            Err(MintError::WorkloadMismatch)
+        };
+        ready(authority)
+    }
+}
+
+#[tokio::test]
+async fn mismatched_binding_agent_ref_omits_targets_and_invalidates_issued_authority()
+-> Result<(), String> {
+    let targets = serde_json::json!({
+        "engineer": "i-0123456789abcdef0"
+    });
+    let runtime = Arc::new(Mutex::new(remote_shell_runtime(
+        true,
+        Some(targets.clone()),
+    )?));
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifier = signing_key.verifying_key();
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://steward-mint.example.org".to_owned(),
+            audience: "steward-mcp".to_owned(),
+            allowed_scopes: vec!["mcp".to_owned()],
+            svid_audience: "steward-mint".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "preview-introspection".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        S5Validator,
+        MutableS5Resolver(runtime.clone()),
+    )
+    .map_err(|error| format!("create mutable remote-shell mint: {error:?}"))?;
+
+    let request = || TokenGrantRequest {
+        grant_type: "client_credentials".to_owned(),
+        client_assertion_type: SPIFFE_CLIENT_ASSERTION_TYPE.to_owned(),
+        client_assertion: SvidAssertion::new("fixture-svid".to_owned()),
+        audience: "steward-mcp".to_owned(),
+        scope: vec!["mcp".to_owned()],
+    };
+    let issued = mint
+        .exchange(request())
+        .await
+        .map_err(|error| format!("mint matching remote-shell token: {error:?}"))?;
+    let untrusted = UntrustedToken::new(issued.access_token())
+        .map_err(|error| format!("parse matching remote-shell token: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifier)
+        .validate(&untrusted)
+        .map_err(|error| format!("verify matching remote-shell token: {error}"))?;
+    assert_eq!(
+        token.claims().custom["steward"]["remote_shell_targets"],
+        targets
+    );
+
+    {
+        let mut runtime = runtime
+            .lock()
+            .map_err(|_| "mutable runtime fixture mutex poisoned".to_owned())?;
+        let annotations = runtime
+            .metadata
+            .annotations
+            .as_mut()
+            .ok_or_else(|| "runtime fixture has no annotations".to_owned())?;
+        let binding = annotations
+            .get_mut(TASK_EXECUTION_BINDING_ANNOTATION)
+            .ok_or_else(|| "runtime fixture has no execution binding".to_owned())?;
+        let mut binding_value: serde_json::Value =
+            serde_json::from_str(binding).map_err(|error| format!("parse binding: {error}"))?;
+        binding_value["agentRef"] = serde_json::json!("other-agent@1.0.0");
+        *binding = binding_value.to_string();
+    }
+
+    let hop1: Hop1Token = serde_json::from_value(serde_json::json!(issued.access_token()))
+        .map_err(|error| format!("construct HOP-1 fixture: {error}"))?;
+    let introspection = mint
+        .introspect(&hop1)
+        .await
+        .map_err(|error| format!("introspect mismatched agent binding: {error:?}"))?;
+    let introspection = serde_json::to_value(introspection)
+        .map_err(|error| format!("serialize introspection response: {error}"))?;
+    assert_eq!(
+        introspection["active"], false,
+        "a previously issued target token must become inactive when the trusted binding no longer matches its agent"
+    );
+
+    let refused = mint
+        .exchange(request())
+        .await
+        .map_err(|error| format!("mint mismatched remote-shell token: {error:?}"))?;
+    let untrusted = UntrustedToken::new(refused.access_token())
+        .map_err(|error| format!("parse mismatched remote-shell token: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifier)
+        .validate(&untrusted)
+        .map_err(|error| format!("verify mismatched remote-shell token: {error}"))?;
+    assert!(
+        token.claims().custom["steward"]
+            .get("remote_shell_targets")
+            .is_none(),
+        "a trusted binding for another agent must mint no target authority"
+    );
+    Ok(())
 }
 
 /// Models the production resolver's security boundary without carrying a

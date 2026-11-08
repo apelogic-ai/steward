@@ -46,10 +46,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Upgrade MCP-GW to v0.8.0 and Steward together before enabling remote shell. Add
   `remoteShellTargets` to the selected deployment execution binding and regenerate its digest; the
-  old mutable tag/Secret target binding is no longer authority. Removing the mapping disables new
-  remote-shell target claims. Roll back by disabling remote shell first, then restore the previous
-  Steward and MCP-GW configuration together because MCP-GW v0.8.0 refuses tokens without the signed
-  mapping while older gateways do not consume it.
+  old mutable tag/Secret target binding is no longer authority. Changing or removing the deployment
+  mapping affects only Tasks created afterward; a running Task keeps its snapshotted mapping and may
+  continue receiving tokens for it. Revoke remote shell from a running Task by cancelling or
+  terminating it, removing its grant, or disabling remote shell at the gateway. Roll back by
+  disabling remote shell first, then restore the previous Steward and MCP-GW configuration together
+  because MCP-GW v0.8.0 refuses tokens without the signed mapping while older gateways do not consume
+  it.
 - No configuration or data migration is required. Existing installations keep exact-commit
   rendering. Administrators who control an in-organization steward-run copy may add `workflowRef`
   and move that ref as they upgrade the copy. Remove the field before rolling back because older

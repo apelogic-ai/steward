@@ -89,8 +89,11 @@ The control-plane token uses `acting_as=service_for_user`,
 `service=steward-apiserver`, the browser user's canonical ID in `sub`, and one exact
 `<provider>/provider-control/status|start` tool grant matching its purpose. The trusted apiserver requests only providers
 from its deployment capability catalog. Ordinary runtime-token claims and their online authority
-revalidation compare the signed target mapping with the current immutable runtime binding, so a
-different or missing binding makes the token inactive.
+revalidation compare the signed target mapping with that running Task's immutable runtime binding,
+so a missing or altered runtime binding makes the token inactive. Editing the deployment execution
+binding affects only Tasks created afterward; it does not replace the snapshot held by a running
+Task. Revoke remote shell from a running Task by cancelling or terminating it, removing its grant,
+or disabling remote shell at the gateway.
 
 Changing or adding a claim changes this wire contract and requires coordinated
 consumer updates under `crates/steward-mint/AGENTS.md`.

@@ -52,6 +52,11 @@ declared role but cannot provide an instance ID, edit the mapping, or borrow ano
 binding. Keep cloud credentials and instance IDs out of Task input, harness configuration, agent
 output, and logs.
 
+Changing the deployment mapping affects only Tasks created afterward. A running Task keeps the
+mapping snapshotted when it was created and may continue receiving tokens for it. To revoke remote
+shell from a running Task, cancel or terminate the Task, remove its remote-shell grant, or disable
+remote shell at the gateway.
+
 This first slice is static per deployment binding. Dynamic per-run allocation through an
 authenticated provisioner is tracked separately in
 [hypershell-platform#78](https://github.com/apelogic-ai/hypershell-platform/issues/78); do not put a
