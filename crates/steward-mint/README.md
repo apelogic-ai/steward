@@ -77,6 +77,10 @@ Steward-specific claims live under `steward`:
 - `service`: the service name for either service mode; absent for users
 - `runtime_uid`: the immutable Kubernetes runtime UID for runtime tokens;
   omitted only for fixed-purpose control-plane tokens
+- `remote_shell_targets`: optional role-to-EC2-instance mapping copied from the deployment-owned,
+  content-bound execution binding. Mint includes it only for a runtime with the exact
+  `remote-shell/remote_shell_run/write` grant. It is absent from control-plane tokens and runtime
+  tokens without both the grant and a valid trusted mapping.
 - `purpose`: omitted for runtime tokens; exactly
   `provider_connection_status` or `provider_connection_start` for the matching control-plane token
 - `tools`: the exact `provider`, `resource`, and `action` attenuation
@@ -85,7 +89,11 @@ The control-plane token uses `acting_as=service_for_user`,
 `service=steward-apiserver`, the browser user's canonical ID in `sub`, and one exact
 `<provider>/provider-control/status|start` tool grant matching its purpose. The trusted apiserver requests only providers
 from its deployment capability catalog. Ordinary runtime-token claims and their online authority
-revalidation are unchanged.
+revalidation compare the signed target mapping with that running Task's immutable runtime binding,
+so a missing or altered runtime binding makes the token inactive. Editing the deployment execution
+binding affects only Tasks created afterward; it does not replace the snapshot held by a running
+Task. Revoke remote shell from a running Task by cancelling or terminating it, removing its grant,
+or disabling remote shell at the gateway.
 
 Changing or adding a claim changes this wire contract and requires coordinated
 consumer updates under `crates/steward-mint/AGENTS.md`.

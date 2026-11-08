@@ -18,6 +18,9 @@
           "example"
         ]
       },
+      "remoteShellTargets": {
+        "engineer": "i-0123456789abcdef0"
+      },
       "providerProfiles": {
         "tools": {
           "id": "example-tools-profile-v7",

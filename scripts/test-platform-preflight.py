@@ -631,6 +631,9 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertIn("audience must equal execution.endpoints.mintAudience", result.stderr)
 
     def test_generate_is_deterministic(self) -> None:
+        self.input["execution"]["binding"]["remoteShellTargets"] = {
+            "engineer": "i-0123456789abcdef0"
+        }
         with tempfile.TemporaryDirectory() as temporary:
             base = pathlib.Path(temporary)
             input_path = base / "input.json"
@@ -655,6 +658,10 @@ class PlatformPreflightTests(unittest.TestCase):
                 rendered_values["config"]["apiserver"]["executionBindings"]["bindings"][0]["models"],
                 {"providers": ["litellm"]},
             )
+            self.assertEqual(
+                rendered_values["config"]["apiserver"]["executionBindings"]["bindings"][0]["remoteShellTargets"],
+                {"engineer": "i-0123456789abcdef0"},
+            )
             profiles = rendered_values["config"]["apiserver"]["executionBindings"]["bindings"][0]["providerProfiles"]
             self.assertEqual(profiles["tools"]["digest"], "sha256:" + "8" * 64)
             self.assertEqual(profiles["inference"]["digest"], "sha256:" + "7" * 64)
@@ -665,6 +672,20 @@ class PlatformPreflightTests(unittest.TestCase):
                 {"steward-mcp"},
             )
             self.assertEqual(rendered_values["config"]["mint"]["audience"], "steward-mcp")
+
+    def test_rejects_malformed_remote_shell_targets(self) -> None:
+        complete = json.loads(COMPLETE.read_text(encoding="utf-8"))
+        for targets in (
+            {"Controller": "i-0123456789abcdef0"},
+            {"engineer": "i-0123456789abcdef"},
+            {"engineer": "host.example.com"},
+            {},
+        ):
+            invalid = copy.deepcopy(complete)
+            invalid["execution"]["binding"]["remoteShellTargets"] = targets
+            result = self.run_validate(invalid)
+            self.assertNotEqual(result.returncode, 0, targets)
+            self.assertIn("execution.binding.remoteShellTargets", result.stderr)
 
     def test_complete_governed_example_emits_and_renders_all_required_values(self) -> None:
         complete = json.loads(COMPLETE.read_text(encoding="utf-8"))

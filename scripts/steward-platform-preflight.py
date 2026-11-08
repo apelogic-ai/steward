@@ -678,6 +678,21 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         raise ValidationError(
             "execution.binding.modelProviders must contain unique non-empty provider identifiers"
         )
+    remote_shell_targets = binding.get("remoteShellTargets")
+    if remote_shell_targets is not None and (
+        not isinstance(remote_shell_targets, dict)
+        or not remote_shell_targets
+        or any(
+            not isinstance(role, str)
+            or re.fullmatch(r"[a-z][a-z0-9-]{0,62}", role) is None
+            or not isinstance(instance_id, str)
+            or re.fullmatch(r"i-[0-9a-f]{8}(?:[0-9a-f]{9})?", instance_id) is None
+            for role, instance_id in remote_shell_targets.items()
+        )
+    ):
+        raise ValidationError(
+            "execution.binding.remoteShellTargets must map valid roles to EC2 instance IDs"
+        )
     runtime_image = binding_images.get(binding["runtimeName"])
     if not isinstance(runtime_image, str) or not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", runtime_image):
         raise ValidationError("execution.binding.runtimeName must select one immutable deploymentLock.executionBindingImages entry")
@@ -867,6 +882,15 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                             "executable": binding["executable"],
                             "versionProbe": {"arguments": ["--version"], "expectedStdout": binding["expectedVersion"]},
                             "models": {"providers": sorted(binding["modelProviders"])},
+                            **(
+                                {
+                                    "remoteShellTargets": dict(
+                                        sorted(binding["remoteShellTargets"].items())
+                                    )
+                                }
+                                if "remoteShellTargets" in binding
+                                else {}
+                            ),
                             "providerProfiles": {
                                 key.removesuffix("Profile"): {
                                     "id": binding[key],

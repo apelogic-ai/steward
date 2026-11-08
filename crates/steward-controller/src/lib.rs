@@ -10610,6 +10610,10 @@ mod webhook_tests {
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
             models: None,
+            remote_shell_targets: std::collections::BTreeMap::from([(
+                "engineer".to_owned(),
+                "i-0123456789abcdef0".to_owned(),
+            )]),
             provider_profiles: ExecutionProviderProfiles::default(),
         });
         execution_binding.validate()?;
@@ -11207,6 +11211,20 @@ mod webhook_tests {
     async fn webhook_admits_only_an_exact_persisted_external_task_create() -> Result<(), String> {
         let admission = persisted_task_runtime_admission()?;
         let value = task_runtime_create_value(&admission)?;
+        let annotation = value["request"]["object"]["metadata"]["annotations"]
+            [TASK_EXECUTION_BINDING_ANNOTATION]
+            .as_str()
+            .ok_or_else(|| "controller runtime has no execution binding annotation".to_owned())?;
+        let projected: DisposableExecutionBinding = serde_json::from_str(annotation)
+            .map_err(|error| format!("parse controller execution binding annotation: {error}"))?;
+        assert_eq!(
+            projected.remote_shell_targets,
+            std::collections::BTreeMap::from([(
+                "engineer".to_owned(),
+                "i-0123456789abcdef0".to_owned(),
+            )]),
+            "the controller must project the persisted target map into its trusted annotation"
+        );
         let mut envelopes = fake_envelopes();
         envelopes.return_envelope = false;
         let review = call_controller_webhook(

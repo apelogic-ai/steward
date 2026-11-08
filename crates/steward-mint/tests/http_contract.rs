@@ -5,18 +5,21 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
+use chrono::Duration as ChronoDuration;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use jwt_compact::{AlgorithmExt, UntrustedToken, alg::Ed25519};
+use jwt_compact::{AlgorithmExt, Claims, Header, TimeOptions, UntrustedToken, alg::Ed25519};
 use rand_core::OsRng;
 use serde_json::Value;
 use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver, AuthorityState,
     ControlPlaneClientCredential, ControlPlaneMintConfig, ControlPlaneWorkloadAuthenticator,
-    DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintError,
-    MintSigningKey, SvidAssertion, SvidValidationError, SvidValidator, ValidatedWorkload,
-    control_plane_router, router,
+    DEFAULT_AUTHORITY_TTL, HOP1_CLAIMS_VERSION, IntrospectionClientCredential, Mint, MintConfig,
+    MintError, MintSigningKey, SvidAssertion, SvidValidationError, SvidValidator,
+    ValidatedWorkload, control_plane_router, router,
 };
-use steward_types::{CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId};
+use steward_types::{
+    CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId, ToolGrant,
+};
 use tower::ServiceExt;
 
 const WORKLOAD: &str = "spiffe://example.org/agent/runtime-a";
@@ -47,6 +50,7 @@ fn active_user_binding() -> Result<AuthorityBinding, String> {
         llms: Vec::new(),
         inference_reference: None,
         tools: Vec::new(),
+        remote_shell_targets: std::collections::BTreeMap::new(),
         state: AuthorityState::Active,
     })
 }
@@ -114,6 +118,7 @@ impl AuthorityResolver for FixedResolver {
                     llms: Vec::new(),
                     inference_reference: None,
                     tools: Vec::new(),
+                    remote_shell_targets: std::collections::BTreeMap::new(),
                     state: AuthorityState::Active,
                 }),
         )
@@ -151,12 +156,20 @@ fn app(
 }
 
 fn control_plane_app() -> Result<(axum::Router, Arc<AtomicUsize>), String> {
-    let (app, calls, _) = control_plane_app_with_verifying_key()?;
+    let (app, _, calls, _, _) = control_plane_apps_with_keys()?;
     Ok((app, calls))
 }
 
-fn control_plane_app_with_verifying_key()
--> Result<(axum::Router, Arc<AtomicUsize>, VerifyingKey), String> {
+fn control_plane_apps_with_keys() -> Result<
+    (
+        axum::Router,
+        axum::Router,
+        Arc<AtomicUsize>,
+        SigningKey,
+        VerifyingKey,
+    ),
+    String,
+> {
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
     let mint = Mint::new(
@@ -192,16 +205,31 @@ fn control_plane_app_with_verifying_key()
     )
     .map_err(|error| format!("control-plane mint config must be valid: {error:?}"))?;
     let calls = Arc::new(AtomicUsize::new(0));
+    let mint = Arc::new(mint);
     Ok((
         control_plane_router(
-            Arc::new(mint),
+            mint.clone(),
             FixedControlPlaneAuthenticator {
                 calls: calls.clone(),
             },
         ),
+        router(mint),
         calls,
+        signing_key,
         verifying_key,
     ))
+}
+
+fn sign_test_hop1(
+    signing_key: &SigningKey,
+    claims: serde_json::Value,
+    ttl: ChronoDuration,
+) -> Result<String, String> {
+    let claims = Claims::new(claims)
+        .set_duration_and_issuance(&TimeOptions::from_leeway(ChronoDuration::zero()), ttl);
+    Ed25519
+        .token(&Header::empty(), &claims, signing_key)
+        .map_err(|error| format!("sign HOP-1 fixture: {error}"))
 }
 
 async fn call(
@@ -384,7 +412,7 @@ async fn control_plane_exchange_issues_one_exact_provider_start_authority() -> R
 #[tokio::test]
 async fn control_plane_exchange_without_provider_keeps_exact_github_status_authority()
 -> Result<(), String> {
-    let (app, _, verifying_key) = control_plane_app_with_verifying_key()?;
+    let (app, _, _, _, verifying_key) = control_plane_apps_with_keys()?;
     let (status, _, response) = call_json_with_authorization(
         app,
         "/control-plane/token",
@@ -410,6 +438,53 @@ async fn control_plane_exchange_without_provider_keeps_exact_github_status_autho
             "resource": "provider-control",
             "action": "status"
         }])
+    );
+    assert!(
+        token.claims().custom["steward"]
+            .get("remote_shell_targets")
+            .is_none(),
+        "control-plane tokens must not gain remote-shell target authority"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_token_carrying_remote_shell_targets_is_inactive() -> Result<(), String> {
+    let (_, introspection_app, _, signing_key, _) = control_plane_apps_with_keys()?;
+    let token = sign_test_hop1(
+        &signing_key,
+        serde_json::json!({
+            "aud": ["mcp-gw.example.test"],
+            "azp": "system:serviceaccount:steward-test:steward-apiserver",
+            "email": "alice@example.com",
+            "iss": "https://mint.example.test",
+            "jti": "control-plane-target-refusal",
+            "steward": {
+                "acting_as": "service_for_user",
+                "service": "steward-apiserver",
+                "purpose": "provider_connection_status",
+                "remote_shell_targets": {
+                    "engineer": "i-0123456789abcdef0"
+                },
+                "tools": [{
+                    "provider": "github",
+                    "resource": "provider-control",
+                    "action": "status"
+                }],
+                "version": HOP1_CLAIMS_VERSION
+            },
+            "sub": CANONICAL_USER
+        }),
+        ChronoDuration::seconds(15),
+    )?;
+    let form = format!("token={token}");
+    let (status, _, introspection) =
+        call_as_gateway(introspection_app, "POST", "/introspect", &form).await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        introspection["active"], false,
+        "control-plane authority must never carry remote-shell targets"
     );
     Ok(())
 }
@@ -620,6 +695,7 @@ impl AuthorityResolver for RevocableResolver {
                     llms: Vec::new(),
                     inference_reference: None,
                     tools: Vec::new(),
+                    remote_shell_targets: std::collections::BTreeMap::new(),
                     state,
                 }),
         )
@@ -678,6 +754,153 @@ async fn already_issued_hop1_is_inactive_immediately_after_revocation() -> Resul
     assert_eq!(
         introspection["active"], false,
         "a consumer check must reject an issued HOP-1 immediately after revocation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn authority_targets_without_exact_grant_are_omitted_and_refused() -> Result<(), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let mut binding = active_user_binding()?;
+    binding.remote_shell_targets = std::collections::BTreeMap::from([(
+        "engineer".to_owned(),
+        "i-0123456789abcdef0".to_owned(),
+    )]);
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["tools".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(ValidatedWorkload {
+                spiffe_id: WORKLOAD.to_owned(),
+            }),
+        },
+        MutableResolver {
+            binding: Arc::new(Mutex::new(binding)),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
+    let app = router(Arc::new(mint));
+
+    let (status, _, token_response) = call(app.clone(), "POST", "/token", VALID_FORM).await?;
+    assert_eq!(status, StatusCode::OK);
+    let encoded = token_response["access_token"]
+        .as_str()
+        .ok_or_else(|| "token exchange must return an access token".to_owned())?;
+    let untrusted =
+        UntrustedToken::new(encoded).map_err(|error| format!("parse issued token: {error}"))?;
+    let issued: jwt_compact::Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("validate issued token: {error}"))?;
+    assert!(
+        issued.claims().custom["steward"]
+            .get("remote_shell_targets")
+            .is_none(),
+        "targets in an authority binding without the exact grant must not be minted"
+    );
+
+    let forged = sign_test_hop1(
+        &signing_key,
+        serde_json::json!({
+            "aud": ["mcp-gw.example.test"],
+            "azp": WORKLOAD,
+            "email": "alice@example.com",
+            "iss": "https://mint.example.test",
+            "jti": "grantless-target-refusal",
+            "steward": {
+                "acting_as": "user",
+                "runtime_uid": "runtime-uid-a",
+                "remote_shell_targets": {
+                    "engineer": "i-0123456789abcdef0"
+                },
+                "tools": [],
+                "version": HOP1_CLAIMS_VERSION
+            },
+            "sub": CANONICAL_USER
+        }),
+        ChronoDuration::seconds(60),
+    )?;
+    let form = format!("token={forged}");
+    let (status, _, introspection) = call_as_gateway(app, "POST", "/introspect", &form).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        introspection["active"], false,
+        "signed targets without the exact grant must be inactive at introspection"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn already_issued_hop1_is_inactive_after_remote_shell_targets_change() -> Result<(), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut initial = active_user_binding()?;
+    initial.tools = vec![ToolGrant {
+        provider: "remote-shell".to_owned(),
+        resource: "remote_shell_run".to_owned(),
+        action: "write".to_owned(),
+    }];
+    initial.remote_shell_targets = std::collections::BTreeMap::from([(
+        "engineer".to_owned(),
+        "i-0123456789abcdef0".to_owned(),
+    )]);
+    let authority = Arc::new(Mutex::new(initial));
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["tools".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(ValidatedWorkload {
+                spiffe_id: WORKLOAD.to_owned(),
+            }),
+        },
+        MutableResolver {
+            binding: authority.clone(),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
+    let app = router(Arc::new(mint));
+    let (status, _, token_response) = call(app.clone(), "POST", "/token", VALID_FORM).await?;
+    assert_eq!(status, StatusCode::OK);
+    let token = token_response["access_token"]
+        .as_str()
+        .ok_or_else(|| "token exchange must return an access token".to_owned())?;
+    let form = format!("token={token}");
+
+    let (status, _, introspection) =
+        call_as_gateway(app.clone(), "POST", "/introspect", &form).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(introspection["active"], true);
+
+    authority
+        .lock()
+        .map_err(|_| "test authority mutex poisoned".to_owned())?
+        .remote_shell_targets
+        .insert("engineer".to_owned(), "i-0abcdef0123456789".to_owned());
+    let (status, _, introspection) = call_as_gateway(app, "POST", "/introspect", &form).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        introspection["active"], false,
+        "changing the trusted role-to-instance map must invalidate issued target authority"
     );
     Ok(())
 }

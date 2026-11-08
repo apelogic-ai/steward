@@ -254,4 +254,9 @@ grep -Fq "bash \"\${root}/scripts/test-steward-bundle-chart.sh\"" \
   exit 1
 }
 
+if grep -Eq '\|[[:space:]]*grep[[:space:]]+-[^[:space:]]*q' "${bundle_harness}"; then
+  echo 'steward-bundle smoke used an early-exit grep on live command output under pipefail' >&2
+  exit 1
+fi
+
 echo 'released-artifact acceptance contract passed'

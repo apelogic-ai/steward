@@ -109,6 +109,7 @@ fn active_binding() -> Result<AuthorityBinding, String> {
         }],
         inference_reference: Some(MANAGED_INFERENCE_REFERENCE.to_owned()),
         tools: Vec::new(),
+        remote_shell_targets: std::collections::BTreeMap::new(),
         state: AuthorityState::Active,
     })
 }
@@ -1021,6 +1022,8 @@ struct TestHop1Claims {
 struct TestStewardClaims {
     acting_as: String,
     runtime_uid: String,
+    #[serde(default)]
+    remote_shell_targets: std::collections::BTreeMap<String, String>,
     service: Option<String>,
     tools: Vec<ToolGrant>,
     version: u8,
@@ -1069,6 +1072,10 @@ async fn active_user_receives_a_versioned_sixty_second_eddsa_hop1() -> Result<()
     assert_eq!(claims.custom.steward.acting_as, "user");
     assert_eq!(claims.custom.steward.service, None);
     assert_eq!(claims.custom.steward.runtime_uid, "runtime-uid-a");
+    assert!(
+        claims.custom.steward.remote_shell_targets.is_empty(),
+        "ordinary HOP-1 tokens must not gain remote-shell target authority"
+    );
     assert_eq!(claims.custom.steward.tools, binding_with_tool()?.tools);
 
     let untrusted = UntrustedToken::new(response.access_token())

@@ -1,6 +1,6 @@
 //! SVID-to-HOP-1 exchange. This crate owns the signing key boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,8 +23,9 @@ pub use steward_ports::{
     SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
 };
 use steward_types::{
-    AgentRuntime, CanonicalAuthorityBinding, MANAGED_INFERENCE_REFERENCE, ModelRef, Phase,
-    Principal, RuntimeId, ToolGrant,
+    AgentRuntime, CanonicalAuthorityBinding, DisposableExecutionBinding,
+    MANAGED_INFERENCE_REFERENCE, ModelRef, Phase, Principal, RuntimeId,
+    TASK_EXECUTION_BINDING_ANNOTATION, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -109,7 +110,41 @@ pub struct AuthorityBinding {
     pub llms: Vec<ModelRef>,
     pub inference_reference: Option<String>,
     pub tools: Vec<ToolGrant>,
+    pub remote_shell_targets: BTreeMap<String, String>,
     pub state: AuthorityState,
+}
+
+fn has_remote_shell_grant(tools: &[ToolGrant]) -> bool {
+    tools.iter().any(|grant| {
+        grant.provider == "remote-shell"
+            && grant.resource == "remote_shell_run"
+            && grant.action == "write"
+    })
+}
+
+fn trusted_remote_shell_targets(runtime: &AgentRuntime) -> BTreeMap<String, String> {
+    if !has_remote_shell_grant(&runtime.spec.tools) {
+        return BTreeMap::new();
+    }
+    runtime
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(TASK_EXECUTION_BINDING_ANNOTATION))
+        .and_then(|serialized| serde_json::from_str::<DisposableExecutionBinding>(serialized).ok())
+        .filter(|binding| {
+            binding.agent_ref == runtime.spec.agent_type.name && binding.validate().is_ok()
+        })
+        .map(|binding| binding.remote_shell_targets)
+        .unwrap_or_default()
+}
+
+fn authorized_remote_shell_targets(authority: &AuthorityBinding) -> BTreeMap<String, String> {
+    if has_remote_shell_grant(&authority.tools) {
+        authority.remote_shell_targets.clone()
+    } else {
+        BTreeMap::new()
+    }
 }
 
 /// Resolve one active authority from the runtime that owns an OpenShell workspace/sandbox pair.
@@ -162,6 +197,7 @@ pub fn authority_from_runtime_refs(
             .as_ref()
             .and_then(|status| status.refs.litellm_key.clone()),
         tools: runtime.spec.tools.clone(),
+        remote_shell_targets: trusted_remote_shell_targets(runtime),
         state: authority_state(runtime.metadata.deletion_timestamp.is_some(), phase),
     })
 }
@@ -569,6 +605,8 @@ struct StewardClaims {
     service: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    remote_shell_targets: BTreeMap<String, String>,
     tools: Vec<ToolGrant>,
     version: u8,
 }
@@ -793,6 +831,7 @@ where
         let authority_ttl = ChronoDuration::from_std(self.config.authority_ttl)
             .map_err(|_| MintError::InvalidRequest)?;
         let time = TimeOptions::from_leeway(ChronoDuration::zero());
+        let remote_shell_targets = authorized_remote_shell_targets(&authority);
         let claims = Claims::new(Hop1Claims {
             aud: vec![self.config.audience.clone()],
             azp: workload.spiffe_id,
@@ -804,6 +843,7 @@ where
                 runtime_uid: Some(authority.runtime.0),
                 service: identity.service,
                 purpose: None,
+                remote_shell_targets,
                 tools: authority.tools,
                 version: HOP1_CLAIMS_VERSION,
             },
@@ -863,6 +903,7 @@ where
                 runtime_uid: None,
                 service: Some(CONTROL_PLANE_SERVICE.to_owned()),
                 purpose: Some(request.purpose.claim().to_owned()),
+                remote_shell_targets: BTreeMap::new(),
                 tools: vec![control_plane_grant],
                 version: HOP1_CLAIMS_VERSION,
             },
@@ -949,6 +990,7 @@ where
                     )
                     .is_some_and(|provider| config.allowed_status_providers.contains(provider))
                     && claims.custom.steward.version == HOP1_CLAIMS_VERSION
+                    && claims.custom.steward.remote_shell_targets.is_empty()
                     && claims.custom.email.is_some()
                     && !claims.custom.sub.is_empty()
             });
@@ -1001,6 +1043,8 @@ where
             && authority.workload_id == claims.custom.azp
             && claims.custom.steward.purpose.is_none()
             && claims.custom.steward.runtime_uid.as_deref() == Some(authority.runtime.0.as_str())
+            && claims.custom.steward.remote_shell_targets
+                == authorized_remote_shell_targets(&authority)
             && authority.tools == claims.custom.steward.tools
             && claims.custom.steward.version == HOP1_CLAIMS_VERSION
             && principal_matches;
