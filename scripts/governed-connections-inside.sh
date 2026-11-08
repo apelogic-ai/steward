@@ -310,10 +310,10 @@ else
   checksum_command=(shasum -a 256 -c -)
 fi
 openshell_archive="openshell-${openshell_target}.tar.gz"
-curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.98/${openshell_archive}" \
   -o "${STEWARD_RUN_DIR}/${openshell_archive}"
-curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.98/openshell-checksums-sha256.txt" \
   -o "${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
 (

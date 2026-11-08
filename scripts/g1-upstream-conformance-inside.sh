@@ -32,10 +32,10 @@ case "$(uname -s):$(uname -m)" in
 esac
 
 archive="openshell-${target}.tar.gz"
-curl -fsSL \
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "https://github.com/NVIDIA/OpenShell/releases/download/${RELEASE}/${archive}" \
   -o "${STEWARD_RUN_DIR}/${archive}"
-curl -fsSL \
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "https://github.com/NVIDIA/OpenShell/releases/download/${RELEASE}/openshell-checksums-sha256.txt" \
   -o "${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
 (

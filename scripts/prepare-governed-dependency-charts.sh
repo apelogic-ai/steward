@@ -58,6 +58,7 @@ done
 
 agent_archive="${work}/agent-sandbox-v0.5.0.tar.gz"
 curl --fail --location --silent --show-error \
+  --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   https://api.github.com/repos/kubernetes-sigs/agent-sandbox/tarball/v0.5.0 \
   -o "${agent_archive}"
 verify_hash \
@@ -78,6 +79,7 @@ python3 "${root}/scripts/prepare-agent-sandbox-chart.py" \
 
 litellm_archive="${work}/litellm-v1.106.2.tar.gz"
 curl --fail --location --silent --show-error \
+  --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   https://github.com/BerriAI/litellm/archive/refs/tags/v1.106.2.tar.gz \
   -o "${litellm_archive}"
 verify_hash \

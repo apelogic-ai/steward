@@ -133,6 +133,7 @@ fn ci() -> TaskResult {
     run("bash", &["scripts/test-core-install-chart.sh"])?;
     run("bash", &["scripts/test-claude-code-launcher.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
+    run("bash", &["scripts/test-release-asset-retries.sh"])?;
     run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
     conformance(&["--pinned".to_owned()])
 }
@@ -5881,7 +5882,9 @@ mod tests {
 
         let curl_downloads = container.matches("curl --fail").count();
         let retried_downloads = container
-            .matches("curl --fail --retry 3 --retry-all-errors")
+            .matches(
+                "curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300",
+            )
             .count();
         assert!(
             curl_downloads > 0,
