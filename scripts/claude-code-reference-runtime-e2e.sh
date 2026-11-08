@@ -35,9 +35,11 @@ esac
 archive="openshell-${target}.tar.gz"
 release_url="https://github.com/NVIDIA/OpenShell/releases/download/${release}"
 curl --fail --location --silent --show-error \
+  --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "${release_url}/${archive}" \
   --output "${STEWARD_RUN_DIR}/${archive}"
 curl --fail --location --silent --show-error \
+  --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "${release_url}/openshell-checksums-sha256.txt" \
   --output "${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
 (

@@ -58,7 +58,7 @@ fi
 
 archive="${RUN_DIR}/mcp-gw.tar.gz"
 source_dir="${RUN_DIR}/source"
-curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
+curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
   "https://github.com/apelogic-ai/mcp-gw/archive/${commit}.tar.gz" -o "${archive}"
 if [[ "${TARGET}" == "pinned" ]]; then
   actual_archive_sha="$("${checksum[@]}" "${archive}" | cut -d ' ' -f 1)"

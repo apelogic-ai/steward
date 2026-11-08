@@ -17,25 +17,25 @@ ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 COPY --chmod=0755 build/claude-code-launcher.sh /usr/local/bin/claude
 COPY --chmod=0755 build/claude-code-image-state-check.sh /usr/local/libexec/steward/claude-code-image-state-check
-RUN curl --fail --silent --show-error --location \
+RUN curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
         --output /tmp/uv.tar.gz \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/jq_${JQ_VERSION}_amd64.deb" \
         --output /tmp/jq.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/libjq1_${LIBJQ_VERSION}_amd64.deb" \
         --output /tmp/libjq1.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/libonig5_${LIBONIG_VERSION}_amd64.deb" \
         --output /tmp/libonig5.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/fd-find_${FD_FIND_VERSION}_amd64.deb" \
         --output /tmp/fd-find.deb \
-    && curl --fail --silent --show-error --location \
+    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
