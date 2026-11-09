@@ -76,6 +76,14 @@ impl ClaudeCodeTaskExecutionAdapter {
             "set --; "
         };
         let (cli_url, shell_url) = governed_command_urls(&request, tool_transport_endpoint)?;
+        // The sandbox helper needs MCP_GW_RUN_TOKEN. Only the non-secret marker is exported;
+        // OpenShell substitutes the run-bound token on the allowed request.
+        let helper_token_setup = if cli_url != ABSENT_COMMAND_URL || shell_url != ABSENT_COMMAND_URL
+        {
+            "export MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder; "
+        } else {
+            ""
+        };
         let shell_command = format!(
             concat!(
                 "set -eu; umask 077; ",
@@ -103,7 +111,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
                 "if [ \"$cli_url\" != \"-\" ]; then export MCP_GW_CLI_URL=\"$cli_url\"; fi; ",
                 "if [ \"$shell_url\" != \"-\" ]; then export MCP_GW_SHELL_URL=\"$shell_url\"; fi; ",
-                "{}",
+                "{}{}",
                 "status_file=\"$CLAUDE_CONFIG_DIR/exit-status\"; ",
                 "( set +e; ",
                 "\"$executable\" --bare --print --model \"$model\" --output-format text ",
@@ -113,7 +121,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "| tee \"$STEWARD_OUTPUT_DIR/result.txt\"; ",
                 "status=$(cat \"$status_file\"); exit \"$status\"",
             ),
-            tool_setup,
+            helper_token_setup, tool_setup,
         );
         let mut command = vec![
             "/bin/sh".to_owned(),

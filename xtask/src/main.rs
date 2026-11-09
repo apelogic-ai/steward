@@ -5976,7 +5976,7 @@ mod tests {
         }
         for required in [
             "MCP-GW 0.8.0",
-            "`MCP_GW_RUN_TOKEN` is not present in the agent environment",
+            "No usable `MCP_GW_RUN_TOKEN` is present in the agent environment",
             "non-secret `openshell-token-grant-placeholder` marker",
             "MCP_GW_CLI_URL",
             "MCP_GW_SHELL_URL",

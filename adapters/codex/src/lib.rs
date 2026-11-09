@@ -142,6 +142,14 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
             ""
         };
         let (cli_url, shell_url) = governed_command_urls(&request)?;
+        // The sandbox helper needs MCP_GW_RUN_TOKEN. Only the non-secret marker is exported;
+        // OpenShell substitutes the run-bound token on the allowed request.
+        let helper_token_setup = if cli_url != ABSENT_COMMAND_URL || shell_url != ABSENT_COMMAND_URL
+        {
+            "export MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder; "
+        } else {
+            ""
+        };
         let shell_command = format!(
             concat!(
                 "set -eu; umask 077; ",
@@ -157,13 +165,13 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 "printf '%s' \"$adapter_config\" > \"$CODEX_HOME/config.toml\"; ",
                 "if [ \"$cli_url\" != \"-\" ]; then export MCP_GW_CLI_URL=\"$cli_url\"; fi; ",
                 "if [ \"$shell_url\" != \"-\" ]; then export MCP_GW_SHELL_URL=\"$shell_url\"; fi; ",
-                "{}",
+                "{}{}",
                 "OPENAI_API_KEY=openshell-token-grant-placeholder ",
                 "\"$executable\" exec --ephemeral --skip-git-repo-check ",
                 "--sandbox danger-full-access --model \"$model\" ",
                 "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$prompt\""
             ),
-            tool_bearer_environment,
+            helper_token_setup, tool_bearer_environment,
         );
         let mut command = vec![
             "/bin/sh".to_owned(),
