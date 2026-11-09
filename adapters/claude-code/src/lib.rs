@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn governed_command_grants_expose_routes_without_helper_token_in_agent_environment()
+    fn governed_command_grants_expose_routes_and_only_the_helper_token_placeholder()
     -> Result<(), String> {
         let adapter =
             ClaudeCodeTaskExecutionAdapter::new("https://inference.example.test".to_owned())
@@ -602,7 +602,10 @@ mod tests {
             })
             .map_err(|error| format!("render governed command plan: {error:?}"))?;
         let shell = &command_plan.command[2];
-        assert!(!shell.contains("MCP_GW_RUN_TOKEN"));
+        // The helper needs MCP_GW_RUN_TOKEN; the agent gets only the non-secret marker
+        // that OpenShell replaces on the allowed network request.
+        assert!(shell.contains("export MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder; "));
+        assert_eq!(shell.matches("MCP_GW_RUN_TOKEN").count(), 1);
         assert!(!shell.contains("https://tools.example.test/cli/run"));
         assert!(!shell.contains("https://tools.example.test/shell/run"));
         assert!(
@@ -616,6 +619,33 @@ mod tests {
                 .contains(&"https://tools.example.test/shell/run".to_owned())
         );
         assert!(!shell.contains("MCP_GW_RUN_TOKEN_FILE"));
+
+        for single_grant in [&command_tools[..1], &command_tools[1..]] {
+            let single_plan = adapter
+                .render(TaskExecutionPlanRequest {
+                    workflow_prompt: "Inspect input.",
+                    model: &model(),
+                    tools: single_grant,
+                    tool_transport_endpoint: endpoint,
+                    binding: &binding,
+                })
+                .map_err(|error| format!("render single command grant plan: {error:?}"))?;
+            assert!(
+                single_plan.command[2]
+                    .contains("export MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder; ")
+            );
+        }
+
+        let tool_less_plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &model(),
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render tool-less plan: {error:?}"))?;
+        assert!(!tool_less_plan.command[2].contains("MCP_GW_RUN_TOKEN"));
 
         let unrelated_tools = [ToolGrant {
             provider: "example-tool".to_owned(),
