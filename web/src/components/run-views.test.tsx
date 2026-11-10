@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView, WorkspaceEvidence } from "@/api-client";
 
-import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunAttribution, RunCards, runCallerLabel, runOriginLabel, runtimeMinutesSummary, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
+import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunAttribution, RunCards, runCallerLabel, runOriginLabel, runtimeMinutesSummary, spendReportReasonText, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -103,6 +103,26 @@ describe("run table", () => {
     expect(html).toContain("Tokens used");
     expect(html).toContain("12,345");
     expect(html).toContain("Not reported");
+  });
+
+  test("explains in plain language why admin spend or tokens are not reported", () => {
+    expect(spendReportReasonText("notSupportedInManagedMode")).toBe("Spend reporting isn't available yet when runs use people's own model keys.");
+    expect(spendReportReasonText("noSpendObservation")).toBe("The model gateway hasn't reported spend for this run.");
+    expect(spendReportReasonText("usageNotReported")).toBe("The model gateway reported spend but not tokens used.");
+    expect(spendReportReasonText(undefined)).toBeNull();
+    expect(spendReportReasonText("somethingNew")).toBeNull();
+
+    const html = renderToStaticMarkup(<RunCards admin runs={[
+      run({ taskUid: "task-managed", spendReportReason: "notSupportedInManagedMode" }),
+      run({
+        taskUid: "task-no-tokens",
+        observedSpend: { observedAmount: "0.02", currency: "USD", exhausted: false },
+        spendReportReason: "usageNotReported",
+      }),
+    ]} />);
+    expect(html).toContain("Spend reporting isn&#x27;t available yet when runs use people&#x27;s own model keys.");
+    expect(html).toContain("The model gateway reported spend but not tokens used.");
+    expect(html).not.toContain("notSupportedInManagedMode");
   });
 
   test("shows external caller context in run detail and preserves historical API runs", () => {

@@ -758,8 +758,9 @@ mod tests {
     use steward_types::{Budget, ModelRef, RuntimeId, SpendSummary};
 
     use super::{
-        LiteLlmAdapter, LiteLlmConfig, budget_limit, configuration_update,
-        observation_from_key_list, unpriced_models,
+        LiteLlmAdapter, LiteLlmConfig, SPEND_LOG_WARNING_INTERVAL, SpendLogRead, SpendLogWarnings,
+        budget_limit, configuration_update, observation_from_key_list, spend_log_warning_line,
+        unpriced_models,
     };
 
     const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -979,6 +980,138 @@ mod tests {
                 ..
             } if observed_amount == "0.3"
         ));
+        Ok(())
+    }
+
+    fn spend_log_adapter(base_url: &str) -> Result<LiteLlmAdapter, String> {
+        LiteLlmAdapter::new_with_spend_log_timeout(
+            LiteLlmConfig {
+                base_url: base_url.to_owned(),
+                master_key: "fixture-management-value".to_owned(),
+            },
+            Duration::from_millis(500),
+        )
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))
+    }
+
+    #[tokio::test]
+    async fn each_unavailable_spend_log_read_has_a_stable_reason() -> Result<(), String> {
+        let cases: Vec<(u16, &str, &str, &str, Option<u16>)> = vec![
+            (401, r#"{"detail":"no"}"#, "", "spend_logs_refused", Some(401)),
+            (403, r#"{"detail":"not permitted"}"#, "", "spend_logs_refused", Some(403)),
+            (404, r#"{"detail":"Not Found"}"#, "", "spend_logs_not_found", Some(404)),
+            (500, r#"{"error":"db"}"#, "", "spend_logs_failed", Some(500)),
+            (200, "[]", "", "spend_logs_empty", None),
+            (200, r#"[{"api_key":"other-key-hash","spend":0.02}]"#, "", "spend_logs_empty", None),
+            (
+                200,
+                r#"[{"api_key":"fixture-token-hash","spend":0.02}]"#,
+                "x-litellm-spend-logs-truncated: true\r\n",
+                "spend_logs_incomplete",
+                None,
+            ),
+            (
+                200,
+                r#"{"data":[{"api_key":"fixture-token-hash","spend":0.02}],"total":5,"total_pages":2}"#,
+                "",
+                "spend_logs_incomplete",
+                None,
+            ),
+            (200, r#"{"unexpected":true}"#, "", "spend_logs_unrecognized", None),
+            (200, r#"[{"api_key":"fixture-token-hash","spend":"lots"}]"#, "", "spend_logs_unrecognized", None),
+            (200, "not json", "", "spend_logs_unrecognized", None),
+        ];
+        for (status, body, headers, reason, http_status) in cases {
+            let server =
+                MockLiteLlm::start_with_headers(vec![(status, body, headers)], MOCK_REQUEST_TIMEOUT)?;
+            let read = spend_log_adapter(&server.base_url)?
+                .read_spend_logs("fixture-token-hash")
+                .await;
+            server.finish()?;
+            assert_eq!(
+                read,
+                SpendLogRead::Unavailable { reason, http_status },
+                "status {status} body {body} must report {reason}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreachable_and_slow_spend_logs_have_stable_reasons() -> Result<(), String> {
+        let unreachable = spend_log_adapter("http://127.0.0.1:9")?
+            .read_spend_logs("fixture-token-hash")
+            .await;
+        assert_eq!(
+            unreachable,
+            SpendLogRead::Unavailable { reason: "gateway_unreachable", http_status: None }
+        );
+
+        let server = MockLiteLlm::start_with_response_delays(
+            vec![(200, "[]", "", Duration::from_secs(2))],
+            MOCK_REQUEST_TIMEOUT,
+        )?;
+        let slow = spend_log_adapter(&server.base_url)?
+            .read_spend_logs("fixture-token-hash")
+            .await;
+        assert_eq!(
+            slow,
+            SpendLogRead::Unavailable { reason: "gateway_timeout", http_status: None }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bundled_and_hosted_spend_log_shapes_are_reported_with_unknown_fields_ignored()
+    -> Result<(), String> {
+        for body in [
+            r#"[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250,"new_field":{"x":1}}]"#,
+            r#"{"data":[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}],"total":1,"total_pages":1,"extra":true}"#,
+        ] {
+            let server = MockLiteLlm::start(vec![body])?;
+            let read = spend_log_adapter(&server.base_url)?
+                .read_spend_logs("fixture-token-hash")
+                .await;
+            server.finish()?;
+            assert!(
+                matches!(&read, SpendLogRead::Reported(usage)
+                    if usage.observed_amount == "0.02" && usage.total_tokens == Some(250)),
+                "{body} must be reported, got {read:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spend_log_warnings_are_rate_limited_per_reason() {
+        let warnings = SpendLogWarnings::default();
+        let start = Instant::now();
+        assert!(warnings.should_emit("spend_logs_refused", start));
+        assert!(!warnings.should_emit("spend_logs_refused", start + Duration::from_secs(1)));
+        assert!(warnings.should_emit("spend_logs_empty", start + Duration::from_secs(1)));
+        assert!(warnings.should_emit(
+            "spend_logs_refused",
+            start + SPEND_LOG_WARNING_INTERVAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn spend_log_warning_line_names_only_component_reason_and_status() -> Result<(), String> {
+        let line = spend_log_warning_line("spend_logs_refused", Some(403));
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| format!("warning must be JSON: {error}"))?;
+        assert_eq!(
+            value,
+            json!({
+                "level": "warn",
+                "component": "litellm",
+                "event": "spend_logs_unavailable",
+                "reason": "spend_logs_refused",
+                "httpStatus": 403
+            })
+        );
+        let without_status = spend_log_warning_line("gateway_unreachable", None);
+        assert!(!without_status.contains("httpStatus"));
         Ok(())
     }
 

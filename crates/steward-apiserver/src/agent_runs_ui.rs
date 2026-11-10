@@ -4085,6 +4085,44 @@ mod tests {
     }
 
     #[test]
+    fn admin_run_views_say_why_spend_or_tokens_are_not_reported() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+
+        let reported = admin_browser_run_view(run(task_uid, owner), InferenceMode::Stock);
+        assert_eq!(reported.spend_report_reason, None);
+
+        let mut without_tokens = run(task_uid, owner);
+        if let Some(spend) = without_tokens.spend.as_mut() {
+            spend.total_tokens = None;
+        }
+        assert_eq!(
+            admin_browser_run_view(without_tokens, InferenceMode::Stock).spend_report_reason,
+            Some("usageNotReported")
+        );
+
+        let mut without_spend = run(task_uid, owner);
+        without_spend.spend = None;
+        assert_eq!(
+            admin_browser_run_view(without_spend.clone(), InferenceMode::Stock).spend_report_reason,
+            Some("noSpendObservation")
+        );
+        assert_eq!(
+            admin_browser_run_view(without_spend.clone(), InferenceMode::Managed)
+                .spend_report_reason,
+            Some("notSupportedInManagedMode")
+        );
+
+        // The personal Runs view never carries the admin diagnostic.
+        let personal = browser_run_view(without_spend);
+        assert_eq!(personal.spend_report_reason, None);
+        let json = serde_json::to_value(&personal).map_err(|error| error.to_string())?;
+        assert!(json.get("spendReportReason").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn run_snapshot_exposes_only_bounded_plain_failure_reasons() -> Result<(), String> {
         let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
             .map_err(|error| error.to_string())?;
