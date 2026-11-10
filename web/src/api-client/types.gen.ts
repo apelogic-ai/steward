@@ -703,6 +703,11 @@ export type BrowserRunView = {
     rerunUnavailableReason?: string | null;
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
+    /**
+     * Admin views only: why spend or tokens show as not reported. One of
+     * `notSupportedInManagedMode`, `noSpendObservation` or `usageNotReported`.
+     */
+    spendReportReason?: string | null;
     stages: Array<BrowserRunStage>;
     taskRuntimeMinutesLimit?: string | null;
     taskUid: string;

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   allRun,
@@ -514,6 +514,23 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
   );
 }
 
+const SPEND_REPORT_REASONS: Readonly<Record<string, string>> = {
+  notSupportedInManagedMode: "Spend reporting isn't available yet when runs use people's own model keys.",
+  noSpendObservation: "The model gateway hasn't reported spend for this run.",
+  usageNotReported: "The model gateway reported spend but not tokens used.",
+};
+
+/** Plain sentence for an admin spend reason code; unknown codes show no sentence. */
+export function spendReportReasonText(reason: string | null | undefined): string | null {
+  return reason && Object.hasOwn(SPEND_REPORT_REASONS, reason) ? SPEND_REPORT_REASONS[reason] : null;
+}
+
+function NotReported({ reason }: Readonly<{ reason?: string | null }>) {
+  const text = spendReportReasonText(reason);
+  if (!text) return <>Not reported</>;
+  return <span title={text}>Not reported<span className="mt-0.5 block whitespace-normal font-sans text-xs font-normal text-muted-ink">{text}</span></span>;
+}
+
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No runs yet.</p>;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
@@ -524,8 +541,8 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
     { key: "envelope", label: "Envelope", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => run.userEnvelopeRevision ? `rev ${run.userEnvelopeRevision}` : "—" },
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
     { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },
-    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Not reported" },
-    { key: "tokens", label: "Tokens used", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : "Not reported" },
+    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : <NotReported reason={run.spendReportReason} /> },
+    { key: "tokens", label: "Tokens used", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : <NotReported reason={run.spendReportReason} /> },
     { key: "updated", label: "Updated", className: "text-right text-muted-ink", render: (run: BrowserRunView) => relativeTime(run.updatedAt) },
   ];
   return <DataTable
@@ -706,14 +723,14 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <div className="mx-5 border-t border-line-soft py-4 text-xs text-muted-ink"><p className="font-mono">{taskUid}</p><p className="mt-2">Created {dateTime(run.createdAt)}</p></div>
               </nav>
               <main className="min-w-0">
-                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-6">{[
+                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-6">{([
                   ["Workflow version", pinnedWorkflow],
                   ["User envelope revision", admitted?.kind === "admitted" ? admitted.envelopeRevision ?? "—" : run.userEnvelopeRevision ?? "—"],
                   ["Runtime", runtimeBound?.kind === "runtimeBound" ? runtimeBound.runtimeUid : run.runtimeUid ?? "unassigned"],
-                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Not reported"],
-                  ["Tokens used", run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : "Not reported"],
+                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : <NotReported key="spend" reason={run.spendReportReason} />],
+                  ["Tokens used", run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : <NotReported key="tokens" reason={run.spendReportReason} />],
                   ["Agent", run.codingAgentRuntime],
-                ].map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
+                ] satisfies Array<[string, ReactNode]>).map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
                 <section aria-labelledby="selected-stage" className="p-5">
                   <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>

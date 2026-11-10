@@ -1,7 +1,8 @@
 //! LiteLLM implementation of Steward's inference enforcement plane.
 
-use std::collections::BTreeSet;
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,8 @@ use steward_types::{Budget, ModelRef, SpendSummary};
 
 pub const IMPLEMENTED_PORTS: [&str; 1] = ["InferencePlane"];
 pub const DEFAULT_SPEND_LOG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Minimum gap between two warnings with the same spend-log reason.
+const SPEND_LOG_WARNING_INTERVAL: Duration = Duration::from_secs(600);
 
 pub struct LiteLlmConfig {
     pub base_url: String,
@@ -27,6 +30,67 @@ pub struct LiteLlmAdapter {
     client: Client,
     master_key: String,
     spend_log_timeout: Duration,
+    spend_log_warnings: Arc<SpendLogWarnings>,
+}
+
+/// Outcome of one per-key `/spend/logs` read. An unavailable read carries a stable reason so
+/// operators can tell a missing database, a refused key and an unreachable gateway apart.
+#[derive(Debug, PartialEq)]
+enum SpendLogRead {
+    Reported(ReportedUsage),
+    Unavailable {
+        reason: &'static str,
+        http_status: Option<u16>,
+    },
+}
+
+impl SpendLogRead {
+    fn unavailable(reason: &'static str) -> Self {
+        Self::Unavailable {
+            reason,
+            http_status: None,
+        }
+    }
+}
+
+/// Rate-limits spend-log warnings to one per reason per interval.
+#[derive(Default)]
+struct SpendLogWarnings {
+    last_emitted: Mutex<HashMap<&'static str, Instant>>,
+}
+
+impl SpendLogWarnings {
+    fn should_emit(&self, reason: &'static str, now: Instant) -> bool {
+        let Ok(mut last_emitted) = self.last_emitted.lock() else {
+            return false;
+        };
+        match last_emitted.get(reason) {
+            Some(previous)
+                if now.saturating_duration_since(*previous) < SPEND_LOG_WARNING_INTERVAL =>
+            {
+                false
+            }
+            _ => {
+                last_emitted.insert(reason, now);
+                true
+            }
+        }
+    }
+}
+
+/// One structured warning line: component, reason code and HTTP status only. Never a key,
+/// credential-bearing URL or response body.
+fn spend_log_warning_line(reason: &'static str, http_status: Option<u16>) -> String {
+    let mut line = serde_json::json!({
+        "level": "warn",
+        "component": "litellm",
+        "event": "spend_logs_unavailable",
+        "reason": reason,
+    });
+    if let (Some(status), Some(object)) = (http_status, line.as_object_mut()) {
+        object.insert("httpStatus".to_owned(), Value::from(status));
+    }
+    line.to_string()
 }
 
 impl LiteLlmAdapter {
@@ -54,6 +118,7 @@ impl LiteLlmAdapter {
             client: Client::new(),
             master_key: config.master_key,
             spend_log_timeout,
+            spend_log_warnings: Arc::new(SpendLogWarnings::default()),
         })
     }
 
@@ -113,7 +178,7 @@ impl LiteLlmAdapter {
         self.response_json(response).await
     }
 
-    async fn spend_logs(&self, key_hash: &str) -> Result<Option<ReportedUsage>, PortError> {
+    async fn read_spend_logs(&self, key_hash: &str) -> SpendLogRead {
         let response = self
             .client
             .get(format!("{}/spend/logs", self.base_url))
@@ -124,29 +189,48 @@ impl LiteLlmAdapter {
             .await;
         let response = match response {
             Ok(response) => response,
-            Err(error) if error.is_timeout() => return Ok(None),
-            Err(_) => {
-                return Err(PortError::Failed {
-                    reason: "inference usage report was unavailable".to_owned(),
-                });
+            Err(error) if error.is_timeout() => {
+                return SpendLogRead::unavailable("gateway_timeout");
             }
+            Err(_) => return SpendLogRead::unavailable("gateway_unreachable"),
         };
-        if matches!(
-            response.status(),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-        ) {
-            return Ok(None);
+        let status = response.status();
+        if !status.is_success() {
+            let reason = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "spend_logs_refused",
+                StatusCode::NOT_FOUND => "spend_logs_not_found",
+                _ => "spend_logs_failed",
+            };
+            return SpendLogRead::Unavailable {
+                reason,
+                http_status: Some(status.as_u16()),
+            };
         }
         let truncated = response
             .headers()
             .get("x-litellm-spend-logs-truncated")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let body = self.response_json(response).await?;
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) if error.is_timeout() => {
+                return SpendLogRead::unavailable("gateway_timeout");
+            }
+            Err(_) => return SpendLogRead::unavailable("gateway_unreachable"),
+        };
         if truncated {
-            return Ok(None);
+            return SpendLogRead::unavailable("spend_logs_incomplete");
         }
-        reported_usage(&body, key_hash)
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(body) => reported_usage(&body, key_hash),
+            Err(_) => SpendLogRead::unavailable("spend_logs_unrecognized"),
+        }
+    }
+
+    fn warn_spend_logs_unavailable(&self, reason: &'static str, http_status: Option<u16>) {
+        if self.spend_log_warnings.should_emit(reason, Instant::now()) {
+            eprintln!("{}", spend_log_warning_line(reason, http_status));
+        }
     }
 }
 
@@ -264,7 +348,16 @@ impl InferencePlane for LiteLlmAdapter {
         let usage = match key_hash_from_key_list(&body)? {
             KeyHash::Absent => return Ok(InferenceObservation::Absent),
             KeyHash::Unavailable => None,
-            KeyHash::Available(key_hash) => self.spend_logs(&key_hash).await.unwrap_or_default(),
+            KeyHash::Available(key_hash) => match self.read_spend_logs(&key_hash).await {
+                SpendLogRead::Reported(usage) => Some(usage),
+                SpendLogRead::Unavailable {
+                    reason,
+                    http_status,
+                } => {
+                    self.warn_spend_logs_unavailable(reason, http_status);
+                    None
+                }
+            },
         };
         observation_from_key_list(request, &alias, &body, usage)
     }
@@ -312,6 +405,7 @@ struct KeyInfo {
     token: Option<Value>,
 }
 
+#[derive(Debug, PartialEq)]
 struct ReportedUsage {
     observed_amount: String,
     total_tokens: Option<i64>,
@@ -492,13 +586,13 @@ fn key_hash_from_key_list(response: &Value) -> Result<KeyHash, PortError> {
         .map_or(KeyHash::Unavailable, KeyHash::Available))
 }
 
-fn reported_usage(response: &Value, key_hash: &str) -> Result<Option<ReportedUsage>, PortError> {
-    let logs = response
+fn reported_usage(response: &Value, key_hash: &str) -> SpendLogRead {
+    let Some(logs) = response
         .as_array()
         .or_else(|| response.get("data").and_then(Value::as_array))
-        .ok_or_else(|| PortError::Failed {
-            reason: "inference usage report omitted the request collection".to_owned(),
-        })?;
+    else {
+        return SpendLogRead::unavailable("spend_logs_unrecognized");
+    };
     if response.get("data").is_some() {
         let incomplete_total = response
             .get("total")
@@ -509,7 +603,7 @@ fn reported_usage(response: &Value, key_hash: &str) -> Result<Option<ReportedUsa
             .and_then(Value::as_u64)
             .is_some_and(|pages| pages > 1);
         if incomplete_total || multiple_pages {
-            return Ok(None);
+            return SpendLogRead::unavailable("spend_logs_incomplete");
         }
     }
     let logs = logs
@@ -517,20 +611,19 @@ fn reported_usage(response: &Value, key_hash: &str) -> Result<Option<ReportedUsa
         .filter(|log| log.get("api_key").and_then(Value::as_str) == Some(key_hash))
         .collect::<Vec<_>>();
     if logs.is_empty() {
-        return Ok(None);
+        return SpendLogRead::unavailable("spend_logs_empty");
     }
     let mut spend = "0".to_owned();
     let mut total_tokens = Some(0_i64);
     for log in logs {
-        let amount = log
+        let Some(next) = log
             .get("spend")
             .and_then(value_decimal)
-            .ok_or_else(|| PortError::Failed {
-                reason: "inference usage report returned an invalid spend amount".to_owned(),
-            })?;
-        spend = add_decimal_amount(&spend, &amount).ok_or_else(|| PortError::Failed {
-            reason: "inference usage report returned an invalid spend amount".to_owned(),
-        })?;
+            .and_then(|amount| add_decimal_amount(&spend, &amount))
+        else {
+            return SpendLogRead::unavailable("spend_logs_unrecognized");
+        };
+        spend = next;
         total_tokens = total_tokens.and_then(|total| {
             log.get("total_tokens")
                 .and_then(Value::as_i64)
@@ -538,10 +631,10 @@ fn reported_usage(response: &Value, key_hash: &str) -> Result<Option<ReportedUsa
                 .and_then(|tokens| total.checked_add(tokens))
         });
     }
-    Ok(Some(ReportedUsage {
+    SpendLogRead::Reported(ReportedUsage {
         observed_amount: spend,
         total_tokens,
-    }))
+    })
 }
 
 fn value_decimal(value: &Value) -> Option<String> {
@@ -758,8 +851,9 @@ mod tests {
     use steward_types::{Budget, ModelRef, RuntimeId, SpendSummary};
 
     use super::{
-        LiteLlmAdapter, LiteLlmConfig, budget_limit, configuration_update,
-        observation_from_key_list, unpriced_models,
+        LiteLlmAdapter, LiteLlmConfig, SPEND_LOG_WARNING_INTERVAL, SpendLogRead, SpendLogWarnings,
+        budget_limit, configuration_update, observation_from_key_list, spend_log_warning_line,
+        unpriced_models,
     };
 
     const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -979,6 +1073,185 @@ mod tests {
                 ..
             } if observed_amount == "0.3"
         ));
+        Ok(())
+    }
+
+    fn spend_log_adapter(base_url: &str) -> Result<LiteLlmAdapter, String> {
+        LiteLlmAdapter::new_with_spend_log_timeout(
+            LiteLlmConfig {
+                base_url: base_url.to_owned(),
+                master_key: "fixture-management-value".to_owned(),
+            },
+            Duration::from_millis(500),
+        )
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))
+    }
+
+    #[tokio::test]
+    async fn each_unavailable_spend_log_read_has_a_stable_reason() -> Result<(), String> {
+        let cases: Vec<(u16, &str, &str, &str, Option<u16>)> = vec![
+            (
+                401,
+                r#"{"detail":"no"}"#,
+                "",
+                "spend_logs_refused",
+                Some(401),
+            ),
+            (
+                403,
+                r#"{"detail":"not permitted"}"#,
+                "",
+                "spend_logs_refused",
+                Some(403),
+            ),
+            (
+                404,
+                r#"{"detail":"Not Found"}"#,
+                "",
+                "spend_logs_not_found",
+                Some(404),
+            ),
+            (500, r#"{"error":"db"}"#, "", "spend_logs_failed", Some(500)),
+            (200, "[]", "", "spend_logs_empty", None),
+            (
+                200,
+                r#"[{"api_key":"other-key-hash","spend":0.02}]"#,
+                "",
+                "spend_logs_empty",
+                None,
+            ),
+            (
+                200,
+                r#"[{"api_key":"fixture-token-hash","spend":0.02}]"#,
+                "x-litellm-spend-logs-truncated: true\r\n",
+                "spend_logs_incomplete",
+                None,
+            ),
+            (
+                200,
+                r#"{"data":[{"api_key":"fixture-token-hash","spend":0.02}],"total":5,"total_pages":2}"#,
+                "",
+                "spend_logs_incomplete",
+                None,
+            ),
+            (
+                200,
+                r#"{"unexpected":true}"#,
+                "",
+                "spend_logs_unrecognized",
+                None,
+            ),
+            (
+                200,
+                r#"[{"api_key":"fixture-token-hash","spend":"lots"}]"#,
+                "",
+                "spend_logs_unrecognized",
+                None,
+            ),
+            (200, "not json", "", "spend_logs_unrecognized", None),
+        ];
+        for (status, body, headers, reason, http_status) in cases {
+            let server = MockLiteLlm::start_with_headers(
+                vec![(status, body, headers)],
+                MOCK_REQUEST_TIMEOUT,
+            )?;
+            let read = spend_log_adapter(&server.base_url)?
+                .read_spend_logs("fixture-token-hash")
+                .await;
+            server.finish()?;
+            assert_eq!(
+                read,
+                SpendLogRead::Unavailable {
+                    reason,
+                    http_status
+                },
+                "status {status} body {body} must report {reason}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreachable_and_slow_spend_logs_have_stable_reasons() -> Result<(), String> {
+        let unreachable = spend_log_adapter("http://127.0.0.1:9")?
+            .read_spend_logs("fixture-token-hash")
+            .await;
+        assert_eq!(
+            unreachable,
+            SpendLogRead::Unavailable {
+                reason: "gateway_unreachable",
+                http_status: None
+            }
+        );
+
+        let server = MockLiteLlm::start_with_response_delays(
+            vec![(200, "[]", "", Duration::from_secs(2))],
+            MOCK_REQUEST_TIMEOUT,
+        )?;
+        let slow = spend_log_adapter(&server.base_url)?
+            .read_spend_logs("fixture-token-hash")
+            .await;
+        assert_eq!(
+            slow,
+            SpendLogRead::Unavailable {
+                reason: "gateway_timeout",
+                http_status: None
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bundled_and_hosted_spend_log_shapes_are_reported_with_unknown_fields_ignored()
+    -> Result<(), String> {
+        for body in [
+            r#"[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250,"new_field":{"x":1}}]"#,
+            r#"{"data":[{"api_key":"fixture-token-hash","spend":0.02,"total_tokens":250}],"total":1,"total_pages":1,"extra":true}"#,
+        ] {
+            let server = MockLiteLlm::start(vec![body])?;
+            let read = spend_log_adapter(&server.base_url)?
+                .read_spend_logs("fixture-token-hash")
+                .await;
+            server.finish()?;
+            assert!(
+                matches!(&read, SpendLogRead::Reported(usage)
+                    if usage.observed_amount == "0.02" && usage.total_tokens == Some(250)),
+                "{body} must be reported, got {read:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spend_log_warnings_are_rate_limited_per_reason() {
+        let warnings = SpendLogWarnings::default();
+        let start = Instant::now();
+        assert!(warnings.should_emit("spend_logs_refused", start));
+        assert!(!warnings.should_emit("spend_logs_refused", start + Duration::from_secs(1)));
+        assert!(warnings.should_emit("spend_logs_empty", start + Duration::from_secs(1)));
+        assert!(warnings.should_emit(
+            "spend_logs_refused",
+            start + SPEND_LOG_WARNING_INTERVAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn spend_log_warning_line_names_only_component_reason_and_status() -> Result<(), String> {
+        let line = spend_log_warning_line("spend_logs_refused", Some(403));
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| format!("warning must be JSON: {error}"))?;
+        assert_eq!(
+            value,
+            json!({
+                "level": "warn",
+                "component": "litellm",
+                "event": "spend_logs_unavailable",
+                "reason": "spend_logs_refused",
+                "httpStatus": 403
+            })
+        );
+        let without_status = spend_log_warning_line("gateway_unreachable", None);
+        assert!(!without_status.contains("httpStatus"));
         Ok(())
     }
 
