@@ -284,7 +284,9 @@ esac
 
 # The packaged helper must accept its configuration inside the governed
 # sandbox, not only in a plain container (steward #77). Command routes reach
-# the agent as inherited environment variables; configuration is checked before
+# the agent as inherited environment variables, and the wrappers pass them and
+# the run token to the helper as options, because the sandbox supervisor can
+# start the helper with an empty environment. Configuration is checked before
 # any network use, so an unreachable route proves acceptance by failing only
 # the request.
 helper_configuration_failed=0

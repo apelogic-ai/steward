@@ -18,12 +18,12 @@ ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 RUN case "${TARGETARCH}" in \
       amd64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
-        helper_sha256="26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34" \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
+        helper_sha256="8ab67581f5a5e991d0429c2fa1f963fe273c746627e652abe9649e1525fb3dec" \
         ;; \
       arm64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
-        helper_sha256="0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4" \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
+        helper_sha256="b7024d0ccec1e1e447cb857f9f0dedeb6a0e2f6652a1849f280fa16665e72e17" \
         ;; \
       *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
@@ -80,10 +80,10 @@ RUN case "${TARGETARCH}" in \
     && rm /tmp/mcp-gw-sandbox-helper.tar.gz \
     && chmod 0755 /usr/local/bin/mcp-gw-sandbox-helper \
     && printf '%s\n' '#!/bin/sh' \
-        'exec /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper --operation kubectl "$@"' \
+        'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"' \
         >/usr/local/bin/kubectl \
     && printf '%s\n' '#!/bin/sh' \
-        'exec /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper --operation remote-shell "$@"' \
+        'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --shell-url "$MCP_GW_SHELL_URL" --operation remote-shell "$@"' \
         >/usr/local/bin/remote-shell \
     && chmod 0755 /usr/local/bin/kubectl /usr/local/bin/remote-shell \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \

@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Governed `kubectl` and `remote-shell` commands in the Codex reference runtime no longer fail with
+  `Sandbox helper configuration failed` when the sandbox supervisor starts the helper with an empty
+  environment. The image pins the MCP-GW 0.8.1 sandbox helper, and the wrappers pass the placeholder
+  run token and the approved route as options. Configuration failures now name a fixed reason.
+
 ### Changed
 
 - Admin Agent Runs now say why spend or tokens show `Not reported`: the deployment uses managed
