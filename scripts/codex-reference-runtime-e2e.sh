@@ -332,6 +332,24 @@ check_sandbox_helper_configuration "debug minimal environment kubectl" \
   "env -i PATH=/usr/local/bin:/usr/bin:/bin BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation kubectl get pods"
 check_sandbox_helper_configuration "debug inherited remote shell" \
   "export MCP_GW_SHELL_URL=${shell_route}; BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation remote-shell machine.test -- uname -a"
+# TEMPORARY diagnostic (steward #77): the same instrumented logic passes when
+# run through BUN_BE_BUN, so compile it as a standalone executable with the
+# release's Bun version and run that inside the sandbox too.
+debug_dir="${STEWARD_RUN_DIR}/helper-debug"
+mkdir -p "${debug_dir}"
+cp "${probe_source}" "${debug_dir}/probe.js"
+docker run --rm --workdir /w --volume "${debug_dir}:/w" \
+  oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 \
+  bun build --compile --target=bun-linux-x64 --outfile /w/mcp-gw-sandbox-helper-debug /w/probe.js
+"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
+  sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/mcp-gw-sandbox-helper-debug" /tmp/
+sandbox_exec /bin/sh -c "chmod 0755 /tmp/mcp-gw-sandbox-helper-debug; ls -l /tmp/mcp-gw-sandbox-helper-debug" || true
+check_sandbox_helper_configuration "compiled debug inherited kubectl" \
+  "export MCP_GW_CLI_URL=${cli_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-debug --operation kubectl get pods"
+check_sandbox_helper_configuration "compiled debug minimal environment kubectl" \
+  "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /tmp/mcp-gw-sandbox-helper-debug --operation kubectl get pods"
+check_sandbox_helper_configuration "compiled debug inherited remote shell" \
+  "export MCP_GW_SHELL_URL=${shell_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-debug --operation remote-shell machine.test -- uname -a"
 if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
   exit 1
