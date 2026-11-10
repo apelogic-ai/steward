@@ -287,14 +287,6 @@ esac
 # the agent as inherited environment variables; configuration is checked before
 # any network use, so an unreachable route proves acceptance by failing only
 # the request.
-sandbox_exec /bin/sh -c "
-id
-ls -l /usr/local/bin/kubectl /usr/local/bin/remote-shell /usr/local/bin/mcp-gw-sandbox-helper
-command -v sha256sum
-sha256sum /usr/local/bin/kubectl /usr/local/bin/remote-shell || echo wrappers-unreadable
-env | cut -d= -f1 | sort | tr '\n' ' '
-echo
-" || true
 helper_configuration_failed=0
 check_sandbox_helper_configuration() {
   label="$1"
@@ -318,74 +310,6 @@ check_sandbox_helper_configuration "inherited remote shell" \
   "export MCP_GW_SHELL_URL=${shell_route}; remote-shell machine.test -- uname -a"
 check_sandbox_helper_configuration "minimal environment kubectl" \
   "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run kubectl get pods"
-# TEMPORARY diagnostic (steward #77): run an instrumented copy of the helper's
-# configuration logic with the packaged helper acting as its own Bun runtime,
-# inside the same sandbox, to name the failing check.
-probe_source="${BASH_SOURCE[0]%/*}/diagnostics/governed-helper-config-probe.js"
-probe_encoded="$(base64 <"${probe_source}" | tr -d '\n')"
-sandbox_exec /bin/sh -c "printf '%s' '${probe_encoded}' | base64 -d >/tmp/helper-config-probe.js"
-check_sandbox_helper_configuration "runtime argv" \
-  "BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper -e 'console.log(JSON.stringify({argv0: process.argv0, argv: process.argv, execPath: process.execPath}))' -- a b"
-check_sandbox_helper_configuration "debug inherited kubectl" \
-  "export MCP_GW_CLI_URL=${cli_route}; BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation kubectl get pods"
-check_sandbox_helper_configuration "debug minimal environment kubectl" \
-  "env -i PATH=/usr/local/bin:/usr/bin:/bin BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation kubectl get pods"
-check_sandbox_helper_configuration "debug inherited remote shell" \
-  "export MCP_GW_SHELL_URL=${shell_route}; BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation remote-shell machine.test -- uname -a"
-# TEMPORARY diagnostic (steward #77): the same instrumented logic passes when
-# run through BUN_BE_BUN, so compile it as a standalone executable with the
-# release's Bun version and run that inside the sandbox too.
-debug_dir="${STEWARD_RUN_DIR}/helper-debug"
-mkdir -p "${debug_dir}"
-cp "${probe_source}" "${debug_dir}/probe.js"
-docker run --rm --workdir /w --volume "${debug_dir}:/w" \
-  oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 \
-  bun build --compile --target=bun-linux-x64 --outfile /w/mcp-gw-sandbox-helper-debug /w/probe.js
-"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
-  sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/mcp-gw-sandbox-helper-debug" /tmp/
-sandbox_exec /bin/sh -c "chmod 0755 /tmp/mcp-gw-sandbox-helper-debug; ls -l /tmp/mcp-gw-sandbox-helper-debug" || true
-check_sandbox_helper_configuration "compiled debug inherited kubectl" \
-  "export MCP_GW_CLI_URL=${cli_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-debug --operation kubectl get pods"
-check_sandbox_helper_configuration "compiled debug minimal environment kubectl" \
-  "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /tmp/mcp-gw-sandbox-helper-debug --operation kubectl get pods"
-check_sandbox_helper_configuration "compiled debug inherited remote shell" \
-  "export MCP_GW_SHELL_URL=${shell_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-debug --operation remote-shell machine.test -- uname -a"
-# TEMPORARY diagnostic (steward #77): how a Bun standalone executable sees its
-# environment under the OpenShell process supervisor.
-cp "${BASH_SOURCE[0]%/*}/diagnostics/bun-standalone-env-probe.js" "${debug_dir}/env-probe.js"
-docker run --rm --workdir /w --volume "${debug_dir}:/w" \
-  oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 \
-  bun build --compile --target=bun-linux-x64 --outfile /w/env-probe /w/env-probe.js
-"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
-  sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/env-probe" /tmp/
-"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
-  sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/env-probe.js" /tmp/
-sandbox_exec /bin/sh -c "chmod 0755 /tmp/env-probe" || true
-check_sandbox_helper_configuration "env probe standalone" "PROBE_VAR=1 /tmp/env-probe"
-check_sandbox_helper_configuration "env probe standalone minimal" "env -i PATH=/usr/bin:/bin PROBE_VAR=1 /tmp/env-probe"
-check_sandbox_helper_configuration "env probe as runtime" \
-  "PROBE_VAR=1 BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper /tmp/env-probe.js"
-check_sandbox_helper_configuration "env probe shell view" \
-  "PROBE_VAR=1 sh -c 'tr \"\\0\" \"\\n\" </proc/self/environ | cut -d= -f1 | tr \"\\n\" \" \"'; grep -E 'NoNewPrivs|Seccomp' /proc/self/status | tr '\\n' ' '"
-# TEMPORARY verification (steward #77): the mcp-gw fix compiled standalone with
-# the release's Bun version must accept its configuration under the supervisor.
-cp "${BASH_SOURCE[0]%/*}/diagnostics/fixed-sandbox-helper.js" "${debug_dir}/fixed-helper.js"
-docker run --rm --workdir /w --volume "${debug_dir}:/w" \
-  oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 \
-  bun build --compile --target=bun-linux-x64 --outfile /w/mcp-gw-sandbox-helper-fixed /w/fixed-helper.js
-"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
-  sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/mcp-gw-sandbox-helper-fixed" /tmp/
-sandbox_exec /bin/sh -c "chmod 0755 /tmp/mcp-gw-sandbox-helper-fixed" || true
-fixed_helper=/tmp/mcp-gw-sandbox-helper-fixed
-placeholder=openshell-token-grant-placeholder
-check_sandbox_helper_configuration "fixed wrapper-form kubectl" \
-  "export MCP_GW_CLI_URL=${cli_route}; exec ${fixed_helper} --run-token ${placeholder} --cli-url \"\$MCP_GW_CLI_URL\" --operation kubectl get pods"
-check_sandbox_helper_configuration "fixed wrapper-form remote shell" \
-  "export MCP_GW_SHELL_URL=${shell_route}; exec ${fixed_helper} --run-token ${placeholder} --shell-url \"\$MCP_GW_SHELL_URL\" --operation remote-shell machine.test -- uname -a"
-check_sandbox_helper_configuration "fixed wrapper-form minimal environment" \
-  "env -i PATH=/usr/bin:/bin ${fixed_helper} --run-token ${placeholder} --cli-url http://127.0.0.1:9/cli/run --operation kubectl get pods"
-check_sandbox_helper_configuration "fixed wrapper-form without a granted route" \
-  "exec ${fixed_helper} --run-token ${placeholder} --cli-url \"\${MCP_GW_CLI_URL-}\" --operation kubectl get pods"
 if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
   exit 1
