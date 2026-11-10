@@ -367,6 +367,23 @@ check_sandbox_helper_configuration "env probe as runtime" \
   "PROBE_VAR=1 BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper /tmp/env-probe.js"
 check_sandbox_helper_configuration "env probe shell view" \
   "PROBE_VAR=1 sh -c 'tr \"\\0\" \"\\n\" </proc/self/environ | cut -d= -f1 | tr \"\\n\" \" \"'; grep -E 'NoNewPrivs|Seccomp' /proc/self/status | tr '\\n' ' '"
+# TEMPORARY verification (steward #77): the mcp-gw fix compiled standalone with
+# the release's Bun version must accept its configuration under the supervisor.
+cp "${BASH_SOURCE[0]%/*}/diagnostics/fixed-sandbox-helper.js" "${debug_dir}/fixed-helper.js"
+docker run --rm --workdir /w --volume "${debug_dir}:/w" \
+  oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 \
+  bun build --compile --target=bun-linux-x64 --outfile /w/mcp-gw-sandbox-helper-fixed /w/fixed-helper.js
+"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
+  sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/mcp-gw-sandbox-helper-fixed" /tmp/
+sandbox_exec /bin/sh -c "chmod 0755 /tmp/mcp-gw-sandbox-helper-fixed" || true
+check_sandbox_helper_configuration "fixed inherited kubectl" \
+  "export MCP_GW_CLI_URL=${cli_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-fixed --operation kubectl get pods"
+check_sandbox_helper_configuration "fixed inline kubectl" \
+  "MCP_GW_CLI_URL=${cli_route} /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-fixed --operation kubectl get pods"
+check_sandbox_helper_configuration "fixed inherited remote shell" \
+  "export MCP_GW_SHELL_URL=${shell_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-fixed --operation remote-shell machine.test -- uname -a"
+check_sandbox_helper_configuration "fixed minimal environment kubectl" \
+  "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /tmp/mcp-gw-sandbox-helper-fixed --operation kubectl get pods"
 if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
   exit 1
