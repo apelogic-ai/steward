@@ -34,16 +34,18 @@ output processing:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
-| `kubectl` | MCP-GW 0.8.0 helper | Governed Kubernetes commands |
-| `remote-shell` | MCP-GW 0.8.0 helper | Governed commands on a run-bound machine |
+| `kubectl` | MCP-GW 0.8.1 helper | Governed Kubernetes commands |
+| `remote-shell` | MCP-GW 0.8.1 helper | Governed commands on a run-bound machine |
 | `uv` | 0.11.15 | Python project and package management |
 
 ## Governed commands and sign-in
 
-The reference image installs the checksum-pinned MCP-GW 0.8.0 sandbox helper
+The reference image installs the checksum-pinned MCP-GW 0.8.1 sandbox helper
 at `/usr/local/bin/mcp-gw-sandbox-helper`. The `kubectl` and `remote-shell`
-wrappers select the matching helper operation explicitly; the helper does not
-contain a gateway credential or implement a second sign-in flow.
+wrappers select the matching helper operation explicitly and pass the
+placeholder run token and the matching route to the helper as options, because
+the sandbox supervisor can start the helper with an empty environment. The
+helper does not contain a gateway credential or implement a second sign-in flow.
 
 When a Task has the matching approved grant, its agent adapter adds only the
 matching route values to the agent process:
@@ -63,8 +65,10 @@ a short-lived, run-bound token only on the allowed network request. MCP-GW then
 checks the token's run identifier, target, and approved command class. A
 missing grant, a command classified above the approved class, or a machine not
 tagged for that run is refused by MCP-GW. Helper configuration and request
-failures return exit code `125` with a generic message and do not print the
-placeholder or substituted token.
+failures return exit code `125` and do not print the placeholder or
+substituted token. A configuration failure names a fixed reason, such as
+`Sandbox helper configuration failed: missing MCP_GW_CLI_URL` when the Task has
+no approved `cli/kubectl` grant.
 
 Use `steward-runtime-providers@1.3.0` with an image containing the helper. Its
 MCP-GW profile preserves exact `POST /mcp` and `DELETE /mcp` access for the

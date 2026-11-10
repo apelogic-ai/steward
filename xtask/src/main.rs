@@ -5897,22 +5897,28 @@ mod tests {
 
         for required in [
             "ARG TARGETARCH",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.0/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
-            "26319ef9c6004e48825cd1411bc2a777c46e2e4e692160ddee25446f65d05f34",
-            "0a3e2452954f0ad4b9bed423fae477639fb743c309cc5c7fc2663a95b4483aa4",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
+            "8ab67581f5a5e991d0429c2fa1f963fe273c746627e652abe9649e1525fb3dec",
+            "b7024d0ccec1e1e447cb857f9f0dedeb6a0e2f6652a1849f280fa16665e72e17",
             "sha256sum --check --strict",
             "/usr/local/bin/mcp-gw-sandbox-helper",
             "/usr/local/bin/kubectl",
             "/usr/local/bin/remote-shell",
-            "--operation kubectl",
-            "--operation remote-shell",
+            r#"'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"'"#,
+            r#"'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --shell-url "$MCP_GW_SHELL_URL" --operation remote-shell "$@"'"#,
         ] {
             assert!(
                 container.contains(required),
                 "runtime image must retain {required}"
             );
         }
+        // The sandbox supervisor can start the compiled helper with an empty
+        // environment, so the wrappers pass the run token and routes as options.
+        assert!(
+            !container.contains("/usr/bin/env MCP_GW_RUN_TOKEN="),
+            "runtime wrappers must not rely on the helper reading its environment"
+        );
         assert_eq!(
             profile_json.pointer("/network/allowedRoutes"),
             Some(&serde_json::json!([
@@ -5975,7 +5981,8 @@ mod tests {
             );
         }
         for required in [
-            "MCP-GW 0.8.0",
+            "MCP-GW 0.8.1",
+            "names a fixed reason",
             "`MCP_GW_RUN_TOKEN` is not present in the agent environment",
             "non-secret `openshell-token-grant-placeholder` marker",
             "MCP_GW_CLI_URL",
