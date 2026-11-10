@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.30] - 2026-11-10
+
+Steward v0.3.30 fixes governed `kubectl` and `remote-shell` commands in the Codex reference
+sandbox and says why Agent Runs show spend or tokens as `Not reported`.
+
 ### Fixed
 
 - Governed `kubectl` and `remote-shell` commands in the Codex reference runtime no longer fail with
@@ -24,6 +29,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `spend_logs_empty`, `spend_logs_incomplete`, `spend_logs_unrecognized`, `gateway_unreachable` or
   `gateway_timeout`) and HTTP status only. The installation guide lists what a self-hosted LiteLLM
   needs for per-run spend and tokens.
+
+### Upgrade and rollback
+
+- Deploy the chart, component images, and reference runtimes as one release unit, then update
+  mirrored v0.3.29 reference runtimes and execution bindings to the v0.3.30 artifacts. No database
+  migration, Helm value, or provider-profile change is added; the provider-profile bundle remains
+  1.3.0, and remote shell still requires MCP-GW v0.8.0 or later as the gateway. Installations still
+  on bundle 1.2.2 run the documented 1.2.2 to 1.3.0 transition from the exact v0.3.30 source
+  revision.
+- Rolling back to v0.3.29 needs no data step, but it restores the reference image whose governed
+  `kubectl` and `remote-shell` commands fail inside the sandbox.
 
 ## [0.3.29] - 2026-11-08
 
@@ -1839,7 +1855,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.29...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.30...HEAD
+[0.3.30]: https://github.com/apelogic-ai/steward/compare/v0.3.29...v0.3.30
 [0.3.29]: https://github.com/apelogic-ai/steward/compare/v0.3.28...v0.3.29
 [0.3.28]: https://github.com/apelogic-ai/steward/compare/v0.3.27...v0.3.28
 [0.3.27]: https://github.com/apelogic-ai/steward/compare/v0.3.26...v0.3.27
