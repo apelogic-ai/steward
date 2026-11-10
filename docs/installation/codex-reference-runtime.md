@@ -57,9 +57,9 @@ The URLs are derived from the Task's configured MCP endpoint. An unrelated or
 unrecognized grant adds none of these values.
 
 No usable `MCP_GW_RUN_TOKEN` is present in the agent environment. When an
-approved grant adds one of these URLs, the adapter also sets `MCP_GW_RUN_TOKEN`,
-which the helper requires, to the non-secret `openshell-token-grant-placeholder`
-marker, and OpenShell substitutes
+approved grant adds one of these URLs, the adapter also sets the
+`MCP_GW_RUN_TOKEN` that the helper requires to the
+non-secret `openshell-token-grant-placeholder` marker, and OpenShell substitutes
 a short-lived, run-bound token only on the allowed network request. MCP-GW then
 checks the token's run identifier, target, and approved command class. A
 missing grant, a command classified above the approved class, or a machine not
