@@ -318,6 +318,20 @@ check_sandbox_helper_configuration "inherited remote shell" \
   "export MCP_GW_SHELL_URL=${shell_route}; remote-shell machine.test -- uname -a"
 check_sandbox_helper_configuration "minimal environment kubectl" \
   "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run kubectl get pods"
+# TEMPORARY diagnostic (steward #77): run an instrumented copy of the helper's
+# configuration logic with the packaged helper acting as its own Bun runtime,
+# inside the same sandbox, to name the failing check.
+probe_source="${BASH_SOURCE[0]%/*}/diagnostics/governed-helper-config-probe.js"
+probe_encoded="$(base64 <"${probe_source}" | tr -d '\n')"
+sandbox_exec /bin/sh -c "printf '%s' '${probe_encoded}' | base64 -d >/tmp/helper-config-probe.js"
+check_sandbox_helper_configuration "runtime argv" \
+  "BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper -e 'console.log(JSON.stringify({argv0: process.argv0, argv: process.argv, execPath: process.execPath}))' -- a b"
+check_sandbox_helper_configuration "debug inherited kubectl" \
+  "export MCP_GW_CLI_URL=${cli_route}; BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation kubectl get pods"
+check_sandbox_helper_configuration "debug minimal environment kubectl" \
+  "env -i PATH=/usr/local/bin:/usr/bin:/bin BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation kubectl get pods"
+check_sandbox_helper_configuration "debug inherited remote shell" \
+  "export MCP_GW_SHELL_URL=${shell_route}; BUN_BE_BUN=1 MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /usr/local/bin/mcp-gw-sandbox-helper /tmp/helper-config-probe.js --operation remote-shell machine.test -- uname -a"
 if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
   exit 1
