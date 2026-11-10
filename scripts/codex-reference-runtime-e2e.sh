@@ -281,3 +281,44 @@ case \"\$(env)\" in
   *openshell-token-grant-placeholder*) exit 1 ;;
 esac
 "
+
+# The packaged helper must accept its configuration inside the governed
+# sandbox, not only in a plain container (steward #77). Command routes reach
+# the agent as inherited environment variables; configuration is checked before
+# any network use, so an unreachable route proves acceptance by failing only
+# the request.
+sandbox_exec /bin/sh -c "
+id
+ls -l /usr/local/bin/kubectl /usr/local/bin/remote-shell /usr/local/bin/mcp-gw-sandbox-helper
+command -v sha256sum
+sha256sum /usr/local/bin/kubectl /usr/local/bin/remote-shell || echo wrappers-unreadable
+env | cut -d= -f1 | sort | tr '\n' ' '
+echo
+" || true
+helper_configuration_failed=0
+check_sandbox_helper_configuration() {
+  label="$1"
+  command="$2"
+  set +e
+  output="$(sandbox_exec /bin/sh -c "${command}" 2>&1)"
+  status=$?
+  set -e
+  echo "sandbox helper ${label}: exit ${status}: $(printf '%s' "${output}" | tr '\n' '|')"
+  case "${output}" in
+    *"Sandbox helper configuration failed"*) helper_configuration_failed=1 ;;
+  esac
+}
+cli_route="https://codex-refusal.test:8443/cli/run"
+shell_route="https://codex-refusal.test:8443/shell/run"
+check_sandbox_helper_configuration "inherited kubectl" \
+  "export MCP_GW_CLI_URL=${cli_route}; kubectl get pods"
+check_sandbox_helper_configuration "inline kubectl" \
+  "MCP_GW_CLI_URL=${cli_route} kubectl get pods"
+check_sandbox_helper_configuration "inherited remote shell" \
+  "export MCP_GW_SHELL_URL=${shell_route}; remote-shell machine.test -- uname -a"
+check_sandbox_helper_configuration "minimal environment kubectl" \
+  "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run kubectl get pods"
+if [[ "${helper_configuration_failed}" == "1" ]]; then
+  echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
+  exit 1
+fi
