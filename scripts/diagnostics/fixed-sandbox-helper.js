@@ -1,29 +1,7 @@
 // TEMPORARY verification for steward #77 (draft PR only; remove before merge).
-// Bundled mcp-gw fix branch fix/sandbox-helper-standalone-environment @ 60d4c86:
-// servers/governed-cli/src/{sandbox-helper,process-environment,shim}.ts, compiled in CI as the release does.
+// Bundled mcp-gw fix branch fix/sandbox-helper-explicit-config @ 43030f1:
+// servers/governed-cli/src/{sandbox-helper,shim}.ts, compiled in CI as the release does.
 // @bun
-// servers/governed-cli/src/process-environment.ts
-import { readFileSync } from "fs";
-var readOwnEnviron = () => readFileSync("/proc/self/environ");
-function sandboxHelperEnvironment(runtime, readEnviron = readOwnEnviron) {
-  if (Object.keys(runtime).length > 0)
-    return runtime;
-  let environ;
-  try {
-    environ = readEnviron();
-  } catch {
-    return {};
-  }
-  const env = {};
-  for (const entry of new TextDecoder().decode(environ).split("\x00")) {
-    const separator = entry.indexOf("=");
-    if (separator <= 0)
-      continue;
-    env[entry.slice(0, separator)] = entry.slice(separator + 1);
-  }
-  return env;
-}
-
 // servers/governed-cli/src/shim.ts
 import { basename } from "path";
 var HELPER_FAILURE_EXIT_CODE = 125;
@@ -49,42 +27,71 @@ async function runRemoteShellShim(options) {
   }, `Remote shell request failed
 `);
 }
+
+class HelperConfigurationError extends Error {
+}
+var HELPER_OPTIONS = {
+  "--run-token": "MCP_GW_RUN_TOKEN",
+  "--cli-url": "MCP_GW_CLI_URL",
+  "--shell-url": "MCP_GW_SHELL_URL"
+};
+function leadingOptions(args) {
+  const overrides = {};
+  let index = 0;
+  while (index < args.length && Object.hasOwn(HELPER_OPTIONS, args[index] ?? "")) {
+    const name = HELPER_OPTIONS[args[index]];
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--") || Object.hasOwn(overrides, name)) {
+      throw new HelperConfigurationError("invalid helper option");
+    }
+    overrides[name] = value;
+    index += 2;
+  }
+  if (index > 0 && args[index] !== "--operation") {
+    throw new HelperConfigurationError("invalid helper option");
+  }
+  return { overrides, rest: args.slice(index) };
+}
 async function runSandboxHelper(options) {
   const stderr = options.stderr ?? process.stderr;
-  const fail = () => {
-    stderr.write(`Sandbox helper configuration failed
+  const fail = (reason) => {
+    stderr.write(`Sandbox helper configuration failed: ${reason}
 `);
     return HELPER_FAILURE_EXIT_CODE;
   };
   try {
     const invokedAs = basename(options.argv0);
-    const operationIndex = options.args.indexOf("--operation");
+    const { overrides, rest } = leadingOptions(options.args);
+    const env = { ...options.env, ...overrides };
+    const operationIndex = rest.indexOf("--operation");
     if (operationIndex > 0)
-      return fail();
+      return fail("invalid operation");
     let command = invokedAs;
-    let args = options.args;
+    let args = rest;
     if (operationIndex === 0) {
-      const operation = options.args[1];
+      const operation = rest[1];
       if (operation !== "kubectl" && operation !== "remote-shell")
-        return fail();
+        return fail("invalid operation");
       if ((invokedAs === "kubectl" || invokedAs === "remote-shell") && invokedAs !== operation) {
-        return fail();
+        return fail("invalid operation");
       }
       command = operation;
-      args = options.args.slice(2);
+      args = rest.slice(2);
     }
-    const token = required(options.env, "MCP_GW_RUN_TOKEN");
+    const token = env.MCP_GW_RUN_TOKEN?.trim();
+    if (!token)
+      return fail("missing run token");
     if (command === "remote-shell") {
       if (args.length < 3 || args[1] !== "--")
-        return fail();
+        return fail("invalid remote-shell arguments");
       const target = args[0];
       const remoteCommand = args.slice(2).join(" ");
       if (!target?.trim() || !remoteCommand.trim())
-        return fail();
+        return fail("invalid remote-shell arguments");
       return await runRemoteShellShim({
         target,
         command: remoteCommand,
-        endpoint: endpoint(options.env, "MCP_GW_SHELL_URL"),
+        endpoint: endpoint(env, "MCP_GW_SHELL_URL"),
         token,
         fetch: options.fetch,
         stdout: options.stdout,
@@ -92,18 +99,18 @@ async function runSandboxHelper(options) {
       });
     }
     if (!command || command === "mcp-gw-sandbox-helper")
-      return fail();
+      return fail("invalid operation");
     return await runCliShim({
       cli: command,
       args,
-      endpoint: endpoint(options.env, "MCP_GW_CLI_URL"),
+      endpoint: endpoint(env, "MCP_GW_CLI_URL"),
       token,
       fetch: options.fetch,
       stdout: options.stdout,
       stderr: options.stderr
     });
-  } catch {
-    return fail();
+  } catch (error) {
+    return fail(error instanceof HelperConfigurationError ? error.message : "unexpected error");
   }
 }
 async function runRequest(options, failureMessage) {
@@ -179,18 +186,20 @@ function consumeEvent(line, exitCode, stdout, stderr) {
   }
   return event.exit_code;
 }
-function required(env, name) {
+function endpoint(env, name) {
   const value = env[name]?.trim();
   if (!value)
-    throw new Error(`Missing ${name}`);
-  return value;
-}
-function endpoint(env, name) {
-  const value = required(env, name);
-  const url = new URL(value);
+    throw new HelperConfigurationError(`missing ${name}`);
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new HelperConfigurationError(`${name} is not a valid URL`);
+  }
   const loopback = url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "[::1]");
-  if (url.protocol !== "https:" && !loopback)
-    throw new Error(`${name} must use HTTPS`);
+  if (url.protocol !== "https:" && !loopback) {
+    throw new HelperConfigurationError(`${name} must use HTTPS`);
+  }
   return value;
 }
 function isRecord(value) {
@@ -201,5 +210,5 @@ function isRecord(value) {
 process.exitCode = await runSandboxHelper({
   argv0: process.argv0,
   args: process.argv.slice(2),
-  env: sandboxHelperEnvironment(process.env)
+  env: process.env
 });

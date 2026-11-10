@@ -376,14 +376,16 @@ docker run --rm --workdir /w --volume "${debug_dir}:/w" \
 "${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
   sandbox upload --no-git-ignore "${sandbox}" "${debug_dir}/mcp-gw-sandbox-helper-fixed" /tmp/
 sandbox_exec /bin/sh -c "chmod 0755 /tmp/mcp-gw-sandbox-helper-fixed" || true
-check_sandbox_helper_configuration "fixed inherited kubectl" \
-  "export MCP_GW_CLI_URL=${cli_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-fixed --operation kubectl get pods"
-check_sandbox_helper_configuration "fixed inline kubectl" \
-  "MCP_GW_CLI_URL=${cli_route} /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-fixed --operation kubectl get pods"
-check_sandbox_helper_configuration "fixed inherited remote shell" \
-  "export MCP_GW_SHELL_URL=${shell_route}; /usr/bin/env MCP_GW_RUN_TOKEN=openshell-token-grant-placeholder /tmp/mcp-gw-sandbox-helper-fixed --operation remote-shell machine.test -- uname -a"
-check_sandbox_helper_configuration "fixed minimal environment kubectl" \
-  "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_RUN_TOKEN=x MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run /tmp/mcp-gw-sandbox-helper-fixed --operation kubectl get pods"
+fixed_helper=/tmp/mcp-gw-sandbox-helper-fixed
+placeholder=openshell-token-grant-placeholder
+check_sandbox_helper_configuration "fixed wrapper-form kubectl" \
+  "export MCP_GW_CLI_URL=${cli_route}; exec ${fixed_helper} --run-token ${placeholder} --cli-url \"\$MCP_GW_CLI_URL\" --operation kubectl get pods"
+check_sandbox_helper_configuration "fixed wrapper-form remote shell" \
+  "export MCP_GW_SHELL_URL=${shell_route}; exec ${fixed_helper} --run-token ${placeholder} --shell-url \"\$MCP_GW_SHELL_URL\" --operation remote-shell machine.test -- uname -a"
+check_sandbox_helper_configuration "fixed wrapper-form minimal environment" \
+  "env -i PATH=/usr/bin:/bin ${fixed_helper} --run-token ${placeholder} --cli-url http://127.0.0.1:9/cli/run --operation kubectl get pods"
+check_sandbox_helper_configuration "fixed wrapper-form without a granted route" \
+  "exec ${fixed_helper} --run-token ${placeholder} --cli-url \"\${MCP_GW_CLI_URL-}\" --operation kubectl get pods"
 if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
   exit 1
