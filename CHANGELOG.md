@@ -7,14 +7,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-### Fixed
-
-- Approved governed `kubectl` and `remote-shell` commands no longer fail with "Sandbox helper
-  configuration failed" in images that run the MCP-GW sandbox helper directly. When a Task grant
-  adds a command URL, both agent adapters now also set `MCP_GW_RUN_TOKEN` to the non-secret
-  `openshell-token-grant-placeholder` marker, which OpenShell replaces with the run-bound token only
-  on the allowed request. Unrelated, over-class and tool-less Tasks still get no `MCP_GW_RUN_TOKEN`.
-
 ## [0.3.29] - 2026-11-08
 
 Steward v0.3.29 adds governed CLI and remote-shell commands to agent sandboxes, signs
