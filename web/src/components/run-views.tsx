@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   allRun,
@@ -723,14 +723,14 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <div className="mx-5 border-t border-line-soft py-4 text-xs text-muted-ink"><p className="font-mono">{taskUid}</p><p className="mt-2">Created {dateTime(run.createdAt)}</p></div>
               </nav>
               <main className="min-w-0">
-                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-6">{[
+                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-6">{([
                   ["Workflow version", pinnedWorkflow],
                   ["User envelope revision", admitted?.kind === "admitted" ? admitted.envelopeRevision ?? "—" : run.userEnvelopeRevision ?? "—"],
                   ["Runtime", runtimeBound?.kind === "runtimeBound" ? runtimeBound.runtimeUid : run.runtimeUid ?? "unassigned"],
                   ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : <NotReported key="spend" reason={run.spendReportReason} />],
                   ["Tokens used", run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : <NotReported key="tokens" reason={run.spendReportReason} />],
                   ["Agent", run.codingAgentRuntime],
-                ].map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
+                ] satisfies Array<[string, ReactNode]>).map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
                 <section aria-labelledby="selected-stage" className="p-5">
                   <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
