@@ -1092,6 +1092,7 @@ async fn browser_application_router(
                 broker.clone(),
                 browser_task_rerunner,
                 auth.clone(),
+                application_config.inference_mode,
             ))
             .merge(github_automation::protected_router(
                 store.clone(),
@@ -1108,6 +1109,7 @@ async fn browser_application_router(
             store.clone(),
             browser_task_rerunner,
             auth.clone(),
+            application_config.inference_mode,
         )),
     };
     let app = match stable_bridge_configuration()? {

@@ -16,6 +16,10 @@ runtime-scoped LiteLLM keys from a deployment master key. Use
 `inference.mode=managed` only when the inference endpoint accepts the users'
 stored keys.
 
+Managed inference does not report per-run spend or tokens yet. Admin Agent
+Runs show `Not reported` with the reason "Spend reporting isn't available yet
+when runs use people's own model keys."
+
 ## Database reader
 
 Mint uses a separate PostgreSQL credential. It needs `CONNECT`, schema `USAGE`,

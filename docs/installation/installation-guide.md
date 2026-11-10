@@ -720,6 +720,31 @@ preserve the same immutable coordinates and cross-component relationships.
    `config.controller.litellmSpendLogTimeoutSeconds` limits each request-log
    read, defaults to 10 seconds, and accepts whole values of at least 1 second.
 
+   **Self-hosted LiteLLM.** Per-run spend and tokens need:
+   - a LiteLLM database with spend logging on (`disable_spend_logs` unset);
+   - a management key that may read `/spend/logs` (the master key or a
+     proxy-admin key);
+   - LiteLLM v1.93.0, the version listed under compatibility above.
+
+   When a request-log read fails, the controller writes at most one warning per
+   reason every 10 minutes, for example
+   `{"level":"warn","component":"litellm","event":"spend_logs_unavailable","reason":"spend_logs_refused","httpStatus":403}`.
+   The line never contains a key, URL or response body. Reasons:
+
+   | Reason | Meaning |
+   | --- | --- |
+   | `spend_logs_refused` | LiteLLM answered 401 or 403: the key may not read request logs. |
+   | `spend_logs_not_found` | LiteLLM answered 404: the request-log route is missing. |
+   | `spend_logs_failed` | LiteLLM answered another error status. |
+   | `spend_logs_empty` | No request log matches the run's key, for example spend logging is off. |
+   | `spend_logs_incomplete` | LiteLLM truncated or paged the request logs. |
+   | `spend_logs_unrecognized` | The response shape or a spend amount was not recognized. |
+   | `gateway_unreachable` / `gateway_timeout` | The read did not reach LiteLLM or exceeded the timeout. |
+
+   Admin Agent Runs show a plain reason next to `Not reported`: the gateway
+   reported no spend for the run, it reported spend but not tokens, or the
+   deployment uses managed inference, which does not report spend yet.
+
    Every model admitted by the capability catalog must have pricing configured
    in LiteLLM. In Steward 0.3.27, LiteLLM `model_name` must equal the exact
    provider-qualified catalog model string (for example `openai/model-name`).

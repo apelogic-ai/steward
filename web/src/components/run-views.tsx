@@ -514,6 +514,23 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
   );
 }
 
+const SPEND_REPORT_REASONS: Readonly<Record<string, string>> = {
+  notSupportedInManagedMode: "Spend reporting isn't available yet when runs use people's own model keys.",
+  noSpendObservation: "The model gateway hasn't reported spend for this run.",
+  usageNotReported: "The model gateway reported spend but not tokens used.",
+};
+
+/** Plain sentence for an admin spend reason code; unknown codes show no sentence. */
+export function spendReportReasonText(reason: string | null | undefined): string | null {
+  return reason && Object.hasOwn(SPEND_REPORT_REASONS, reason) ? SPEND_REPORT_REASONS[reason] : null;
+}
+
+function NotReported({ reason }: Readonly<{ reason?: string | null }>) {
+  const text = spendReportReasonText(reason);
+  if (!text) return <>Not reported</>;
+  return <span title={text}>Not reported<span className="mt-0.5 block whitespace-normal font-sans text-xs font-normal text-muted-ink">{text}</span></span>;
+}
+
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No runs yet.</p>;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
@@ -524,8 +541,8 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
     { key: "envelope", label: "Envelope", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => run.userEnvelopeRevision ? `rev ${run.userEnvelopeRevision}` : "—" },
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
     { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },
-    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Not reported" },
-    { key: "tokens", label: "Tokens used", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : "Not reported" },
+    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : <NotReported reason={run.spendReportReason} /> },
+    { key: "tokens", label: "Tokens used", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : <NotReported reason={run.spendReportReason} /> },
     { key: "updated", label: "Updated", className: "text-right text-muted-ink", render: (run: BrowserRunView) => relativeTime(run.updatedAt) },
   ];
   return <DataTable
@@ -710,8 +727,8 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   ["Workflow version", pinnedWorkflow],
                   ["User envelope revision", admitted?.kind === "admitted" ? admitted.envelopeRevision ?? "—" : run.userEnvelopeRevision ?? "—"],
                   ["Runtime", runtimeBound?.kind === "runtimeBound" ? runtimeBound.runtimeUid : run.runtimeUid ?? "unassigned"],
-                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Not reported"],
-                  ["Tokens used", run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : "Not reported"],
+                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : <NotReported key="spend" reason={run.spendReportReason} />],
+                  ["Tokens used", run.observedSpend?.totalTokens != null ? run.observedSpend.totalTokens.toLocaleString() : <NotReported key="tokens" reason={run.spendReportReason} />],
                   ["Agent", run.codingAgentRuntime],
                 ].map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
                 <section aria-labelledby="selected-stage" className="p-5">

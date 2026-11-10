@@ -9518,6 +9518,13 @@
               "null"
             ]
           },
+          "spendReportReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Admin views only: why spend or tokens show as not reported. One of\n`notSupportedInManagedMode`, `noSpendObservation` or `usageNotReported`."
+          },
           "stages": {
             "type": "array",
             "items": {

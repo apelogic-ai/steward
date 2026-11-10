@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Admin Agent Runs now say why spend or tokens show `Not reported`: the deployment uses managed
+  inference (not reported yet), the model gateway reported no spend for the run, or it reported spend
+  but not tokens. The admin run views expose this as `spendReportReason`; personal Runs views do not.
+- When a LiteLLM request-log read fails, the controller writes one rate-limited structured warning
+  with a stable reason (`spend_logs_refused`, `spend_logs_not_found`, `spend_logs_failed`,
+  `spend_logs_empty`, `spend_logs_incomplete`, `spend_logs_unrecognized`, `gateway_unreachable` or
+  `gateway_timeout`) and HTTP status only. The installation guide lists what a self-hosted LiteLLM
+  needs for per-run spend and tokens.
+
 ## [0.3.29] - 2026-11-08
 
 Steward v0.3.29 adds governed CLI and remote-shell commands to agent sandboxes, signs

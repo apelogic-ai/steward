@@ -24,8 +24,9 @@ use steward_ports::{
 };
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
-    AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind, BrowserTaskVersionPublication,
-    BrowserTaskVersionRecord, StoreError, TaskRecord, WorkflowRevisionRecord,
+    AgentRunRecord, AgentRunSpend, AgentRunTimelineEvent, AgentRunTimelineKind,
+    BrowserTaskVersionPublication, BrowserTaskVersionRecord, StoreError, TaskRecord,
+    WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, EnvelopeDigest,
@@ -36,7 +37,7 @@ use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, TaskOutputArchiveEntry,
     task_output_archive_entries,
 };
-use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
+use steward_types::{CanonicalUserId, InferenceMode, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
 use crate::browser_auth::{
@@ -64,6 +65,8 @@ pub(crate) struct BrowserRunsState<L> {
     github_rerunner: Arc<dyn BrowserGithubRerunner>,
     browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
     event_streams: Arc<BrowserRunEventStreams>,
+    /// Lets admin views say why spend is not reported; managed inference keeps no spend yet.
+    inference_mode: InferenceMode,
 }
 
 const MAX_BROWSER_RUN_EVENT_STREAMS_PER_USER: usize = 4;
@@ -463,6 +466,10 @@ pub(crate) struct BrowserRunView {
     execution_log: ExecutionLogMode,
     rerun_supported: bool,
     rerun_unavailable_reason: Option<&'static str>,
+    /// Admin views only: why spend or tokens show as not reported. One of
+    /// `notSupportedInManagedMode`, `noSpendObservation` or `usageNotReported`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spend_report_reason: Option<&'static str>,
     stages: Vec<BrowserRunStage>,
 }
 
@@ -912,6 +919,7 @@ where
             github_rerunner,
             browser_task_rerunner,
             event_streams: Arc::new(BrowserRunEventStreams::default()),
+            inference_mode: InferenceMode::default(),
         })
 }
 
@@ -1734,7 +1742,11 @@ fn encode_output_path(path: &str) -> String {
         .join("/")
 }
 
-fn all_runs_router<L>(ledger: L, github_rerunner: Arc<dyn BrowserGithubRerunner>) -> Router
+fn all_runs_router<L>(
+    ledger: L,
+    github_rerunner: Arc<dyn BrowserGithubRerunner>,
+    inference_mode: InferenceMode,
+) -> Router
 where
     L: AgentRunLedger,
 {
@@ -1754,6 +1766,7 @@ where
             github_rerunner,
             browser_task_rerunner: Arc::new(DisabledBrowserTaskRerunner),
             event_streams: Arc::new(BrowserRunEventStreams::default()),
+            inference_mode,
         })
 }
 
@@ -1778,7 +1791,7 @@ where
         browser_auth.clone(),
     )
     .merge(protect_browser_admin_routes(
-        all_runs_router(ledger, github_rerunner),
+        all_runs_router(ledger, github_rerunner, InferenceMode::default()),
         browser_auth,
     ))
 }
@@ -1803,7 +1816,7 @@ where
         browser_auth.clone(),
     )
     .merge(protect_browser_admin_routes(
-        all_runs_router(ledger, github_rerunner),
+        all_runs_router(ledger, github_rerunner, InferenceMode::default()),
         browser_auth,
     ))
 }
@@ -1813,6 +1826,7 @@ pub fn protected_router_with_rerunners<L, P>(
     github_rerunner: P,
     browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
     browser_auth: BrowserAuthService,
+    inference_mode: InferenceMode,
 ) -> Router
 where
     L: AgentRunLedger,
@@ -1828,7 +1842,7 @@ where
         browser_auth.clone(),
     )
     .merge(protect_browser_admin_routes(
-        all_runs_router(ledger, github_rerunner),
+        all_runs_router(ledger, github_rerunner, inference_mode),
         browser_auth,
     ))
 }
@@ -1837,6 +1851,7 @@ pub fn protected_router_with_task_reruns<L>(
     ledger: L,
     browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
     browser_auth: BrowserAuthService,
+    inference_mode: InferenceMode,
 ) -> Router
 where
     L: AgentRunLedger,
@@ -1851,7 +1866,7 @@ where
         browser_auth.clone(),
     )
     .merge(protect_browser_admin_routes(
-        all_runs_router(ledger, github_rerunner),
+        all_runs_router(ledger, github_rerunner, inference_mode),
         browser_auth,
     ))
 }
@@ -1977,7 +1992,7 @@ where
                 .map(|record| AllRunsView {
                     owner_user_id: record.owner_user_id.clone(),
                     owner_display_email: record.owner_display_email.clone(),
-                    run: browser_run_view(record),
+                    run: admin_browser_run_view(record, state.inference_mode),
                 })
                 .collect(),
             next_cursor,
@@ -2018,6 +2033,7 @@ where
         &state.ledger,
         task_uid,
         Some(session.principal.canonical_user_id.as_str().to_owned()),
+        None,
     )
     .await
 }
@@ -2424,7 +2440,7 @@ where
     if authority.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    single_run_response(&state.ledger, task_uid, None).await
+    single_run_response(&state.ledger, task_uid, None, Some(state.inference_mode)).await
 }
 
 #[utoipa::path(
@@ -2645,6 +2661,7 @@ async fn single_run_response<L>(
     ledger: &L,
     task_uid: Uuid,
     owner_user_id: Option<String>,
+    admin_inference_mode: Option<InferenceMode>,
 ) -> Response
 where
     L: AgentRunLedger,
@@ -2652,7 +2669,10 @@ where
     match scoped_run(ledger, task_uid, owner_user_id).await {
         Ok(Some(record)) => Json(BrowserRunResponse {
             api_version: BROWSER_AGENT_RUNS_API_VERSION,
-            run: browser_run_view(record),
+            run: match admin_inference_mode {
+                Some(mode) => admin_browser_run_view(record, mode),
+                None => browser_run_view(record),
+            },
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -2720,6 +2740,27 @@ where
         })
         .await?;
     Ok(page.records.into_iter().next())
+}
+
+/// Why an admin sees "Not reported" for spend or tokens; `None` when both are reported.
+fn spend_report_reason(
+    spend: Option<&AgentRunSpend>,
+    inference_mode: InferenceMode,
+) -> Option<&'static str> {
+    match spend {
+        None if inference_mode == InferenceMode::Managed => Some("notSupportedInManagedMode"),
+        None => Some("noSpendObservation"),
+        Some(spend) if spend.total_tokens.is_none() => Some("usageNotReported"),
+        Some(_) => None,
+    }
+}
+
+fn admin_browser_run_view(record: AgentRunRecord, inference_mode: InferenceMode) -> BrowserRunView {
+    let reason = spend_report_reason(record.spend.as_ref(), inference_mode);
+    BrowserRunView {
+        spend_report_reason: reason,
+        ..browser_run_view(record)
+    }
 }
 
 fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
@@ -2865,6 +2906,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         rerun_supported,
         rerun_unavailable_reason: (!rerun_supported)
             .then_some("This run does not have a replayable package source."),
+        spend_report_reason: None,
         stages,
     }
 }
@@ -5593,21 +5635,26 @@ mod tests {
         });
         let (service, session_cookie, csrf) =
             signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
-        let response = protected_router_with_task_reruns(ledger.clone(), rerunner, service.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/app/api/v1/runs/{source_task_uid}/rerun"))
-                    .header(header::COOKIE, &session_cookie)
-                    .header(header::ORIGIN, "http://127.0.0.1:33001")
-                    .header("sec-fetch-site", "same-origin")
-                    .header("x-steward-csrf", &csrf)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"idempotencyKey":"one-click"}"#))
-                    .map_err(|error| format!("build browser rerun request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("execute browser rerun request: {error}"))?;
+        let response = protected_router_with_task_reruns(
+            ledger.clone(),
+            rerunner,
+            service.clone(),
+            InferenceMode::Stock,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/app/api/v1/runs/{source_task_uid}/rerun"))
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, "http://127.0.0.1:33001")
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"idempotencyKey":"one-click"}"#))
+                .map_err(|error| format!("build browser rerun request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute browser rerun request: {error}"))?;
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), 4096)
             .await
@@ -5632,6 +5679,7 @@ mod tests {
                 BrowserTaskRerunError::InferenceKeyMissing,
             )),
             service,
+            InferenceMode::Stock,
         )
         .oneshot(
             Request::builder()
@@ -5811,6 +5859,55 @@ mod tests {
                 .map_err(|error| format!("decode staged rerun response: {error}"))?,
             serde_json::json!({ "error": "connections.orchestration_not_active" })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_inference_admin_runs_say_spend_is_not_supported() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("44444444-4444-4444-8444-444444444444")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        let mut unreported = run(task_uid, "usr_abcdefabcdefabcdefabcdefabcdefab");
+        unreported.spend = None;
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(unreported);
+
+        for uri in [
+            format!("/admin/api/v1/all-runs/{task_uid}"),
+            "/admin/api/v1/all-runs".to_owned(),
+        ] {
+            let (admin_service, admin_cookie) = signed_in_cookie(LocalFakeIdentity::Admin).await?;
+            let response = protected_router_with_task_reruns(
+                ledger.clone(),
+                Arc::new(DisabledBrowserTaskRerunner),
+                admin_service,
+                InferenceMode::Managed,
+            )
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::COOKIE, admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build {uri} request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute {uri} request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .map_err(|error| format!("read {uri} response: {error}"))?;
+            let body: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("decode {uri} response: {error}"))?;
+            let run = body.get("run").or_else(|| body["runs"].get(0));
+            assert_eq!(
+                run.and_then(|run| run.get("spendReportReason")),
+                Some(&serde_json::json!("notSupportedInManagedMode")),
+                "{uri}"
+            );
+        }
         Ok(())
     }
 
