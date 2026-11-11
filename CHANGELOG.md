@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- A user guide in `docs/user-guide/` for people who run Tasks. It covers concepts, running a Task
+  from the app, repository checkouts (directories and default names, every `ref` form, what
+  `trigger` resolves to, history, paths, submodules and access), outputs, callers, reading a run,
+  common refusals, and reference tables. CI checks every JSON example in the guide against the
+  Task contract, and an example with no schema marker fails the check.
+
 ## [0.3.30] - 2026-11-10
 
 Steward v0.3.30 fixes governed `kubectl` and `remote-shell` commands in the Codex reference

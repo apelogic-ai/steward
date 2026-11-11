@@ -12,6 +12,28 @@ Audience: engineering leadership, IT / security, platform, product
 > implementation contracts, and the [frozen M1 contract](contracts/m1/v1/README.md) for
 > normative M1 behavior.
 
+> **Outdated as of Steward v0.3.30 (reviewed 2026-11-11).** Read the sections below as the
+> original proposal only:
+>
+> - **§1–§2:** what shipped is governed Tasks and Runs under per-user Envelopes, not a
+>   long-running agent. Steward is its own control plane (apiserver, controller, Mint) on stock
+>   OpenShell, not an OpenShell gateway extension. LiteLLM holds inference keys only in stock
+>   inference mode. See the [user guide](user-guide/README.md),
+>   [Task submission API](task-submission-api.md) and
+>   [managed inference](installation/managed-inference.md).
+> - **§3 and §6:** administrators approve Envelope requests in Steward. There is no Jira
+>   escalation or Jira system of record; Jira is a read-only Trigger source
+>   ([Jira Triggers](calling-steward-from-jira.md)). Evidence lives in Task records, audit
+>   records and the Agent Runs views ([Agent Runs API](admin-agent-runs-api-v1.md)).
+> - **§4 and §9:** authority comes from Envelope template revisions and User Envelopes, not role
+>   envelopes ([Envelope administration](operator-envelope-administration.md)). The governed
+>   tool surface includes `kubectl` and remote shell
+>   ([governed CLI and remote shell](installation/governed-cli-remote-shell.md)).
+> - **§5:** standing month-long delegation applies only to the deferred long-running agent. Task
+>   runs get runtime-scoped keys revoked at cleanup
+>   ([Task runtime orchestration](task-runtime-orchestration.md)).
+> - **§7:** in managed inference mode Steward holds each user's encrypted model key.
+
 > **Naming note.** *Steward* is a **temporary working name** for the control plane
 > described here, pending a final brand + availability/trademark check. It is not an
 > OpenShell sub-brand: the product is built *on* OpenShell (NVIDIA, Apache-2.0) but

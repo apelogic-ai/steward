@@ -46,6 +46,12 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`contracts/m1/v1/README.md`](contracts/m1/v1/README.md) | **Frozen contract** | Entry point for `steward.m1/v1` schemas, fixtures, compatibility, and authority decisions. |
 | [`m1-delivery-plan.md`](m1-delivery-plan.md) | **Historical** | Delivery dependency index for the frozen M1 outcome; not implementation status. |
 
+### User guide
+
+| Document | Status | Purpose |
+|---|---|---|
+| [`user-guide/README.md`](user-guide/README.md) | **Current implementation** | Task-oriented guide for people who run Tasks: concepts, the app, repository checkouts, outputs, callers, reading a run, refusals, and reference tables. Its JSON examples are checked against the Task contract in CI. |
+
 ### Current implementation
 
 | Document | Status | Scope |
