@@ -337,12 +337,15 @@ done
 for f in "${SSL_CERT_FILE:-}" "${NODE_EXTRA_CA_CERTS:-}"; do
   [ -n "$f" ] && { test -r "$f" && echo "readable $f $(grep -c BEGIN "$f") certs" || echo "unreadable $f"; }
 done'
+# Each call uses its own unresolvable host, so OpenShell's network log shows
+# exactly which calls reached the egress proxy (a DENIED entry naming that
+# host) and which never left the process (no entry). `exec` keeps the pid.
 proof "curl through env proxy (control)" \
-  "curl -sS -o /dev/null -w 'http=%{http_code}\n' --max-time 15 -X POST -H 'Content-Type: application/json' -d '{}' ${cli_route}"
-proof "curl with no proxy (direct)" \
-  "curl -sS -o /dev/null -w 'http=%{http_code}\n' --max-time 15 --noproxy '*' -X POST -d '{}' ${cli_route}"
+  "echo pid=\$\$; exec curl -sS -o /dev/null -w 'http=%{http_code}\n' --max-time 15 -X POST -d '{}' https://curl-route.test:8443/cli/run"
 proof "packaged kubectl wrapper" \
-  "export MCP_GW_CLI_URL=${cli_route}; kubectl get pods"
+  "echo pid=\$\$; export MCP_GW_CLI_URL=https://wrapper-cli-route.test:8443/cli/run; exec kubectl get pods"
+proof "packaged remote-shell wrapper" \
+  "echo pid=\$\$; export MCP_GW_SHELL_URL=https://wrapper-shell-route.test:8443/shell/run; exec remote-shell machine.test -- uname -a"
 bun_fetch='const o={method:"POST",headers:{"content-type":"application/json"},body:"{}"};
 const p=process.env.HTTPS_PROXY||process.env.https_proxy||process.env.ALL_PROXY||"";
 const f=process.env.SSL_CERT_FILE||process.env.NODE_EXTRA_CA_CERTS||"";
@@ -350,10 +353,8 @@ const mode="__MODE__";
 console.log("mode="+mode+" env_keys="+Object.keys(process.env).length+" proxy_set="+(p!=="")+" ca_set="+(f!==""));
 if(mode==="proxy"||mode==="proxy-ca")o.proxy=p;
 if(mode==="proxy-ca")o.tls={ca:require("fs").readFileSync(f,"utf8")};
-fetch("'"${cli_route}"'",o).then(r=>console.log("status="+r.status)).catch(e=>console.log("error="+e.name+": "+(e.code||"")+" "+e.message))'
+fetch("https://bun-"+mode+".test:8443/cli/run",o).then(r=>console.log("status="+r.status)).catch(e=>console.log("error="+e.name+": "+(e.code||"")+" "+e.message))'
 printf '%s' "${bun_fetch}" >"${STEWARD_RUN_DIR}/proof-fetch.js"
-proof "helper binary: compiled entry env visibility" \
-  "env | wc -l; MCP_GW_CLI_URL=${cli_route} /usr/local/bin/mcp-gw-sandbox-helper --operation kubectl get pods"
 for mode in direct-no-env direct proxy proxy-ca; do
   if [[ "${mode}" == "direct-no-env" ]]; then
     prefix="env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy"
@@ -361,10 +362,10 @@ for mode in direct-no-env direct proxy proxy-ca; do
     prefix="env"
   fi
   proof "helper binary as bun: fetch ${mode}" \
-    "${prefix} BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper -e '$(sed -e "s/__MODE__/${mode}/" -e "s/'/'\\\\''/g" "${STEWARD_RUN_DIR}/proof-fetch.js")'"
+    "echo pid=\$\$; exec ${prefix} BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper -e '$(sed -e "s/__MODE__/${mode}/" -e "s/'/'\\\\''/g" "${STEWARD_RUN_DIR}/proof-fetch.js")'"
 done
 echo "::group::proof: OpenShell sandbox network log"
 "${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
   logs "${sandbox}" --source sandbox --since 10m -n 2000 2>&1 |
-  grep -i -E 'codex-refusal|connect|deny|denied|network|proxy|binary|curl|helper|kubectl|8443|egress|l7|tls' | tail -150 || true
+  grep -E 'NET:|\.test' | tail -100 || true
 echo "::endgroup::"
