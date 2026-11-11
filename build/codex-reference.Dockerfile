@@ -18,12 +18,12 @@ ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 RUN case "${TARGETARCH}" in \
       amd64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
-        helper_sha256="8ab67581f5a5e991d0429c2fa1f963fe273c746627e652abe9649e1525fb3dec" \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
+        helper_sha256="b539765dbc551a37d25faaeedf6027149f3bce99a362d275ad3d28ac5be27fdd" \
         ;; \
       arm64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
-        helper_sha256="b7024d0ccec1e1e447cb857f9f0dedeb6a0e2f6652a1849f280fa16665e72e17" \
+        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
+        helper_sha256="ca62b90c1e73d3e6cf8e5f5e8a5a62c5f51adc1bff7f42b2f7eb00326a6a690c" \
         ;; \
       *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
@@ -80,10 +80,10 @@ RUN case "${TARGETARCH}" in \
     && rm /tmp/mcp-gw-sandbox-helper.tar.gz \
     && chmod 0755 /usr/local/bin/mcp-gw-sandbox-helper \
     && printf '%s\n' '#!/bin/sh' \
-        'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"' \
+        'exec /usr/local/bin/mcp-gw-sandbox-helper ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} ${SSL_CERT_FILE:+--ca-file "$SSL_CERT_FILE"} --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"' \
         >/usr/local/bin/kubectl \
     && printf '%s\n' '#!/bin/sh' \
-        'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --shell-url "$MCP_GW_SHELL_URL" --operation remote-shell "$@"' \
+        'exec /usr/local/bin/mcp-gw-sandbox-helper ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} ${SSL_CERT_FILE:+--ca-file "$SSL_CERT_FILE"} --run-token openshell-token-grant-placeholder --shell-url "$MCP_GW_SHELL_URL" --operation remote-shell "$@"' \
         >/usr/local/bin/remote-shell \
     && chmod 0755 /usr/local/bin/kubectl /usr/local/bin/remote-shell \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \

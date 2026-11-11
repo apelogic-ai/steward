@@ -199,6 +199,117 @@ do
   fi
 done
 
+# Governed commands must reach their gateway through the sandbox egress proxy
+# (steward #77): the sandbox refuses direct connections, and the packaged
+# helper starts with an empty environment, so the wrappers pass the proxy and
+# CA file explicitly. This stub is the gateway stand-in, a TLS server inside the
+# test cluster that the proxy relays to.
+egress_namespace="codex-egress"
+egress_host="egress-stub.${egress_namespace}.svc.cluster.local"
+egress_certificate="${STEWARD_RUN_DIR}/egress-stub.crt"
+egress_private_key="${STEWARD_RUN_DIR}/egress-stub.key"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj "/CN=${egress_host}" \
+  -addext "subjectAltName=DNS:${egress_host}" \
+  -keyout "${egress_private_key}" \
+  -out "${egress_certificate}" >/dev/null 2>&1
+k() {
+  kubectl --kubeconfig "${kubeconfig}" --context "${kube_context}" "$@"
+}
+k create namespace "${egress_namespace}" >/dev/null
+k -n "${egress_namespace}" create secret tls egress-stub-tls \
+  --cert "${egress_certificate}" --key "${egress_private_key}" >/dev/null
+k -n "${egress_namespace}" create configmap egress-stub-server \
+  --from-file=server.py=/dev/stdin >/dev/null <<'PYTHON'
+import json
+import ssl
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))) or b"{}")
+        auth = self.headers.get("authorization", "")
+        auth = "placeholder" if auth == "Bearer openshell-token-grant-placeholder" else "other"
+        if self.path == "/cli/run":
+            line = f"RELAYED kubectl {' '.join(body.get('args', []))} auth={auth}"
+        elif self.path == "/shell/run":
+            line = f"RELAYED remote shell {body.get('target')}: {body.get('command')} auth={auth}"
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        print(line, flush=True)
+        output = json.dumps({"type": "stdout", "data": "egress relay ok\n"})
+        data = f"{output}\n{json.dumps({'type': 'exit', 'exit_code': 0})}\n".encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/x-ndjson")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, _format, *_args):
+        pass
+
+
+server = ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
+server.socket = context.wrap_socket(server.socket, server_side=True)
+print("READY", flush=True)
+sys.stdout.flush()
+server.serve_forever()
+PYTHON
+k -n "${egress_namespace}" apply -f - >/dev/null <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: egress-stub }
+  template:
+    metadata:
+      labels: { app: egress-stub }
+    spec:
+      containers:
+        - name: server
+          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
+          args: ["python3", "-u", "/srv/server.py"]
+          ports:
+            - { name: https, containerPort: 8443 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+            runAsUser: 65534
+          volumeMounts:
+            - { name: server, mountPath: /srv, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+      volumes:
+        - name: server
+          configMap: { name: egress-stub-server }
+        - name: tls
+          secret: { secretName: egress-stub-tls }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-stub
+spec:
+  selector: { app: egress-stub }
+  ports:
+    - { name: https, port: 8443, targetPort: https }
+YAML
+k -n "${egress_namespace}" rollout status deployment/egress-stub --timeout=180s >/dev/null
+egress_ip="$(k -n "${egress_namespace}" get service egress-stub -o jsonpath='{.spec.clusterIP}')"
+[[ "${egress_ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "egress stub has no IPv4 cluster address" >&2
+  exit 1
+}
+
 policy="${STEWARD_RUN_DIR}/codex-reference-runtime-policy.yaml"
 cat >"${policy}" <<'YAML'
 version: 1
@@ -226,6 +337,22 @@ network_policies:
           - allow:
               method: POST
               path: /shell/run
+    binaries:
+      - path: /usr/local/bin/mcp-gw-sandbox-helper
+      - path: /usr/local/bin/kubectl
+      - path: /usr/local/bin/remote-shell
+YAML
+# The relay endpoint passes TLS through unterminated, so the helper must trust
+# the stub's certificate; it is reachable only through the proxy, and only for
+# the helper and its wrappers.
+cat >>"${policy}" <<YAML
+  governed_egress_relay:
+    name: governed-egress-relay
+    endpoints:
+      - host: ${egress_host}
+        port: 8443
+        tls: skip
+        allowed_ips: ["${egress_ip}/32"]
     binaries:
       - path: /usr/local/bin/mcp-gw-sandbox-helper
       - path: /usr/local/bin/kubectl
@@ -314,5 +441,60 @@ check_sandbox_helper_configuration "minimal environment kubectl" \
   "env -i PATH=/usr/local/bin:/usr/bin:/bin MCP_GW_CLI_URL=http://127.0.0.1:9/cli/run kubectl get pods"
 if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
+  exit 1
+fi
+
+# The packaged wrappers must reach the stub through the sandbox egress proxy,
+# with OpenShell's own HTTPS_PROXY untouched. Only SSL_CERT_FILE is pointed at
+# the stub's certificate, because the relay does not terminate TLS.
+sandbox_exec /bin/sh -c "printf '%s\n' '$(cat "${egress_certificate}")' >/sandbox/egress-stub-ca.pem"
+egress_failed=0
+check_egress() {
+  label="$1"
+  command="$2"
+  set +e
+  output="$(sandbox_exec /bin/sh -c "export SSL_CERT_FILE=/sandbox/egress-stub-ca.pem; ${command}" 2>&1)"
+  status=$?
+  set -e
+  echo "egress ${label}: exit ${status}: $(printf '%s' "${output}" | tr '\n' '|')"
+  if [[ "${status}" -ne 0 || "${output}" != *"egress relay ok"* ]]; then
+    egress_failed=1
+  fi
+}
+check_egress "packaged kubectl" \
+  "export MCP_GW_CLI_URL=https://${egress_host}:8443/cli/run; kubectl get pods"
+check_egress "packaged remote shell" \
+  "export MCP_GW_SHELL_URL=https://${egress_host}:8443/shell/run; remote-shell engineer -- uname -a"
+egress_stub_log="$(k -n "${egress_namespace}" logs deployment/egress-stub)"
+for expected in \
+  'RELAYED kubectl get pods auth=placeholder' \
+  'RELAYED remote shell engineer: uname -a auth=placeholder'
+do
+  if ! grep -Fx "${expected}" <<<"${egress_stub_log}" >/dev/null; then
+    echo "egress stub did not record: ${expected}" >&2
+    egress_failed=1
+  fi
+done
+# OpenShell ships sandbox events to the gateway in batches, so poll briefly for
+# the proxy's record of the relayed helper connection.
+egress_allowed="NET:OPEN \[INFO\] ALLOWED /usr/local/bin/mcp-gw-sandbox-helper\([0-9]+\) -> (${egress_host//./\\.}|${egress_ip//./\\.}):8443 "
+egress_proxy_log=""
+for _attempt in {1..30}; do
+  egress_proxy_log="$("${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${workspace}" logs "${sandbox}" --source sandbox --since 30m -n 5000 2>&1 || true)"
+  if grep -E "${egress_allowed}" <<<"${egress_proxy_log}" >/dev/null; then
+    break
+  fi
+  sleep 2
+done
+if grep -E "${egress_allowed}" <<<"${egress_proxy_log}"; then
+  :
+else
+  grep -F 'NET:' <<<"${egress_proxy_log}" | tail -20 || true
+  echo "the sandbox egress proxy recorded no allowed helper connection to the stub" >&2
+  egress_failed=1
+fi
+if [[ "${egress_failed}" == "1" ]]; then
+  echo "the packaged wrappers did not reach the gateway stub through the sandbox egress proxy" >&2
   exit 1
 fi
