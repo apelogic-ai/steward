@@ -11,5 +11,8 @@ serde.workspace = true
 steward-ports = { path = "../steward-ports", version = "=0.3.31" }
 steward-types = { path = "../steward-types", version = "=0.3.31" }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

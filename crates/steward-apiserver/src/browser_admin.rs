@@ -336,7 +336,7 @@ mod capability_catalog_tests {
         MAX_CAPABILITY_MODELS, MAX_CAPABILITY_TOOLS, MAX_TOOLSET_NAME_CHARS, MAX_TOOLSETS_PER_TOOL,
         ToolAccessClass,
     };
-    use steward_types::ModelRef;
+    use steward_types::{EgressHost, ModelRef};
 
     fn catalog() -> CapabilityCatalog {
         CapabilityCatalog {
@@ -359,7 +359,53 @@ mod capability_catalog_tests {
                 version: "1.6.0".to_owned(),
                 available: true,
             }],
+            egress_hosts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn egress_hosts_default_to_port_443_and_malformed_hosts_are_refused() -> Result<(), String> {
+        let plain = serde_json::to_value(catalog()).map_err(|error| error.to_string())?;
+        assert!(
+            plain.get("egressHosts").is_none(),
+            "a catalog without egress hosts serializes exactly as before: {plain}"
+        );
+        let mut value = plain;
+        value["egressHosts"] = serde_json::json!([
+            {"host": "advisories.example.com"},
+            {"host": "feeds.example.org", "port": 8443}
+        ]);
+        let parsed = CapabilityCatalog::from_json(&value.to_string())?;
+        assert_eq!(
+            parsed.egress_hosts,
+            vec![
+                EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                },
+                EgressHost {
+                    host: "feeds.example.org".to_owned(),
+                    port: 8443,
+                },
+            ]
+        );
+        for refused in [
+            serde_json::json!([{"host": "*.example.com"}]),
+            serde_json::json!([{"host": "203.0.113.7"}]),
+            serde_json::json!([{"host": "localhost"}]),
+            serde_json::json!([{"host": "advisories.example.com", "port": 0}]),
+            serde_json::json!([
+                {"host": "advisories.example.com"},
+                {"host": "advisories.example.com", "port": 443}
+            ]),
+        ] {
+            value["egressHosts"] = refused.clone();
+            assert!(
+                CapabilityCatalog::from_json(&value.to_string()).is_err(),
+                "catalog egress hosts {refused} must be refused"
+            );
+        }
+        Ok(())
     }
 
     #[test]

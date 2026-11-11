@@ -7217,6 +7217,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_admin_template_authoring_refuses_egress_hosts_outside_the_catalog()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let ledger = ledger();
+        let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let model = ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        };
+        let app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_admin::CapabilityCatalog {
+                schema_version: "steward.capability-catalog/v2".to_owned(),
+                models: vec![model.clone()],
+                tools: Vec::new(),
+                catalogs: Vec::new(),
+                egress_hosts: vec![steward_types::EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                }],
+            },
+            auth,
+        );
+        let mut next = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock member template")?
+            .clone();
+        next.spec.llms = vec![model];
+        next.spec.tools.clear();
+        let submit = |envelope: Envelope, label: &'static str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/api/v1/envelope-templates/engineer")
+                        .header(header::COOKIE, &cookie)
+                        .header(header::ORIGIN, origin)
+                        .header("sec-fetch-site", "same-origin")
+                        .header("x-steward-csrf", &csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
+                        ))
+                        .map_err(|error| format!("build {label} template request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("submit {label} template: {error}"))
+            }
+        };
+
+        next.revision += 1;
+        next.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let listed = submit(next.clone(), "listed-egress").await?;
+        assert_eq!(
+            listed.status(),
+            StatusCode::CREATED,
+            "a template may grant a host the capability catalog lists"
+        );
+
+        next.revision += 1;
+        next.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "other.example.net".to_owned(),
+                port: 443,
+            }],
+        });
+        let unlisted = submit(next, "unlisted-egress").await?;
+        assert_eq!(unlisted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(unlisted.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read unlisted-egress template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse unlisted-egress template response: {error}"))?;
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert_eq!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .len(),
+            1,
+            "a host outside the capability catalog cannot write a template revision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_admin_template_authoring_uses_the_descriptive_capability_catalog()
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";

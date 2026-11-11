@@ -1394,8 +1394,9 @@ fn grant_covers(
 mod tests {
     use steward_types::direct_package::{ResourceQuantity, WorkspaceAuthority, WorkspaceEntryType};
     use steward_types::{
-        AgentRuntimeSpec, AgentType, BindingRef, Budget, Duration, Email, KubernetesQuantity,
-        ModelRef, Principal, RunnerPlatform, RunnerRequirements, ToolGrant,
+        AgentRuntimeSpec, AgentType, BindingRef, Budget, Duration, EgressAuthority, EgressHost,
+        Email, KubernetesQuantity, ModelRef, Principal, RunnerPlatform, RunnerRequirements,
+        ToolGrant,
     };
 
     use super::{
@@ -1525,6 +1526,170 @@ mod tests {
             max_history_depth: Some(max_history_depth),
             max_submodule_depth: Some(max_submodule_depth),
         })
+    }
+
+    fn egress(hosts: &[(&str, u16)]) -> EgressAuthority {
+        EgressAuthority {
+            hosts: hosts
+                .iter()
+                .map(|(host, port)| EgressHost {
+                    host: (*host).to_owned(),
+                    port: *port,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn egress_hosts_use_request_at_or_below_the_ceiling() -> Result<(), String> {
+        let mut ceiling = envelope_with_budget("100.00");
+        ceiling.spec.egress = Some(egress(&[
+            ("advisories.example.com", 443),
+            ("feeds.example.org", 443),
+        ]));
+        let mut below = ceiling.spec.clone();
+        below.egress = Some(egress(&[("advisories.example.com", 443)]));
+        let equal = ceiling.spec.clone();
+        let mut above = ceiling.spec.clone();
+        above.egress = Some(egress(&[
+            ("advisories.example.com", 443),
+            ("other.example.net", 443),
+        ]));
+        assert_request_relation("egress hosts", below, equal, above.clone(), &ceiling)?;
+        assert_eq!(
+            evaluate_authority_request(&above, &ceiling)
+                .map_err(|error| format!("evaluate egress above ceiling: {error:?}"))?,
+            AdmissionDecision::Reject {
+                deltas: vec![AdmissionDelta::EgressHosts {
+                    requested: egress(&[("other.example.net", 443)]).hosts,
+                    ceiling: egress(&[("advisories.example.com", 443), ("feeds.example.org", 443)])
+                        .hosts,
+                }],
+            },
+            "only the host outside the ceiling is reported"
+        );
+
+        let mut other_port = ceiling.spec.clone();
+        other_port.egress = Some(egress(&[("advisories.example.com", 8443)]));
+        assert!(
+            matches!(
+                evaluate_authority_request(&other_port, &ceiling),
+                Ok(AdmissionDecision::Reject { .. })
+            ),
+            "a listed host on another port is outside the ceiling"
+        );
+
+        let ungranted = envelope_with_budget("100.00");
+        assert!(
+            matches!(
+                evaluate_authority_request(&above, &ungranted),
+                Ok(AdmissionDecision::Reject { deltas })
+                    if matches!(deltas.as_slice(), [AdmissionDelta::EgressHosts { ceiling, .. }] if ceiling.is_empty())
+            ),
+            "an Envelope without an egress grant allows no host"
+        );
+        assert_eq!(
+            evaluate_authority_request(&ungranted.spec, &ceiling)
+                .map_err(|error| format!("evaluate no egress request: {error:?}"))?,
+            AdmissionDecision::Admit,
+            "requesting no egress is always within the ceiling"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_egress_is_omitted_so_existing_envelope_digests_do_not_change()
+    -> Result<(), String> {
+        let spec = envelope_with_budget("100.00").spec;
+        let written = serde_json::to_value(&spec).map_err(|error| error.to_string())?;
+        assert!(
+            written.get("egress").is_none(),
+            "an Envelope without egress must serialize exactly as before: {written}"
+        );
+
+        let mut with_egress = written;
+        with_egress["egress"] = serde_json::json!({"hosts": [{"host": "advisories.example.com"}]});
+        let parsed: EnvelopeSpec =
+            serde_json::from_value(with_egress).map_err(|error| error.to_string())?;
+        assert_eq!(
+            parsed.egress,
+            Some(egress(&[("advisories.example.com", 443)])),
+            "the port defaults to 443"
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed.egress).map_err(|error| error.to_string())?,
+            serde_json::json!({"hosts": [{"host": "advisories.example.com", "port": 443}]}),
+            "the stored form always names the port"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_egress_hosts_are_rejected_before_they_become_authority() {
+        let long_label = format!("{}.example.com", "a".repeat(64));
+        let refused: Vec<Vec<(&str, u16)>> = vec![
+            Vec::new(),
+            vec![("*.example.com", 443)],
+            vec![("203.0.113.7", 443)],
+            vec![("::1", 443)],
+            vec![("[2001:db8::1]", 443)],
+            vec![("localhost", 443)],
+            vec![("example", 443)],
+            vec![("Advisories.example.com", 443)],
+            vec![("advisories .example.com", 443)],
+            vec![("-advisories.example.com", 443)],
+            vec![("advisories-.example.com", 443)],
+            vec![("advisories.example.com.", 443)],
+            vec![("advisories..example.com", 443)],
+            vec![("advisories.example.com/path", 443)],
+            vec![("https://advisories.example.com", 443)],
+            vec![(long_label.as_str(), 443)],
+            vec![("advisories.example.com", 0)],
+            vec![("advisories.example.com", 443), ("advisories.example.com", 443)],
+        ];
+        for hosts in refused {
+            let mut envelope = envelope_with_budget("100.00");
+            envelope.spec.egress = Some(egress(&hosts));
+            assert!(
+                matches!(
+                    validate_envelope(&envelope),
+                    Err(AdmissionError::InvalidEgressAuthority { .. })
+                ),
+                "egress hosts {hosts:?} must be refused"
+            );
+        }
+
+        for hosts in [
+            vec![("advisories.example.com", 443)],
+            vec![("xn--bcher-kva.example", 443)],
+            vec![("a1.b-c.example.org", 8443), ("advisories.example.com", 443)],
+            vec![("advisories.example.com", 443), ("advisories.example.com", 8443)],
+        ] {
+            let mut envelope = envelope_with_budget("100.00");
+            envelope.spec.egress = Some(egress(&hosts));
+            assert_eq!(
+                validate_envelope(&envelope),
+                Ok(()),
+                "egress hosts {hosts:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_message_names_only_the_egress_host_outside_the_envelope() {
+        let decision = AdmissionDecision::Reject {
+            deltas: vec![AdmissionDelta::EgressHosts {
+                requested: egress(&[("other.example.net", 443)]).hosts,
+                ceiling: egress(&[("advisories.example.com", 443)]).hosts,
+            }],
+        };
+        assert_eq!(
+            decision.counterexample(),
+            Some(
+                "Egress host other.example.net:443 is not one of the egress hosts this Envelope allows"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

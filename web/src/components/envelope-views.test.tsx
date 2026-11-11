@@ -40,6 +40,13 @@ describe("envelope run history", () => {
     expect(source).toContain('title={request.approvedEnvelope ? "Approved access" : "Requested access"}');
   });
 
+  test("shows granted public egress hosts on envelope details and template requests", () => {
+    expect(source).toContain("Public egress");
+    expect(source).toContain("envelope.spec.egress?.hosts");
+    expect(source).toContain("template.ceiling.spec.egress?.hosts");
+    expect(source).toContain("`${host.host}:${host.port}`");
+  });
+
   test("loads deployment workspace capabilities for template and custom requests", () => {
     expect(source).toContain("getUserCapabilities");
     expect(source).toContain("WorkspaceAuthorityControls");

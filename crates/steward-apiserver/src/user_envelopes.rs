@@ -1860,7 +1860,8 @@ mod tests {
         PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeProjectionStore,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
         attach_request_projection, capability_catalog_violation_fields, envelope_usage_view,
-        inner_router, inner_router_with_agents, inner_router_with_capabilities,
+        envelope_request_field_list, inner_router, inner_router_with_agents,
+        inner_router_with_capabilities,
     };
     use crate::browser_admin::{CapabilityCatalog, CapabilityTool, ToolAccessClass};
     use crate::connections::{
@@ -2814,6 +2815,76 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn egress_hosts_outside_the_capability_catalog_are_unavailable() {
+        let requested = template().ceiling;
+        let catalog = CapabilityCatalog {
+            schema_version: "steward.capability-catalog/v2".to_owned(),
+            models: requested.spec.llms.clone(),
+            tools: vec![CapabilityTool {
+                provider: "github".to_owned(),
+                resource: "repository".to_owned(),
+                action: "get_file_contents".to_owned(),
+                access_class: ToolAccessClass::Read,
+                toolsets: Vec::new(),
+            }],
+            catalogs: Vec::new(),
+            egress_hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        assert!(
+            capability_catalog_violation_fields(&catalog, &requested).is_empty(),
+            "an Envelope without egress needs no egress capability"
+        );
+        let with_hosts = |hosts: &[(&str, u16)]| {
+            let mut envelope = requested.clone();
+            envelope.spec.egress = Some(steward_types::EgressAuthority {
+                hosts: hosts
+                    .iter()
+                    .map(|(host, port)| steward_types::EgressHost {
+                        host: (*host).to_owned(),
+                        port: *port,
+                    })
+                    .collect(),
+            });
+            envelope
+        };
+        assert!(
+            capability_catalog_violation_fields(&catalog, &with_hosts(&[("advisories.example.com", 443)]))
+                .is_empty(),
+            "a listed host is available"
+        );
+        for hosts in [
+            vec![("other.example.net", 443)],
+            vec![("advisories.example.com", 8443)],
+            vec![("advisories.example.com", 443), ("other.example.net", 443)],
+        ] {
+            assert_eq!(
+                capability_catalog_violation_fields(&catalog, &with_hosts(&hosts)),
+                vec![EnvelopeRequestField::EgressHosts],
+                "hosts {hosts:?} include one the deployment does not provide"
+            );
+        }
+        let no_egress_catalog = CapabilityCatalog {
+            egress_hosts: Vec::new(),
+            ..catalog
+        };
+        assert_eq!(
+            capability_catalog_violation_fields(
+                &no_egress_catalog,
+                &with_hosts(&[("advisories.example.com", 443)])
+            ),
+            vec![EnvelopeRequestField::EgressHosts],
+            "a deployment without egress hosts provides none"
+        );
+        assert_eq!(
+            envelope_request_field_list(&[EnvelopeRequestField::EgressHosts]),
+            "egress hosts"
+        );
     }
 
     #[tokio::test]
