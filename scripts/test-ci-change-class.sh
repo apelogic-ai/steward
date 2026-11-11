@@ -127,6 +127,8 @@ expect_class full "example compiled into tests" docs/examples/github-file-read-v
 expect_class full "Markdown compiled with include_str" docs/task-submission-api.md
 expect_class full "second Markdown compiled with include_str" docs/installation/installation-guide.md
 expect_class full "Markdown copied into a bundle" docs/installation/platform-preflight.md
+expect_class full "user guide examples checked by a crate test" docs/user-guide/concepts.md
+expect_class full "user guide README checked by a crate test" docs/user-guide/README.md
 expect_class full "non-prose under docs" docs/installation/execution-bindings.example.json
 expect_class full "root Markdown off the allowlist" NOTES.md
 expect_class full "Markdown beside code" crates/steward-types/DESIGN.md
@@ -1122,7 +1124,7 @@ COPY --from=build /target/release/steward /usr/local/bin/steward
   # listed source root is docs, as is the changelog.
   while IFS= read -r path; do
     case "${path}" in
-      docs/contracts/*) continue ;;
+      docs/contracts/*|docs/user-guide/*) continue ;;
       */*)
         below_root=0
         for docs_root in ${DOCS_NAME_ROOTS}; do
