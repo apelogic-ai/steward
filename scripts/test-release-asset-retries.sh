@@ -128,7 +128,7 @@ while IFS= read -r -d '' candidate; do
   relative="${candidate#"${root}/"}"
   [[ "${relative}" == 'scripts/test-release-asset-retries.sh' ]] && continue
   if grep -Eq \
-    'releases/download|api\.github\.com/repos/.*/tarball|github\.com/.*/archive|launchpad\.net/ubuntu/\+archive|dl\.k8s\.io/release|get\.helm\.sh|ziglang\.org/download|openpolicyagent\.org/downloads' \
+    'releases/download|api\.github\.com/repos/.*/tarball|github\.com/.*/archive|launchpad\.net/ubuntu/\+archive|archive\.ubuntu\.com/ubuntu/pool|dl\.k8s\.io/release|get\.helm\.sh|ziglang\.org/download|openpolicyagent\.org/downloads' \
     "${candidate}" && ! is_covered_source "${relative}"; then
     printf '%s: release-download source is missing from the retry contract inventory\n' \
       "${relative}" >&2
