@@ -328,6 +328,7 @@ proof() {
   set -e
   echo "::endgroup::"
 }
+# shellcheck disable=SC2016 # expanded inside the sandbox shell
 proof "proxy and CA variables" '
 for name in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NO_PROXY no_proxy \
   SSL_CERT_FILE NODE_EXTRA_CA_CERTS CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_USE_ENV_PROXY; do
