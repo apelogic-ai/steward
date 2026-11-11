@@ -4,16 +4,18 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use steward_types::direct_package::{
-    AgentRef, BrowserPackageLocator, ContentDigest, Decimal, DirectTaskBindingEvidence,
-    DirectTaskDefinition, DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit,
-    ExecutionLogMode, InstructionSkill, InvocationManifest, PackageClosure, RelativePath,
-    RepositoryUrl, SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
-    WorkspaceAuthority, WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName,
-    WorkspacePath, canonical_json_bytes,
+    AgentRef, BrowserPackageLocator, ContentDigest, Decimal, DirectRequirements,
+    DirectTaskBindingEvidence, DirectTaskDefinition, DirectTaskStatusResponse,
+    DirectTaskSubmission, Duration, ExactGitCommit, ExecutionLogMode, InstructionSkill,
+    InvocationManifest, PackageClosure, RelativePath, RepositoryUrl, SOURCE_PROVENANCE_JWT_CLAIM,
+    Slug, SourceProvenance, StableProviderId, Uuid, WorkspaceAuthority, WorkspaceEntry,
+    WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
+    canonical_json_bytes,
 };
 
 const CONTRACT_ROOT: &str = "../../docs/contracts/task/v2";
 const INSTALLATION_GUIDE: &str = "../../docs/installation/installation-guide.md";
+const USER_GUIDE: &str = "../../docs/user-guide";
 
 fn fixture(path: &str) -> Result<String, String> {
     std::fs::read_to_string(
@@ -142,6 +144,12 @@ fn rust_contract_accepts(definition: &str, value: serde_json::Value) -> Result<b
             .map_err(|error| error.to_string())
             .and_then(|contract| contract.validate()),
         "taskBindingEvidence" => serde_json::from_value::<DirectTaskBindingEvidence>(value)
+            .map_err(|error| error.to_string())
+            .and_then(|contract| contract.validate()),
+        "workspaceEntry" => serde_json::from_value::<WorkspaceEntry>(value)
+            .map_err(|error| error.to_string())
+            .and_then(|contract| contract.validate()),
+        "directRequirements" => serde_json::from_value::<DirectRequirements>(value)
             .map_err(|error| error.to_string())
             .and_then(|contract| contract.validate()),
         _ => return Err(format!("manifest uses unknown definition {definition}")),
@@ -1322,5 +1330,119 @@ fn frozen_v1_fixture_remains_separate_and_unmodified() -> Result<(), String> {
     let frozen: serde_json::Value = serde_json::from_str(&frozen)
         .map_err(|error| format!("frozen v1 fixture must parse: {error}"))?;
     assert!(serde_json::from_value::<DirectTaskDefinition>(frozen).is_err());
+    Ok(())
+}
+
+/// One JSON example from the user guide and the schema definition it must match.
+#[derive(Debug, PartialEq)]
+struct GuideExample {
+    location: String,
+    definition: String,
+    valid: bool,
+    json: String,
+}
+
+/// Every ```json block in a guide page must sit directly below a
+/// `<!-- schema: <definition> -->` marker (or `<!-- schema: invalid <definition> -->` for an
+/// example the guide shows being refused), so no example goes unchecked.
+fn guide_examples(page: &str, markdown: &str) -> Result<Vec<GuideExample>, String> {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut examples = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim_start() != "```json" {
+            index += 1;
+            continue;
+        }
+        let location = format!("{page}:{}", index + 1);
+        let marker = index
+            .checked_sub(1)
+            .map(|previous| lines[previous].trim())
+            .and_then(|line| line.strip_prefix("<!-- schema: "))
+            .and_then(|line| line.strip_suffix(" -->"))
+            .ok_or_else(|| format!("{location}: JSON example needs a schema marker"))?;
+        let (valid, definition) = match marker.strip_prefix("invalid ") {
+            Some(definition) => (false, definition),
+            None => (true, marker),
+        };
+        let end = lines[index + 1..]
+            .iter()
+            .position(|line| line.trim_start() == "```")
+            .map(|offset| index + 1 + offset)
+            .ok_or_else(|| format!("{location}: JSON example is not closed"))?;
+        examples.push(GuideExample {
+            location,
+            definition: definition.to_owned(),
+            valid,
+            json: lines[index + 1..end].join("\n"),
+        });
+        index = end + 1;
+    }
+    Ok(examples)
+}
+
+#[test]
+fn guide_examples_require_a_schema_marker() -> Result<(), String> {
+    let unmarked = "Text\n\n```json\n{}\n```\n";
+    assert_eq!(
+        guide_examples("page.md", unmarked),
+        Err("page.md:3: JSON example needs a schema marker".to_owned())
+    );
+    let marked = "<!-- schema: invalid workspaceEntry -->\n```json\n{}\n```\n";
+    let examples = guide_examples("page.md", marked)?;
+    assert_eq!(examples.len(), 1);
+    assert!(!examples[0].valid);
+    assert_eq!(examples[0].definition, "workspaceEntry");
+    Ok(())
+}
+
+#[test]
+fn user_guide_json_examples_match_the_contract() -> Result<(), String> {
+    let schema = parse_value("schemas/direct-package.schema.json")?;
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(USER_GUIDE);
+    let mut pages = std::fs::read_dir(&directory)
+        .map_err(|error| format!("user guide directory must be readable: {error}"))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("user guide entry must be readable: {error}"))?;
+    pages.retain(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"));
+    pages.sort();
+    let mut checked = 0;
+    for path in pages {
+        let page = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "user guide page name must be UTF-8".to_owned())?
+            .to_owned();
+        let markdown = std::fs::read_to_string(&path)
+            .map_err(|error| format!("user guide page {page} must be readable: {error}"))?;
+        for example in guide_examples(&page, &markdown)? {
+            let location = &example.location;
+            let value: serde_json::Value = serde_json::from_str(&example.json)
+                .map_err(|error| format!("{location}: example must be JSON: {error}"))?;
+            let definition_schema = schema
+                .pointer(&format!("/$defs/{}", example.definition))
+                .ok_or_else(|| {
+                    format!(
+                        "{location}: unknown schema definition {}",
+                        example.definition
+                    )
+                })?;
+            let schema_accepts =
+                validate_schema_instance(&schema, definition_schema, &value, "$example").is_ok();
+            let rust_accepts = rust_contract_accepts(&example.definition, value)?;
+            if schema_accepts != example.valid || rust_accepts != example.valid {
+                return Err(format!(
+                    "{location}: {} example expected valid={}, schema accepted={schema_accepts}, Rust accepted={rust_accepts}",
+                    example.definition, example.valid
+                ));
+            }
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "the user guide must contain checked JSON examples"
+    );
     Ok(())
 }
