@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.31] - 2026-11-11
+
+Steward v0.3.31 makes governed `kubectl` and `remote-shell` commands in the Codex reference
+sandbox reach the command gateway through the sandbox egress proxy, and adds a user guide.
+
 ### Fixed
 
 - Governed `kubectl` and `remote-shell` commands in the Codex reference sandbox reach the command
@@ -25,6 +30,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `trigger` resolves to, history, paths, submodules and access), outputs, callers, reading a run,
   common refusals, and reference tables. CI checks every JSON example in the guide against the
   Task contract, and an example with no schema marker fails the check.
+
+### Upgrade and rollback
+
+- Deploy the chart, component images, and reference runtimes as one release unit, then update
+  mirrored v0.3.30 reference runtimes and execution bindings to the v0.3.31 artifacts. No database
+  migration, Helm value, provider-profile, or MCP-GW gateway change is added; the provider-profile
+  bundle remains 1.3.0, and remote shell still requires MCP-GW v0.8.0 or later as the gateway. The
+  MCP-GW 0.8.2 helper runs only inside the sandbox.
+- Rolling back to v0.3.30 needs no data step, but it restores the reference image whose governed
+  `kubectl` and `remote-shell` commands cannot reach the gateway from the sandbox.
 
 ## [0.3.30] - 2026-11-10
 
@@ -1874,7 +1889,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.30...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.31...HEAD
+[0.3.31]: https://github.com/apelogic-ai/steward/compare/v0.3.30...v0.3.31
 [0.3.30]: https://github.com/apelogic-ai/steward/compare/v0.3.29...v0.3.30
 [0.3.29]: https://github.com/apelogic-ai/steward/compare/v0.3.28...v0.3.29
 [0.3.28]: https://github.com/apelogic-ai/steward/compare/v0.3.27...v0.3.28

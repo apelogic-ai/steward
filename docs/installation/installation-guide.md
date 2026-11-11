@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.30`. The release workflow pulls the published OCI
+Release contract: chart `0.3.31`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -697,7 +697,7 @@ preserve the same immutable coordinates and cross-component relationships.
    Steward v0.3.4 tag to reach bundle 1.2.2. A v0.3.2 installation runs
    1.2.0-to-1.2.1 and then 1.2.1-to-1.2.2; it does not require an intermediate
    Helm upgrade to Steward v0.3.3. A v0.3.3 installation runs only
-   1.2.1-to-1.2.2. Then use the exact Steward v0.3.30 source to run the
+   1.2.1-to-1.2.2. Then use the exact Steward v0.3.31 source to run the
    1.2.2-to-1.3.0 transition. Re-apply the rendered profiles under their
    existing IDs, rerun platform preflight with
    `execution.endpoints.mintAudience` equal to `config.mint.audience`, and use

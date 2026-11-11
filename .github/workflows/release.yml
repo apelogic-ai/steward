@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.30"
+          test "$version" = "0.3.31"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -970,14 +970,14 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.30 fixes governed kubectl and remote-shell commands in the Codex reference sandbox, which failed with Sandbox helper configuration failed when the sandbox supervisor started the helper with an empty environment. The reference image now pins the checksum-verified MCP-GW 0.8.1 sandbox helper, and the kubectl and remote-shell wrappers pass the non-secret run-token placeholder and the approved command route to the helper as options. Grants, exact routes, and refusals are unchanged; a Task without the matching approved grant still has no route, and the helper reports a fixed configuration reason without printing any token.\n\n'
-            printf 'Admin Agent Runs now say why spend or tokens show Not reported: the deployment uses managed inference, the model gateway reported no spend for the run, or it reported spend but not tokens. The admin run views expose this as spendReportReason; personal Runs views do not. When a LiteLLM request-log read fails, the controller writes one rate-limited structured warning with a stable reason and HTTP status only.\n\n'
+            printf 'Steward v0.3.31 makes governed kubectl and remote-shell commands in the Codex reference sandbox reach the command gateway. After v0.3.30 they passed helper configuration but failed with CLI request failed or Remote shell request failed: the sandbox supervisor starts the helper with an empty environment, so it could not see the sandbox egress proxy and connected directly, which the sandbox refuses. The reference image now pins the checksum-verified MCP-GW 0.8.2 sandbox helper, and the wrappers pass the sandbox HTTPS_PROXY and SSL_CERT_FILE as the helper proxy and CA options. Grants, exact routes, and refusals are unchanged. CI now runs the packaged wrappers in a real OpenShell sandbox against a gateway stub that is reachable only through the proxy.\n\n'
+            printf 'The release also adds a user guide for people who run Tasks under docs/user-guide, with every JSON example checked against the Task contract in CI.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Deploy the chart, component images, and reference runtimes as one release unit. No database migration, Helm value, provider-profile, or MCP-GW gateway change is added; the provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later. Installations still on provider-profile bundle 1.2.2 follow the documented 1.2.2 to 1.3.0 same-ID transition from the exact v0.3.30 source revision.\n\n'
-            printf 'Rolling back to v0.3.29 is an image and chart rollback with no data step, but it restores the reference image whose governed kubectl and remote-shell commands fail in the sandbox.\n\n'
+            printf 'Deploy the chart, component images, and reference runtimes as one release unit. No database migration, Helm value, provider-profile, or MCP-GW gateway change is added; the provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later. The MCP-GW 0.8.2 helper is a sandbox-side client only. Installations still on provider-profile bundle 1.2.2 follow the documented 1.2.2 to 1.3.0 same-ID transition from the exact v0.3.31 source revision.\n\n'
+            printf 'Rolling back to v0.3.30 is an image and chart rollback with no data step, but it restores the reference image whose governed kubectl and remote-shell commands cannot reach the gateway from the sandbox.\n\n'
             printf '## Required action\n\n'
-            printf 'Update mirrored v0.3.29 reference runtimes and execution bindings to the v0.3.30 artifacts. To see why a run reports no spend from a self-hosted LiteLLM, confirm the management credential can read request logs for runtime key hashes.\n\n'
+            printf 'Update mirrored v0.3.30 reference runtimes and execution bindings to the v0.3.31 artifacts.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, exact command-route and signed-target refusals, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1057,7 +1057,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.30.json
+          subject-path: dist/steward-product-compatibility-0.3.31.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1067,7 +1067,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.30.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.31.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
