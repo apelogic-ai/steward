@@ -475,11 +475,22 @@ do
     egress_failed=1
   fi
 done
-egress_proxy_log="$("${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  --workspace "${workspace}" logs "${sandbox}" --source sandbox --since 30m -n 5000 2>&1 |
-  grep -F "${egress_host}" || true)"
-printf '%s\n' "${egress_proxy_log}" | tail -20
-if ! grep -F 'mcp-gw-sandbox-helper' <<<"${egress_proxy_log}" | grep -v -F 'DENIED' >/dev/null; then
+# OpenShell ships sandbox events to the gateway in batches, so poll briefly for
+# the proxy's record of the relayed helper connection.
+egress_allowed="NET:OPEN \[INFO\] ALLOWED /usr/local/bin/mcp-gw-sandbox-helper\([0-9]+\) -> (${egress_host//./\\.}|${egress_ip//./\\.}):8443 "
+egress_proxy_log=""
+for _attempt in {1..30}; do
+  egress_proxy_log="$("${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${workspace}" logs "${sandbox}" --source sandbox --since 30m -n 5000 2>&1 || true)"
+  if grep -E "${egress_allowed}" <<<"${egress_proxy_log}" >/dev/null; then
+    break
+  fi
+  sleep 2
+done
+if grep -E "${egress_allowed}" <<<"${egress_proxy_log}"; then
+  :
+else
+  grep -F 'NET:' <<<"${egress_proxy_log}" | tail -20 || true
   echo "the sandbox egress proxy recorded no allowed helper connection to the stub" >&2
   egress_failed=1
 fi
