@@ -31,22 +31,22 @@ RUN case "${TARGETARCH}" in \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
         --output /tmp/uv.tar.gz \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
-        "https://archive.ubuntu.com/ubuntu/pool/universe/r/rust-ripgrep/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
+        "https://mirrors.edge.kernel.org/ubuntu/pool/universe/r/rust-ripgrep/ripgrep_${RIPGREP_VERSION}_amd64.deb" \
         --output /tmp/ripgrep.deb \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
-        "https://archive.ubuntu.com/ubuntu/pool/main/j/jq/jq_${JQ_VERSION}_amd64.deb" \
+        "https://mirrors.edge.kernel.org/ubuntu/pool/main/j/jq/jq_${JQ_VERSION}_amd64.deb" \
         --output /tmp/jq.deb \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
-        "https://archive.ubuntu.com/ubuntu/pool/main/j/jq/libjq1_${LIBJQ_VERSION}_amd64.deb" \
+        "https://mirrors.edge.kernel.org/ubuntu/pool/main/j/jq/libjq1_${LIBJQ_VERSION}_amd64.deb" \
         --output /tmp/libjq1.deb \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
-        "https://archive.ubuntu.com/ubuntu/pool/main/libo/libonig/libonig5_${LIBONIG_VERSION}_amd64.deb" \
+        "https://mirrors.edge.kernel.org/ubuntu/pool/main/libo/libonig/libonig5_${LIBONIG_VERSION}_amd64.deb" \
         --output /tmp/libonig5.deb \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
-        "https://archive.ubuntu.com/ubuntu/pool/universe/r/rust-fd-find/fd-find_${FD_FIND_VERSION}_amd64.deb" \
+        "https://mirrors.edge.kernel.org/ubuntu/pool/universe/r/rust-fd-find/fd-find_${FD_FIND_VERSION}_amd64.deb" \
         --output /tmp/fd-find.deb \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
-        "https://archive.ubuntu.com/ubuntu/pool/universe/t/tree/tree_${TREE_VERSION}_amd64.deb" \
+        "https://mirrors.edge.kernel.org/ubuntu/pool/universe/t/tree/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location "${helper_url}" \
         --output /tmp/mcp-gw-sandbox-helper.tar.gz \
