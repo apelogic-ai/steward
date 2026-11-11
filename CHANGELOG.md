@@ -9,6 +9,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- The reference images fetch their pinned Ubuntu packages (`rg`, `jq`, `fd`, `tree` and their
+  libraries) from the kernel.org Ubuntu mirror instead of Launchpad, so an outage of Canonical's
+  Launchpad and archive hosts no longer fails the image builds. Every version and sha256 pin is
+  unchanged, so the installed bytes are identical.
+
 - Governed `kubectl` and `remote-shell` commands in the Codex reference sandbox reach the command
   gateway again. They failed with "CLI request failed" or "Remote shell request failed" because the
   helper, which the sandbox supervisor starts with an empty environment, could not see the sandbox
