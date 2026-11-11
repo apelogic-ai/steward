@@ -620,6 +620,7 @@ mod browser_rbac_tests {
         Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: Vec::new(),
                 tools: Vec::new(),
                 budget: Budget {
@@ -13540,6 +13541,7 @@ mod task_execution_binding_tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: spec.llms.clone(),
                 tools: spec.tools.clone(),
                 budget: spec.budget.clone(),
@@ -16875,5 +16877,6 @@ fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
         AdmissionDelta::RunnerCompute { .. } => "runner-compute",
         AdmissionDelta::RunnerStorage { .. } => "runner-storage",
         AdmissionDelta::Workspace { .. } => "workspace",
+        AdmissionDelta::EgressHosts { .. } => "egress-hosts",
     }
 }

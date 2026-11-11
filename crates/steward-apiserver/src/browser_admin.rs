@@ -228,6 +228,10 @@ pub struct CapabilityCatalog {
     pub models: Vec<ModelRef>,
     pub tools: Vec<CapabilityTool>,
     pub catalogs: Vec<CapabilityProviderCatalog>,
+    /// Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means
+    /// no public egress is available; omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_hosts: Vec<steward_types::EgressHost>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -251,6 +255,8 @@ impl CapabilityCatalog {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        steward_types::validate_egress_hosts(&self.egress_hosts)
+            .map_err(|reason| format!("capability catalog {reason}"))?;
         if self.schema_version != "steward.capability-catalog/v2" {
             return Err(
                 "capability catalog schemaVersion must be steward.capability-catalog/v2".to_owned(),
@@ -665,6 +671,7 @@ pub(crate) enum BrowserEnvelopeTemplateField {
     Compute,
     Storage,
     Workspace,
+    EgressHosts,
     AutoProvisionThreshold,
 }
 
@@ -2223,6 +2230,9 @@ where
     }) {
         unavailable_fields.push(BrowserEnvelopeTemplateField::Tools);
     }
+    if crate::user_envelopes::egress_hosts_unavailable(&state.capabilities, &envelope) {
+        unavailable_fields.push(BrowserEnvelopeTemplateField::EgressHosts);
+    }
     if !unavailable_fields.is_empty() {
         return envelope_template_error_response(
             "capability_not_available",
@@ -2403,6 +2413,9 @@ fn envelope_validation_fields(
         }
         AdmissionError::InvalidWorkspaceAuthority { .. } => {
             vec![BrowserEnvelopeTemplateField::Workspace]
+        }
+        AdmissionError::InvalidEgressAuthority { .. } => {
+            vec![BrowserEnvelopeTemplateField::EgressHosts]
         }
         AdmissionError::UnsupportedBindings => Vec::new(),
     }
@@ -2594,6 +2607,7 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
     let requested = BrowserEnvelope {
         revision: record.envelope_revision,
         spec: BrowserEnvelopeSpec {
+            egress: None,
             llms: record.proposed_spec.llms,
             tools: record.proposed_spec.tools,
             budget: record.proposed_spec.budget,
@@ -3236,6 +3250,7 @@ mod request_projection_tests {
         let pinned_template = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: Vec::new(),
                 tools: Vec::new(),
                 budget: Budget {
@@ -3338,6 +3353,7 @@ mod request_projection_tests {
             template_envelope: Envelope {
                 revision: 1,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: Vec::new(),
                     tools: Vec::new(),
                     budget,

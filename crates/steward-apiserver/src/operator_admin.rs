@@ -1081,6 +1081,7 @@ mod tests {
         let ceiling: Envelope = BrowserEnvelope {
             revision: 1,
             spec: crate::user_envelopes::BrowserEnvelopeSpec {
+                egress: None,
                 llms: vec![steward_types::ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),

@@ -7335,6 +7335,7 @@ mod tests {
             ledger.clone(),
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog {
+                egress_hosts: Vec::new(),
                 schema_version: "steward.capability-catalog/v2".to_owned(),
                 models: vec![ModelRef {
                     provider: "provider-b".to_owned(),
@@ -7591,6 +7592,7 @@ mod tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),
@@ -10651,6 +10653,7 @@ mod tests {
         let envelope = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),
@@ -10677,6 +10680,7 @@ mod tests {
                 ceiling: Envelope {
                     revision: 3,
                     spec: EnvelopeSpec {
+                        egress: None,
                         llms: vec![ModelRef {
                             provider: "provider-a".to_owned(),
                             model: "model-a".to_owned(),
@@ -10696,6 +10700,7 @@ mod tests {
                 auto_provision_threshold: Some(Envelope {
                     revision: 3,
                     spec: EnvelopeSpec {
+                        egress: None,
                         llms: vec![ModelRef {
                             provider: "provider-a".to_owned(),
                             model: "model-a".to_owned(),
@@ -10751,6 +10756,7 @@ mod tests {
 
     fn browser_capability_catalog() -> browser_admin::CapabilityCatalog {
         browser_admin::CapabilityCatalog {
+            egress_hosts: Vec::new(),
             schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![ModelRef {
                 provider: "provider-a".to_owned(),
@@ -10836,6 +10842,7 @@ mod tests {
             requested_envelope: Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: vec![ModelRef {
                         provider: "provider-a".to_owned(),
                         model: "model-a".to_owned(),
@@ -10855,6 +10862,7 @@ mod tests {
             template_envelope: Some(Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: vec![ModelRef {
                         provider: "provider-a".to_owned(),
                         model: "model-a".to_owned(),
@@ -10928,6 +10936,7 @@ mod tests {
         let approved = Envelope {
             revision: 4,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),
@@ -10989,6 +10998,7 @@ mod tests {
             .map_err(|_| "fake Envelope template ledger lock was poisoned")? = Envelope {
             revision: 7,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),
@@ -16947,6 +16957,7 @@ mod tests {
             ledger.clone(),
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog {
+                egress_hosts: Vec::new(),
                 schema_version: "steward.capability-catalog/v2".to_owned(),
                 models: Vec::new(),
                 tools: Vec::new(),

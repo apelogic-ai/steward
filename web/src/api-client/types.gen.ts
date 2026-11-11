@@ -349,6 +349,7 @@ export type BrowserEnvelopeRequestView = {
 
 export type BrowserEnvelopeSpec = {
     budget: Budget;
+    egress?: null | EgressAuthority;
     llms: Array<ModelRef>;
     runner?: RunnerRequirements;
     runtimeMinutesLimit?: string | null;
@@ -364,7 +365,7 @@ export type BrowserEnvelopeTemplateErrorResponse = {
     fields: Array<BrowserEnvelopeTemplateField>;
 };
 
-export type BrowserEnvelopeTemplateField = 'templateId' | 'displayName' | 'memberRoles' | 'envelopeRevision' | 'currency' | 'monthlyLimit' | 'singleRunLimit' | 'runtimeMinutes' | 'ttl' | 'models' | 'tools' | 'platforms' | 'memory' | 'compute' | 'storage' | 'workspace' | 'autoProvisionThreshold';
+export type BrowserEnvelopeTemplateField = 'templateId' | 'displayName' | 'memberRoles' | 'envelopeRevision' | 'currency' | 'monthlyLimit' | 'singleRunLimit' | 'runtimeMinutes' | 'ttl' | 'models' | 'tools' | 'platforms' | 'memory' | 'compute' | 'storage' | 'workspace' | 'egressHosts' | 'autoProvisionThreshold';
 
 export type BrowserEnvelopeTemplateListItem = {
     allowInlineBrowserTasks: boolean;
@@ -851,6 +852,11 @@ export type CanonicalUserId = string;
 
 export type CapabilityCatalog = {
     catalogs: Array<CapabilityProviderCatalog>;
+    /**
+     * Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means
+     * no public egress is available; omitted when empty.
+     */
+    egressHosts?: Array<EgressHost>;
     models: Array<ModelRef>;
     schemaVersion: string;
     tools: Array<CapabilityTool>;
@@ -1023,6 +1029,10 @@ export type DirectAdmissionDelta = {
     ceiling?: null | WorkspaceAuthority;
     dimension: 'workspace';
     requested: WorkspaceAuthority;
+} | {
+    ceiling: Array<EgressHost>;
+    dimension: 'egressHosts';
+    requested: Array<EgressHost>;
 };
 
 export type DirectRequirements = {
@@ -1113,6 +1123,22 @@ export type DispatchTaskResponse = {
 
 export type Duration = string;
 
+/**
+ * Public egress an Envelope grants: only the listed hosts, read-only.
+ */
+export type EgressAuthority = {
+    hosts: Array<EgressHost>;
+};
+
+/**
+ * A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and
+ * port. Hosts are granted only through an Envelope, within the deployment capability catalog.
+ */
+export type EgressHost = {
+    host: string;
+    port?: number;
+};
+
 export type Email = string;
 
 export type EnvelopeDigest = string;
@@ -1130,7 +1156,7 @@ export type EnvelopeRequestErrorResponse = {
     fields: Array<EnvelopeRequestField>;
 };
 
-export type EnvelopeRequestField = 'requestedEnvelope' | 'justification' | 'rationale' | 'evidenceUrl' | 'expiresAt' | 'budgetMonthlyLimit' | 'budgetSingleRunLimit' | 'runtimeMinutesLimit' | 'ttl' | 'llms' | 'tools' | 'runnerPlatforms' | 'runnerMemory' | 'runnerCompute' | 'runnerStorage' | 'workspace';
+export type EnvelopeRequestField = 'requestedEnvelope' | 'justification' | 'rationale' | 'evidenceUrl' | 'expiresAt' | 'budgetMonthlyLimit' | 'budgetSingleRunLimit' | 'runtimeMinutesLimit' | 'ttl' | 'llms' | 'tools' | 'runnerPlatforms' | 'runnerMemory' | 'runnerCompute' | 'runnerStorage' | 'workspace' | 'egressHosts';
 
 export type EnvelopeRequestHistoryEvent = {
     actor: string;

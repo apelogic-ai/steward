@@ -41,6 +41,31 @@ types are available in the deployment at request creation and again at approval.
 The deprecated `config.apiserver.customEnvelopeSafetyCeiling` setting is accepted
 but ignored for one release and emits one startup warning when set.
 
+## Public egress grants
+
+An Envelope may grant read-only access to named public hosts with
+`spec.egress.hosts`, a list of `{"host": "<exact DNS name>", "port": <1-65535>}`
+entries (the port defaults to 443). The grant follows the same rules as models
+and tools:
+
+- the deployment capability catalog's `egressHosts` is the ceiling, and an
+  installation that lists none offers no public egress;
+- a template may grant only hosts the catalog lists;
+- a request whose hosts are all in its template is provisioned automatically, a
+  host outside the template but in the catalog waits for an administrator, and a
+  host the catalog doesn't list is refused with `422 capability_not_available`
+  (field `egressHosts`);
+- an Envelope without `egress` grants no public egress, even when the catalog
+  lists hosts.
+
+Hosts must be exact lowercase DNS names. Wildcards, IP addresses, single-label
+names, `localhost`, URLs, port 0 and repeated entries are refused. An Envelope
+without `egress` serializes exactly as before, so existing Envelope digests don't
+change.
+
+This release records and admits egress grants. Task sandboxes don't use them yet;
+sandbox enforcement is added separately.
+
 ## Multiple active Envelopes and Task selection
 
 One user may retain active Envelopes from different templates when both their

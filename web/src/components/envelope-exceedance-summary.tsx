@@ -54,6 +54,8 @@ export function envelopeDeltaSummary(delta: DirectAdmissionDelta): EnvelopeExcee
       return { ceiling: delta.ceiling ?? "Not set", label: "Runner storage", requested: delta.requested };
     case "workspace":
       return { ceiling: workspace(delta, "ceiling"), label: "Workspace", requested: workspace(delta, "requested") };
+    case "egressHosts":
+      return { ceiling: listOrNone(delta.ceiling.map((host) => `${host.host}:${host.port}`)), label: "Egress hosts", requested: listOrNone(delta.requested.map((host) => `${host.host}:${host.port}`)) };
   }
 }
 

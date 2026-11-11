@@ -476,6 +476,7 @@ impl Harness {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: Vec::new(),
                 tools: vec![ToolGrant {
                     provider: "github".to_owned(),

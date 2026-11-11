@@ -200,6 +200,8 @@ pub struct BrowserEnvelopeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<steward_types::EgressAuthority>,
 }
 
 impl From<Envelope> for BrowserEnvelope {
@@ -214,6 +216,7 @@ impl From<Envelope> for BrowserEnvelope {
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
                 workspace: envelope.spec.workspace,
+                egress: envelope.spec.egress,
             },
         }
     }
@@ -224,6 +227,7 @@ impl From<BrowserEnvelope> for Envelope {
         Self {
             revision: envelope.revision,
             spec: steward_admission::EnvelopeSpec {
+                egress: envelope.spec.egress,
                 llms: envelope.spec.llms,
                 tools: envelope.spec.tools,
                 budget: envelope.spec.budget,
@@ -286,6 +290,7 @@ pub enum EnvelopeRequestField {
     RunnerCompute,
     RunnerStorage,
     Workspace,
+    EgressHosts,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -931,7 +936,23 @@ pub(crate) fn capability_catalog_violation_fields(
     }) {
         fields.push(EnvelopeRequestField::Tools);
     }
+    if egress_hosts_unavailable(capabilities, envelope) {
+        fields.push(EnvelopeRequestField::EgressHosts);
+    }
     fields
+}
+
+/// True when the Envelope grants a public egress host the deployment catalog does not list.
+pub(crate) fn egress_hosts_unavailable(
+    capabilities: &CapabilityCatalog,
+    envelope: &Envelope,
+) -> bool {
+    envelope.spec.egress.as_ref().is_some_and(|egress| {
+        egress
+            .hosts
+            .iter()
+            .any(|host| !capabilities.egress_hosts.contains(host))
+    })
 }
 
 pub(crate) fn envelope_request_error_response(
@@ -971,6 +992,7 @@ fn envelope_request_field_label(field: EnvelopeRequestField) -> &'static str {
         EnvelopeRequestField::RunnerCompute => "runner compute",
         EnvelopeRequestField::RunnerStorage => "runner storage",
         EnvelopeRequestField::Workspace => "workspace",
+        EnvelopeRequestField::EgressHosts => "egress hosts",
     }
 }
 
@@ -1859,8 +1881,8 @@ mod tests {
         EnvelopeRequestField, EnvelopeRequestHistoryEvent, EnvelopeRequestStatus,
         PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeProjectionStore,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        attach_request_projection, capability_catalog_violation_fields, envelope_usage_view,
-        envelope_request_field_list, inner_router, inner_router_with_agents,
+        attach_request_projection, capability_catalog_violation_fields,
+        envelope_request_field_list, envelope_usage_view, inner_router, inner_router_with_agents,
         inner_router_with_capabilities,
     };
     use crate::browser_admin::{CapabilityCatalog, CapabilityTool, ToolAccessClass};
@@ -2272,6 +2294,7 @@ mod tests {
         let ceiling = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),
@@ -2325,6 +2348,7 @@ mod tests {
         };
         requested.spec.tools = vec![jira_read.clone()];
         let capabilities = CapabilityCatalog {
+            egress_hosts: Vec::new(),
             schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![model],
             tools: vec![CapabilityTool {
@@ -2854,8 +2878,11 @@ mod tests {
             envelope
         };
         assert!(
-            capability_catalog_violation_fields(&catalog, &with_hosts(&[("advisories.example.com", 443)]))
-                .is_empty(),
+            capability_catalog_violation_fields(
+                &catalog,
+                &with_hosts(&[("advisories.example.com", 443)])
+            )
+            .is_empty(),
             "a listed host is available"
         );
         for hosts in [

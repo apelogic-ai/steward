@@ -1236,6 +1236,7 @@ fn test_envelope() -> Envelope {
     Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),

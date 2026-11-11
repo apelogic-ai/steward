@@ -9113,6 +9113,7 @@ mod workflow_request_tests {
         let envelope = Envelope {
             revision: 7,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),

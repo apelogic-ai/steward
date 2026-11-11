@@ -4009,6 +4009,7 @@ name = "steward-admission"
 version = "0.3.31"
 dependencies = [
  "serde",
+ "serde_json",
  "steward-ports",
  "steward-types",
 ]

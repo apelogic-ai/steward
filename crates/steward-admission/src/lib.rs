@@ -5,8 +5,8 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 use steward_types::direct_package::{ResourceQuantity, WorkspaceAuthority, WorkspaceEntryType};
 use steward_types::{
-    AgentRuntimeSpec, Budget, Duration, KubernetesQuantity, ModelRef, RunnerPlatform,
-    RunnerRequirements, SpendSummary, ToolGrant,
+    AgentRuntimeSpec, Budget, Duration, EgressAuthority, EgressHost, KubernetesQuantity, ModelRef,
+    RunnerPlatform, RunnerRequirements, SpendSummary, ToolGrant, validate_egress_hosts,
 };
 
 /// Product-owned authorities that are versioned independently from mutable user and service
@@ -49,6 +49,7 @@ pub mod internal_authorities {
             Envelope {
                 revision: AUTHORITY_VERSION,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: Vec::new(),
                     tools: ["status", "start", "disconnect"]
                         .into_iter()
@@ -269,6 +270,10 @@ pub struct EnvelopeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceAuthority>,
+    /// Public hosts the Envelope grants read-only. Absent means no public egress; it is omitted
+    /// when absent so existing Envelope digests do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressAuthority>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,6 +345,10 @@ pub enum AdmissionDelta {
     Workspace {
         requested: WorkspaceAuthority,
         ceiling: Option<WorkspaceAuthority>,
+    },
+    EgressHosts {
+        requested: Vec<EgressHost>,
+        ceiling: Vec<EgressHost>,
     },
 }
 
@@ -454,6 +463,18 @@ impl AdmissionDelta {
             } => format!(
                 "Workspace access: requested {}, but this Envelope does not allow workspace access",
                 workspace_authority_summary(requested)
+            ),
+            Self::EgressHosts {
+                requested,
+                ceiling: _,
+            } => outside_values_message(
+                "Egress host",
+                "Egress hosts",
+                requested
+                    .iter()
+                    .map(|host| format!("{}:{}", host.host, host.port))
+                    .collect(),
+                "egress hosts",
             ),
         }
     }
@@ -584,6 +605,7 @@ pub enum AdmissionError {
     InvalidRunnerQuantity { resource: String, value: String },
     DuplicateRunnerPlatform { platform: RunnerPlatform },
     InvalidWorkspaceAuthority { reason: String },
+    InvalidEgressAuthority { reason: String },
     UnsupportedBindings,
 }
 
@@ -614,6 +636,15 @@ fn validate_envelope_spec(spec: &EnvelopeSpec) -> Result<(), AdmissionError> {
     validate_runner(&spec.runner)?;
     if let Some(workspace) = &spec.workspace {
         validate_workspace_authority(workspace)?;
+    }
+    if let Some(egress) = &spec.egress {
+        if egress.hosts.is_empty() {
+            return Err(AdmissionError::InvalidEgressAuthority {
+                reason: "hosts must not be empty".to_owned(),
+            });
+        }
+        validate_egress_hosts(&egress.hosts)
+            .map_err(|reason| AdmissionError::InvalidEgressAuthority { reason })?;
     }
     Ok(())
 }
@@ -655,6 +686,7 @@ pub fn evaluate(
     }
     evaluate_envelope_spec(
         &EnvelopeSpec {
+            egress: None,
             llms: request.llms.clone(),
             tools: request.tools.clone(),
             budget: request.budget.clone(),
@@ -823,6 +855,25 @@ fn evaluate_envelope_spec(
             requested: requested.clone(),
             ceiling: envelope.spec.workspace.clone(),
         });
+    }
+    if let Some(requested) = request.egress.as_ref() {
+        let ceiling = envelope
+            .spec
+            .egress
+            .as_ref()
+            .map_or_else(Vec::new, |egress| egress.hosts.clone());
+        let outside = requested
+            .hosts
+            .iter()
+            .filter(|host| !ceiling.contains(host))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !outside.is_empty() {
+            deltas.push(AdmissionDelta::EgressHosts {
+                requested: outside,
+                ceiling,
+            });
+        }
     }
     if deltas.is_empty() {
         Ok(AdmissionDecision::Admit)
@@ -1386,6 +1437,12 @@ fn grant_covers(
             },
             AdmissionDelta::Workspace { requested, .. },
         ) => workspace_authority_is_within(requested, Some(granted)),
+        (
+            AdmissionDelta::EgressHosts {
+                requested: granted, ..
+            },
+            AdmissionDelta::EgressHosts { requested, .. },
+        ) => Ok(requested.iter().all(|host| granted.contains(host))),
         _ => Ok(false),
     }
 }
@@ -1444,6 +1501,7 @@ mod tests {
             let envelope = Envelope {
                 revision: 1,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: Vec::new(),
                     tools: Vec::new(),
                     budget: Budget {
@@ -1494,6 +1552,7 @@ mod tests {
         Envelope {
             revision: 7,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),
@@ -1598,8 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_egress_is_omitted_so_existing_envelope_digests_do_not_change()
-    -> Result<(), String> {
+    fn absent_egress_is_omitted_so_existing_envelope_digests_do_not_change() -> Result<(), String> {
         let spec = envelope_with_budget("100.00").spec;
         let written = serde_json::to_value(&spec).map_err(|error| error.to_string())?;
         assert!(
@@ -1645,7 +1703,10 @@ mod tests {
             vec![("https://advisories.example.com", 443)],
             vec![(long_label.as_str(), 443)],
             vec![("advisories.example.com", 0)],
-            vec![("advisories.example.com", 443), ("advisories.example.com", 443)],
+            vec![
+                ("advisories.example.com", 443),
+                ("advisories.example.com", 443),
+            ],
         ];
         for hosts in refused {
             let mut envelope = envelope_with_budget("100.00");
@@ -1662,8 +1723,14 @@ mod tests {
         for hosts in [
             vec![("advisories.example.com", 443)],
             vec![("xn--bcher-kva.example", 443)],
-            vec![("a1.b-c.example.org", 8443), ("advisories.example.com", 443)],
-            vec![("advisories.example.com", 443), ("advisories.example.com", 8443)],
+            vec![
+                ("a1.b-c.example.org", 8443),
+                ("advisories.example.com", 443),
+            ],
+            vec![
+                ("advisories.example.com", 443),
+                ("advisories.example.com", 8443),
+            ],
         ] {
             let mut envelope = envelope_with_budget("100.00");
             envelope.spec.egress = Some(egress(&hosts));
@@ -1806,6 +1873,7 @@ mod tests {
         let ceiling = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![first_model.clone(), second_model.clone()],
                 tools: vec![first_tool.clone(), second_tool.clone()],
                 budget: budget_with_single_run_limit("100.00", "10.00"),

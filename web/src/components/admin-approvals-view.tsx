@@ -212,6 +212,7 @@ function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]):
     runnerCompute: "Compute",
     runnerStorage: "Storage",
     workspace: "Workspace",
+    egressHosts: "Egress hosts",
   }[dimension];
 }
 
@@ -221,6 +222,9 @@ function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | 
   }
   if (delta.dimension === "tools") {
     return <GrantChipList grants={delta[side].map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.resource}:${tool.action}` }))} />;
+  }
+  if (delta.dimension === "egressHosts") {
+    return delta[side].length ? <GrantChipList grants={delta[side].map((host) => ({ kind: "read", name: `${host.host}:${host.port}` }))} /> : <span className="font-mono text-sm">None</span>;
   }
   if (delta.dimension === "budget" || delta.dimension === "singleRunBudget") {
     const value = delta[side];
