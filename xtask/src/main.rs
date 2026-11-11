@@ -5897,16 +5897,16 @@ mod tests {
 
         for required in [
             "ARG TARGETARCH",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.1/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
-            "8ab67581f5a5e991d0429c2fa1f963fe273c746627e652abe9649e1525fb3dec",
-            "b7024d0ccec1e1e447cb857f9f0dedeb6a0e2f6652a1849f280fa16665e72e17",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
+            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
+            "b539765dbc551a37d25faaeedf6027149f3bce99a362d275ad3d28ac5be27fdd",
+            "ca62b90c1e73d3e6cf8e5f5e8a5a62c5f51adc1bff7f42b2f7eb00326a6a690c",
             "sha256sum --check --strict",
             "/usr/local/bin/mcp-gw-sandbox-helper",
             "/usr/local/bin/kubectl",
             "/usr/local/bin/remote-shell",
-            r#"'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"'"#,
-            r#"'exec /usr/local/bin/mcp-gw-sandbox-helper --run-token openshell-token-grant-placeholder --shell-url "$MCP_GW_SHELL_URL" --operation remote-shell "$@"'"#,
+            r#"'exec /usr/local/bin/mcp-gw-sandbox-helper ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} ${SSL_CERT_FILE:+--ca-file "$SSL_CERT_FILE"} --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"'"#,
+            r#"'exec /usr/local/bin/mcp-gw-sandbox-helper ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} ${SSL_CERT_FILE:+--ca-file "$SSL_CERT_FILE"} --run-token openshell-token-grant-placeholder --shell-url "$MCP_GW_SHELL_URL" --operation remote-shell "$@"'"#,
         ] {
             assert!(
                 container.contains(required),
@@ -5946,6 +5946,10 @@ mod tests {
             "REFUSED kubectl delete: This command is not approved for this run.",
             "REFUSED remote shell: This command is not approved for this run.",
             "remote-shell",
+            "governed_egress_relay",
+            "tls: skip",
+            "RELAYED kubectl get pods auth=placeholder",
+            "RELAYED remote shell engineer: uname -a auth=placeholder",
         ] {
             assert!(
                 e2e.contains(required),
@@ -5981,8 +5985,10 @@ mod tests {
             );
         }
         for required in [
-            "MCP-GW 0.8.1",
+            "MCP-GW 0.8.2",
             "names a fixed reason",
+            "`HTTPS_PROXY`",
+            "`SSL_CERT_FILE`",
             "`MCP_GW_RUN_TOKEN` is not present in the agent environment",
             "non-secret `openshell-token-grant-placeholder` marker",
             "MCP_GW_CLI_URL",

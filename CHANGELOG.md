@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Governed `kubectl` and `remote-shell` commands in the Codex reference sandbox reach the command
+  gateway again. They failed with "CLI request failed" or "Remote shell request failed" because the
+  helper, which the sandbox supervisor starts with an empty environment, could not see the sandbox
+  egress proxy and connected directly, which the sandbox refuses. The reference image pins the
+  MCP-GW 0.8.2 sandbox helper, and the wrappers pass the sandbox's `HTTPS_PROXY` and
+  `SSL_CERT_FILE` as the helper's `--proxy` and `--ca-file` options. CI now runs the packaged
+  wrappers in a real OpenShell sandbox against a gateway stub that is reachable only through the
+  proxy.
+
 ### Added
 
 - A user guide in `docs/user-guide/` for people who run Tasks. It covers concepts, running a Task

@@ -34,18 +34,21 @@ output processing:
 | `jq` | 1.7.1 | JSON inspection and transformation |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
-| `kubectl` | MCP-GW 0.8.1 helper | Governed Kubernetes commands |
-| `remote-shell` | MCP-GW 0.8.1 helper | Governed commands on a run-bound machine |
+| `kubectl` | MCP-GW 0.8.2 helper | Governed Kubernetes commands |
+| `remote-shell` | MCP-GW 0.8.2 helper | Governed commands on a run-bound machine |
 | `uv` | 0.11.15 | Python project and package management |
 
 ## Governed commands and sign-in
 
-The reference image installs the checksum-pinned MCP-GW 0.8.1 sandbox helper
+The reference image installs the checksum-pinned MCP-GW 0.8.2 sandbox helper
 at `/usr/local/bin/mcp-gw-sandbox-helper`. The `kubectl` and `remote-shell`
 wrappers select the matching helper operation explicitly and pass the
 placeholder run token and the matching route to the helper as options, because
-the sandbox supervisor can start the helper with an empty environment. The
-helper does not contain a gateway credential or implement a second sign-in flow.
+the sandbox supervisor can start the helper with an empty environment. For the
+same reason they pass the sandbox's egress proxy (`HTTPS_PROXY`) and CA bundle
+(`SSL_CERT_FILE`) when the sandbox sets them: the sandbox allows egress only
+through its proxy, which terminates TLS with its own CA. The helper does not
+contain a gateway credential or implement a second sign-in flow.
 
 When a Task has the matching approved grant, its agent adapter adds only the
 matching route values to the agent process:
