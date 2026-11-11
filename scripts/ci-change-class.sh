@@ -103,6 +103,8 @@ path_class() {
     docs/task-submission-api.md) echo full; return ;;
     docs/installation/installation-guide.md) echo full; return ;;
     docs/installation/federated-task-identity-upgrade.md) echo full; return ;;
+    # Every JSON example is checked by a steward-types contract test.
+    docs/user-guide/*) echo full; return ;;
     # Copied into the platform-preflight bundle.
     docs/installation/platform-preflight.md) echo full; return ;;
   esac
