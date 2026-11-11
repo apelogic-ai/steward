@@ -1385,11 +1385,11 @@ fn guide_examples(page: &str, markdown: &str) -> Result<Vec<GuideExample>, Strin
 fn guide_examples_require_a_schema_marker() -> Result<(), String> {
     let unmarked = "Text\n\n```json\n{}\n```\n";
     assert_eq!(
-        guide_examples("page.md", unmarked),
-        Err("page.md:3: JSON example needs a schema marker".to_owned())
+        guide_examples("example-page", unmarked),
+        Err("example-page:3: JSON example needs a schema marker".to_owned())
     );
     let marked = "<!-- schema: invalid workspaceEntry -->\n```json\n{}\n```\n";
-    let examples = guide_examples("page.md", marked)?;
+    let examples = guide_examples("example-page", marked)?;
     assert_eq!(examples.len(), 1);
     assert!(!examples[0].valid);
     assert_eq!(examples[0].definition, "workspaceEntry");
