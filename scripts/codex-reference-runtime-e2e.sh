@@ -230,6 +230,7 @@ network_policies:
       - path: /usr/local/bin/mcp-gw-sandbox-helper
       - path: /usr/local/bin/kubectl
       - path: /usr/local/bin/remote-shell
+      - path: /usr/bin/curl
 YAML
 
 "${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
@@ -316,3 +317,53 @@ if [[ "${helper_configuration_failed}" == "1" ]]; then
   echo "the packaged helper rejected its configuration inside the governed sandbox" >&2
   exit 1
 fi
+
+# PROOF ONLY (steward #77, not for merge): does the packaged helper use the
+# sandbox egress proxy? Informational; never fails the job.
+proof() {
+  echo "::group::proof: $1"
+  set +e
+  sandbox_exec /bin/sh -c "$2" 2>&1 | sed -E 's#(://)[^@/ ]*@#\1<userinfo>@#g'
+  echo "exit ${PIPESTATUS[0]}"
+  set -e
+  echo "::endgroup::"
+}
+proof "proxy and CA variables" '
+for name in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NO_PROXY no_proxy \
+  SSL_CERT_FILE NODE_EXTRA_CA_CERTS CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_USE_ENV_PROXY; do
+  if value=$(printenv "$name"); then echo "$name=$value"; else echo "$name unset"; fi
+done
+for f in "${SSL_CERT_FILE:-}" "${NODE_EXTRA_CA_CERTS:-}"; do
+  [ -n "$f" ] && { test -r "$f" && echo "readable $f $(grep -c BEGIN "$f") certs" || echo "unreadable $f"; }
+done'
+proof "curl through env proxy (control)" \
+  "curl -sS -o /dev/null -w 'http=%{http_code}\n' --max-time 15 -X POST -H 'Content-Type: application/json' -d '{}' ${cli_route}"
+proof "curl with no proxy (direct)" \
+  "curl -sS -o /dev/null -w 'http=%{http_code}\n' --max-time 15 --noproxy '*' -X POST -d '{}' ${cli_route}"
+proof "packaged kubectl wrapper" \
+  "export MCP_GW_CLI_URL=${cli_route}; kubectl get pods"
+bun_fetch='const o={method:"POST",headers:{"content-type":"application/json"},body:"{}"};
+const p=process.env.HTTPS_PROXY||process.env.https_proxy||process.env.ALL_PROXY||"";
+const f=process.env.SSL_CERT_FILE||process.env.NODE_EXTRA_CA_CERTS||"";
+const mode="__MODE__";
+console.log("mode="+mode+" env_keys="+Object.keys(process.env).length+" proxy_set="+(p!=="")+" ca_set="+(f!==""));
+if(mode==="proxy"||mode==="proxy-ca")o.proxy=p;
+if(mode==="proxy-ca")o.tls={ca:require("fs").readFileSync(f,"utf8")};
+fetch("'"${cli_route}"'",o).then(r=>console.log("status="+r.status)).catch(e=>console.log("error="+e.name+": "+(e.code||"")+" "+e.message))'
+printf '%s' "${bun_fetch}" >"${STEWARD_RUN_DIR}/proof-fetch.js"
+proof "helper binary: compiled entry env visibility" \
+  "env | wc -l; MCP_GW_CLI_URL=${cli_route} /usr/local/bin/mcp-gw-sandbox-helper --operation kubectl get pods"
+for mode in direct-no-env direct proxy proxy-ca; do
+  if [[ "${mode}" == "direct-no-env" ]]; then
+    prefix="env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy"
+  else
+    prefix="env"
+  fi
+  proof "helper binary as bun: fetch ${mode}" \
+    "${prefix} BUN_BE_BUN=1 /usr/local/bin/mcp-gw-sandbox-helper -e '$(sed -e "s/__MODE__/${mode}/" -e "s/'/'\\\\''/g" "${STEWARD_RUN_DIR}/proof-fetch.js")'"
+done
+echo "::group::proof: OpenShell sandbox network log"
+"${cli}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" --workspace "${workspace}" \
+  logs "${sandbox}" --source sandbox --since 10m -n 2000 2>&1 |
+  grep -i -E 'codex-refusal|connect|deny|denied|network|proxy|binary|curl|helper|kubectl|8443|egress|l7|tls' | tail -150 || true
+echo "::endgroup::"
