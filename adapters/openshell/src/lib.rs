@@ -31,9 +31,10 @@ use openshell_sdk::raw::proto::sandbox::v1::{
 use openshell_sdk::raw::proto::{
     AddNetworkRule, AttachSandboxProviderRequest, CreateProviderRequest,
     DetachSandboxProviderRequest, ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest,
-    GetSandboxRequest, ListSandboxProvidersRequest, PolicyMergeOperation, RemoveNetworkRule,
-    Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, UpdateConfigRequest,
-    exec_sandbox_event, policy_merge_operation,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, ListSandboxProvidersRequest,
+    PolicyMergeOperation, RemoveNetworkRule, Sandbox as RawSandbox,
+    SandboxPhase as RawSandboxPhase, UpdateConfigRequest, exec_sandbox_event,
+    policy_merge_operation,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -2541,12 +2542,32 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
+    /// The sandbox's current policy: its latest policy revision, or its create-time policy while
+    /// no revision exists.
     async fn sandbox_policy(
         &self,
         workspace: &str,
         sandbox: &str,
     ) -> Result<Option<SandboxPolicy>, PortError> {
         let mut client = self.authenticated_client().await?.raw_grpc();
+        match client
+            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                name: sandbox.to_owned(),
+                version: 0,
+                global: false,
+                workspace: workspace.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => {
+                return Ok(response
+                    .into_inner()
+                    .revision
+                    .and_then(|revision| revision.policy));
+            }
+            Err(error) if error.code() as i32 == GRPC_NOT_FOUND => {}
+            Err(error) => return Err(raw_port_failure(error)),
+        }
         let snapshot = client
             .get_sandbox(GetSandboxRequest {
                 name: sandbox.to_owned(),
