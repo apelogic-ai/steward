@@ -1816,7 +1816,7 @@ mod tests {
         let spec: super::AgentRuntimeSpec = serde_json::from_value(serde_json::json!({
             "principal": {"kind": "user", "actingUser": "alice@example.com"},
             "owner": "alice@example.com",
-            "agentType": {"name": "codex@0.140.0"},
+            "agentType": {"name": "example-agent@1.0.0"},
             "llms": [],
             "tools": [],
             "budget": {"monthlyLimit": "1.00", "currency": "USD"},
