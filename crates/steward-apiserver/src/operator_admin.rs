@@ -278,8 +278,22 @@ struct ErrorResponse {
     error: &'static str,
 }
 
-const EGRESS_HOST_NOT_AVAILABLE: &str =
-    "an egress host is not in this deployment's capability catalog egressHosts";
+/// Refuses malformed egress hosts first, then hosts the deployment catalog doesn't list. Without
+/// a configured catalog no egress host is available.
+fn egress_refusal(
+    capabilities: Option<&Extension<crate::browser_admin::CapabilityCatalog>>,
+    envelope: Envelope,
+) -> Option<Response> {
+    if !crate::user_envelopes::egress_format_is_valid(envelope.spec.egress.as_ref()) {
+        return Some(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid egress hosts",
+        ));
+    }
+    let empty = crate::browser_admin::CapabilityCatalog::default();
+    let catalog = capabilities.map_or(&empty, |Extension(catalog)| catalog);
+    crate::user_envelopes::egress_unavailable_response(catalog, &envelope)
+}
 
 pub fn router<L, A>(ledger: L, authenticator: A) -> Router
 where
@@ -552,7 +566,7 @@ pub(crate) async fn latest_template<L: OperatorLedger>(
 pub(crate) async fn apply_template<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
-    egress_ceiling: Option<Extension<crate::user_envelopes::DeploymentEgressCeiling>>,
+    capabilities: Option<Extension<crate::browser_admin::CapabilityCatalog>>,
     Path((template_id, revision)): Path<(String, i64)>,
     Json(mut request): Json<OperatorTemplateApplyRequest>,
 ) -> Response {
@@ -562,11 +576,8 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
             steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
         );
     }
-    if !crate::user_envelopes::egress_within_deployment(
-        egress_ceiling.as_ref().map(|Extension(ceiling)| ceiling),
-        request.ceiling.spec.egress.as_ref(),
-    ) {
-        return error(StatusCode::UNPROCESSABLE_ENTITY, EGRESS_HOST_NOT_AVAILABLE);
+    if let Some(response) = egress_refusal(capabilities.as_ref(), request.ceiling.clone().into()) {
+        return response;
     }
     if !crate::browser_admin::valid_template_identifier(&template_id)
         || revision <= 0
@@ -649,14 +660,14 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
 pub(crate) async fn provision<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
-    egress_ceiling: Option<Extension<crate::user_envelopes::DeploymentEgressCeiling>>,
+    capabilities: Option<Extension<crate::browser_admin::CapabilityCatalog>>,
     Json(request): Json<OperatorProvisionRequest>,
 ) -> Response {
-    if !crate::user_envelopes::egress_within_deployment(
-        egress_ceiling.as_ref().map(|Extension(ceiling)| ceiling),
-        request.requested_envelope.spec.egress.as_ref(),
+    if let Some(response) = egress_refusal(
+        capabilities.as_ref(),
+        request.requested_envelope.clone().into(),
     ) {
-        return error(StatusCode::UNPROCESSABLE_ENTITY, EGRESS_HOST_NOT_AVAILABLE);
+        return response;
     }
     let owner_user_id = match CanonicalUserId::parse(request.owner_user_id) {
         Ok(user_id) => user_id,
@@ -996,16 +1007,17 @@ mod tests {
         })
     }
 
-    fn ceiling(hosts: &[&str]) -> axum::Extension<crate::user_envelopes::DeploymentEgressCeiling> {
-        axum::Extension(crate::user_envelopes::DeploymentEgressCeiling(
-            hosts
+    fn ceiling(hosts: &[&str]) -> axum::Extension<crate::browser_admin::CapabilityCatalog> {
+        axum::Extension(crate::browser_admin::CapabilityCatalog {
+            egress_hosts: hosts
                 .iter()
                 .map(|host| steward_types::EgressHost {
                     host: (*host).to_owned(),
                     port: 443,
                 })
                 .collect(),
-        ))
+            ..crate::browser_admin::CapabilityCatalog::default()
+        })
     }
 
     #[tokio::test]
@@ -1052,7 +1064,7 @@ mod tests {
         }
         let refused = (
             StatusCode::UNPROCESSABLE_ENTITY,
-            EGRESS_HOST_NOT_AVAILABLE.to_owned(),
+            "capability_not_available".to_owned(),
         );
         assert_eq!(
             error_of(
@@ -1080,7 +1092,7 @@ mod tests {
         )
         .await?;
         assert_ne!(
-            listed_error, EGRESS_HOST_NOT_AVAILABLE,
+            listed_error, "capability_not_available",
             "a listed host passes the egress check and reaches the ledger"
         );
 

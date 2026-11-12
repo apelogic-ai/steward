@@ -2683,7 +2683,7 @@ where
 async fn author_envelope_handler<R, L, D>(
     State(state): State<AppState<R, L, D>>,
     Extension(admin): Extension<AdminContext>,
-    egress_ceiling: Option<Extension<user_envelopes::DeploymentEgressCeiling>>,
+    capabilities: Option<Extension<browser_admin::CapabilityCatalog>>,
     Path(member_role): Path<String>,
     Json(envelope): Json<Envelope>,
 ) -> Response
@@ -2692,17 +2692,19 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    if !user_envelopes::egress_within_deployment(
-        egress_ceiling.as_ref().map(|Extension(ceiling)| ceiling),
-        envelope.spec.egress.as_ref(),
-    ) {
+    if !user_envelopes::egress_format_is_valid(envelope.spec.egress.as_ref()) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "an egress host is not in this deployment's capability catalog egressHosts",
-            })),
+            Json(serde_json::json!({ "error": "invalid egress hosts" })),
         )
             .into_response();
+    }
+    let empty = browser_admin::CapabilityCatalog::default();
+    let catalog = capabilities
+        .as_ref()
+        .map_or(&empty, |Extension(catalog)| catalog);
+    if let Some(response) = user_envelopes::egress_unavailable_response(catalog, &envelope) {
+        return response;
     }
     if member_role.is_empty() || envelope.revision <= 0 {
         return (
@@ -5803,6 +5805,37 @@ mod tests {
             .await
             .map_err(|error| format!("execute admin Envelope provision request: {error}"))?;
         assert_eq!(provisioned.status(), StatusCode::OK);
+        let unlisted_egress = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelopes/provision")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ownerUserId":"usr_0123456789abcdef0123456789abcdef","templateId":"engineer","templateRevision":3,"requestedEnvelope":{"revision":3,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"200.00","currency":"USD"},"ttl":"24h","runner":{},"egress":{"hosts":[{"host":"advisories.example.com"}]}}},"idempotencyKey":"admin-provision-unlisted-egress"}"#,
+                    ))
+                    .map_err(|error| format!("build unlisted egress provision: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unlisted egress provision: {error}"))?;
+        assert_eq!(
+            unlisted_egress.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "administrator provisioning must refuse a host the catalog doesn't list"
+        );
+        let refusal: serde_json::Value = serde_json::from_slice(
+            &to_bytes(unlisted_egress.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read unlisted egress provision: {error}"))?,
+        )
+        .map_err(|error| format!("parse unlisted egress provision: {error}"))?;
+        assert_eq!(refusal["error"], "capability_not_available");
+        assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
         let admin_provisions = admin_ledger
             .admin_provisions
             .lock()
@@ -7287,6 +7320,14 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             "a host outside the deployment ceiling cannot be authored"
         );
+        let refusal: serde_json::Value = serde_json::from_slice(
+            &to_bytes(without_ceiling.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read legacy refusal: {error}"))?,
+        )
+        .map_err(|error| format!("parse legacy refusal: {error}"))?;
+        assert_eq!(refusal["error"], "capability_not_available");
+        assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
 
         let with_ceiling = author(
             router(
@@ -7295,12 +7336,13 @@ mod tests {
                 FakeAuthenticator,
                 FakeDecisionChannel::default(),
             )
-            .layer(axum::Extension(
-                crate::user_envelopes::DeploymentEgressCeiling(vec![steward_types::EgressHost {
+            .layer(axum::Extension(browser_admin::CapabilityCatalog {
+                egress_hosts: vec![steward_types::EgressHost {
                     host: "advisories.example.com".to_owned(),
                     port: 443,
-                }]),
-            )),
+                }],
+                ..browser_admin::CapabilityCatalog::default()
+            })),
             body,
         )
         .await?;

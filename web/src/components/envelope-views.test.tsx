@@ -40,11 +40,16 @@ describe("envelope run history", () => {
     expect(source).toContain('title={request.approvedEnvelope ? "Approved access" : "Requested access"}');
   });
 
-  test("shows granted public egress hosts on envelope details and template requests", () => {
+  test("shows granted public egress hosts on envelope details", () => {
     expect(source).toContain("Public egress");
     expect(source).toContain("envelope.spec.egress?.hosts");
-    expect(source).toContain("template.ceiling.spec.egress?.hosts");
     expect(source).toContain("`${host.host}:${host.port}`");
+  });
+
+  test("requests only the template egress hosts the person selects, none by default", () => {
+    expect(source).toContain("useState<ReadonlySet<string>>(() => new Set())");
+    expect(source).toContain("egress: selectedEgressHosts.length ? { hosts: selectedEgressHosts } : undefined");
+    expect(source).toContain('rejectedFields.includes("egressHosts")');
   });
 
   test("loads deployment workspace capabilities for template and custom requests", () => {

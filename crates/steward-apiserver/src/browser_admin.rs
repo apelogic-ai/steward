@@ -1248,6 +1248,11 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     }
     let requested_envelope: Envelope = body.requested_envelope.into();
+    if let Some(response) =
+        crate::user_envelopes::egress_unavailable_response(&state.capabilities, &requested_envelope)
+    {
+        return response;
+    }
     let actor = authority.principal().canonical_user_id.as_str();
     match state
         .ledger

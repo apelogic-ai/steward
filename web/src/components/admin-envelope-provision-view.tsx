@@ -111,6 +111,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
           ["Time-to-live limit", formatDuration(template.envelope.spec.ttl)],
           ["Models", formatCount(template.envelope.spec.llms.length, "model")],
           ["Tools", formatCount(template.envelope.spec.tools.length, "tool")],
+          ["Public egress (read-only)", template.envelope.spec.egress?.hosts.map((host) => `${host.host}:${host.port}`).join(", ") || "None"],
         ]} />
       </section>
       <p className="text-sm text-muted-ink">The selected user remains the owner. Your administrator identity is recorded as the person who made this change.</p>

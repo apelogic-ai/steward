@@ -83,6 +83,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
+mod envelope_egress;
 mod personal_agents;
 
 const RUNTIME_PATH_PREFIX: &str =

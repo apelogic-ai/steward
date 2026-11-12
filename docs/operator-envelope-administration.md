@@ -56,10 +56,14 @@ and tools:
   host outside the template but in the catalog waits for an administrator, and a
   host the catalog doesn't list is refused with `422 capability_not_available`
   (field `egressHosts`), even when its template lists that host;
-- approval, operator provisioning and legacy Envelope authoring check the catalog
-  again;
+- approval, browser and operator provisioning, legacy Envelope authoring and the
+  optional default template check the same catalog, parsed once at startup;
 - an Envelope without `egress` grants no public egress, even when the catalog
   lists hosts.
+
+In the web app a person picks hosts from the template; none is requested by
+default. Administrators see every requested host when reviewing a request or
+provisioning an Envelope.
 
 Hosts must be exact lowercase DNS names whose top-level domain starts with a
 letter. Wildcards, IP addresses, single-label names, `localhost`, URLs, port 0 and

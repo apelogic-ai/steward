@@ -11348,12 +11348,17 @@
         ],
         "properties": {
           "host": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
           },
           "port": {
             "type": "integer",
             "format": "int32",
-            "minimum": 0
+            "default": 443,
+            "maximum": 65535,
+            "minimum": 1
           }
         },
         "additionalProperties": false

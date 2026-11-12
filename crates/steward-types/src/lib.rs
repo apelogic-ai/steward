@@ -1287,8 +1287,14 @@ pub struct ToolGrant {
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressHost {
+    #[schema(
+        min_length = 1,
+        max_length = 253,
+        pattern = r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    )]
     pub host: String,
     #[serde(default = "default_egress_port")]
+    #[schema(minimum = 1, maximum = 65535, default = 443)]
     pub port: u16,
 }
 

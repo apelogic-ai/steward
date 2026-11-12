@@ -145,7 +145,9 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let managed_inference_cipher = managed_inference_cipher(inference_mode)?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
-    ensure_default_llm_template(&store).await?;
+    // Parsed once: every Envelope and template writer checks this same deployment catalog.
+    let capability_catalog = load_capability_catalog()?;
+    ensure_default_llm_template(&store, capability_catalog.as_ref()).await?;
     tokio::spawn(
         steward_apiserver::governed_connections::ConnectionOperationReconciler::new(store.clone())
             .run(),
@@ -233,6 +235,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(
+        capability_catalog.clone(),
         store.clone(),
         runtimes.clone(),
         decisions.clone(),
@@ -259,7 +262,10 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     .merge(operator_admin::router(store.clone(), authenticator))
     .merge(task_auth_discovery_router(task_auth_discovery))
     .merge(task_router(store.clone(), task_identities, task_api_config))
-    .layer(axum::Extension(deployment_egress_ceiling()?));
+    // Without a configured catalog the operator and legacy writers see no egress hosts.
+    .layer(axum::Extension(
+        capability_catalog.clone().unwrap_or_default(),
+    ));
     let app = match browser {
         Some(browser) => app.merge(browser),
         None => app,
@@ -457,10 +463,9 @@ fn configured_source_repository_bindings_json() -> Result<Option<String>, io::Er
     )
 }
 
-/// The public egress ceiling from the capability catalog, for the operator and legacy authoring
-/// paths. Without a configured catalog no egress host is available.
-fn deployment_egress_ceiling()
--> Result<steward_apiserver::user_envelopes::DeploymentEgressCeiling, Box<dyn Error>> {
+/// The deployment capability catalog, parsed once at startup and shared by every Envelope and
+/// template writer.
+fn load_capability_catalog() -> Result<Option<browser_admin::CapabilityCatalog>, Box<dyn Error>> {
     let Some(catalog_json) = configured_bounded_json(
         "STEWARD_CAPABILITY_CATALOG_JSON",
         "STEWARD_CAPABILITY_CATALOG_FILE",
@@ -468,12 +473,10 @@ fn deployment_egress_ceiling()
         "capability catalog",
     )?
     else {
-        return Ok(steward_apiserver::user_envelopes::DeploymentEgressCeiling::default());
+        return Ok(None);
     };
-    let catalog =
-        browser_admin::CapabilityCatalog::from_json(&catalog_json).map_err(io::Error::other)?;
-    Ok(steward_apiserver::user_envelopes::DeploymentEgressCeiling(
-        catalog.egress_hosts,
+    Ok(Some(
+        browser_admin::CapabilityCatalog::from_json(&catalog_json).map_err(io::Error::other)?,
     ))
 }
 
@@ -908,6 +911,7 @@ fn parse_browser_user_token_config(
 }
 
 async fn browser_application_router(
+    capability_catalog: Option<browser_admin::CapabilityCatalog>,
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
@@ -918,15 +922,8 @@ async fn browser_application_router(
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
     };
-    let capability_catalog_json = configured_bounded_json(
-        "STEWARD_CAPABILITY_CATALOG_JSON",
-        "STEWARD_CAPABILITY_CATALOG_FILE",
-        browser_admin::MAX_CAPABILITY_CATALOG_BYTES,
-        "capability catalog",
-    )?
-    .ok_or_else(|| io::Error::other("browser administration requires a capability catalog"))?;
-    let capability_catalog = browser_admin::CapabilityCatalog::from_json(&capability_catalog_json)
-        .map_err(io::Error::other)?;
+    let capability_catalog = capability_catalog
+        .ok_or_else(|| io::Error::other("browser administration requires a capability catalog"))?;
     let admin_setup_config = steward_apiserver::admin_setup::AdminSetupConfig {
         orchestration_active: application_config.task_orchestration_mode.is_active(),
         execution_bindings_active: application_config.task_execution_bindings_active,
@@ -1894,7 +1891,10 @@ fn parse_template_document(bytes: &[u8]) -> Result<TemplateDocument, io::Error> 
         .map_err(|_| io::Error::other("template document must be valid strict YAML or JSON"))
 }
 
-async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Error>> {
+async fn ensure_default_llm_template(
+    store: &PgStore,
+    capability_catalog: Option<&browser_admin::CapabilityCatalog>,
+) -> Result<(), Box<dyn Error>> {
     let Some(document) = optional_unicode_environment("STEWARD_DEFAULT_LLM_TEMPLATE_JSON")? else {
         return Ok(());
     };
@@ -1908,26 +1908,10 @@ async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Erro
         return Err(io::Error::other("template member roles must be unique").into());
     }
     let ceiling: steward_admission::Envelope = document.ceiling.into();
-    let capability_catalog_json = configured_bounded_json(
-        "STEWARD_CAPABILITY_CATALOG_JSON",
-        "STEWARD_CAPABILITY_CATALOG_FILE",
-        browser_admin::MAX_CAPABILITY_CATALOG_BYTES,
-        "capability catalog",
-    )?
-    .ok_or_else(|| {
+    let capability_catalog = capability_catalog.ok_or_else(|| {
         io::Error::other("default LLM smoke template requires the capability catalog")
     })?;
-    let capability_catalog = browser_admin::CapabilityCatalog::from_json(&capability_catalog_json)
-        .map_err(io::Error::other)?;
-    if !ceiling.spec.tools.is_empty()
-        || ceiling.spec.llms.len() != 1
-        || !capability_catalog.models.contains(&ceiling.spec.llms[0])
-    {
-        return Err(io::Error::other(
-            "default LLM smoke template requires one exact available model and empty tools",
-        )
-        .into());
-    }
+    validate_default_template_ceiling(&ceiling, capability_catalog)?;
     if document.auto_provision_threshold.is_some() {
         return Err(io::Error::other(RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE).into());
     }
@@ -1961,6 +1945,28 @@ async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Erro
             authored_by: "system:install",
         })
         .await?;
+    Ok(())
+}
+
+/// The default template must select one available model, no tools, and only egress hosts the
+/// deployment catalog lists.
+fn validate_default_template_ceiling(
+    ceiling: &steward_admission::Envelope,
+    capability_catalog: &browser_admin::CapabilityCatalog,
+) -> Result<(), io::Error> {
+    if !ceiling.spec.tools.is_empty()
+        || ceiling.spec.llms.len() != 1
+        || !capability_catalog.models.contains(&ceiling.spec.llms[0])
+    {
+        return Err(io::Error::other(
+            "default LLM smoke template requires one exact available model and empty tools",
+        ));
+    }
+    if steward_apiserver::user_envelopes::egress_hosts_unavailable(capability_catalog, ceiling) {
+        return Err(io::Error::other(
+            "default LLM smoke template egress hosts must be listed in the capability catalog egressHosts",
+        ));
+    }
     Ok(())
 }
 
@@ -2341,6 +2347,50 @@ mod tests {
                 "invalid personal-agent dispatcher configuration {values:?} must fail startup"
             );
         }
+    }
+
+    #[test]
+    fn default_template_egress_hosts_must_be_in_the_capability_catalog() -> Result<(), String> {
+        let model = steward_types::ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "model-a".to_owned(),
+        };
+        let host = steward_types::EgressHost {
+            host: "advisories.example.com".to_owned(),
+            port: 443,
+        };
+        let ceiling = steward_admission::Envelope {
+            revision: 1,
+            spec: steward_admission::EnvelopeSpec {
+                llms: vec![model.clone()],
+                tools: Vec::new(),
+                budget: steward_types::Budget {
+                    monthly_limit: "1.00".to_owned(),
+                    single_run_limit: None,
+                    currency: "USD".to_owned(),
+                },
+                runtime_minutes_limit: None,
+                ttl: steward_types::Duration("15m".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
+                workspace: None,
+                egress: Some(steward_types::EgressAuthority {
+                    hosts: vec![host.clone()],
+                }),
+            },
+        };
+        let mut catalog = super::browser_admin::CapabilityCatalog {
+            schema_version: "steward.capability-catalog/v2".to_owned(),
+            models: vec![model],
+            ..super::browser_admin::CapabilityCatalog::default()
+        };
+        assert!(
+            super::validate_default_template_ceiling(&ceiling, &catalog).is_err(),
+            "a host the catalog doesn't list must stop the default template"
+        );
+        catalog.egress_hosts = vec![host];
+        super::validate_default_template_ceiling(&ceiling, &catalog)
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     #[test]

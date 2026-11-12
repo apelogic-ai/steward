@@ -942,31 +942,33 @@ pub(crate) fn capability_catalog_violation_fields(
     fields
 }
 
-/// The deployment's public egress ceiling (the capability catalog's `egressHosts`) for paths that
-/// do not read the capability catalog themselves. When it is absent no host is available.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DeploymentEgressCeiling(pub Vec<steward_types::EgressHost>);
-
-impl DeploymentEgressCeiling {
-    /// True when every host the egress grant names is in the ceiling.
-    pub fn allows(&self, egress: Option<&steward_types::EgressAuthority>) -> bool {
-        egress.is_none_or(|egress| egress.hosts.iter().all(|host| self.0.contains(host)))
-    }
+/// Hostname-format check for an egress grant, run before any catalog comparison so a malformed
+/// host is reported as invalid rather than unavailable.
+pub(crate) fn egress_format_is_valid(egress: Option<&steward_types::EgressAuthority>) -> bool {
+    egress.is_none_or(|egress| {
+        !egress.hosts.is_empty() && steward_types::validate_egress_hosts(&egress.hosts).is_ok()
+    })
 }
 
-/// Checks an egress grant on a path without its own catalog; a missing ceiling allows no host.
-pub(crate) fn egress_within_deployment(
-    ceiling: Option<&DeploymentEgressCeiling>,
-    egress: Option<&steward_types::EgressAuthority>,
-) -> bool {
-    ceiling.map_or_else(|| egress.is_none(), |ceiling| ceiling.allows(egress))
+/// The one deployment check for public egress, shared by every Envelope and template writer: a
+/// host the capability catalog's `egressHosts` doesn't list is refused with
+/// `422 capability_not_available`, field `egressHosts`.
+pub(crate) fn egress_unavailable_response(
+    capabilities: &CapabilityCatalog,
+    envelope: &Envelope,
+) -> Option<Response> {
+    egress_hosts_unavailable(capabilities, envelope).then(|| {
+        envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "capability_not_available",
+            "This deployment does not provide the requested egress hosts.",
+            vec![EnvelopeRequestField::EgressHosts],
+        )
+    })
 }
 
 /// True when the Envelope grants a public egress host the deployment catalog does not list.
-pub(crate) fn egress_hosts_unavailable(
-    capabilities: &CapabilityCatalog,
-    envelope: &Envelope,
-) -> bool {
+pub fn egress_hosts_unavailable(capabilities: &CapabilityCatalog, envelope: &Envelope) -> bool {
     envelope.spec.egress.as_ref().is_some_and(|egress| {
         egress
             .hosts
