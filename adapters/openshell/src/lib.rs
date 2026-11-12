@@ -3739,11 +3739,15 @@ mod tests {
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
     #[cfg(feature = "runtime")]
+    use openshell_sdk::raw::proto::sandbox::v1::{
+        NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+    };
+    #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
         ExecSandboxEvent, ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout,
         Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
         SandboxStatus as RawSandboxStatus, SandboxTemplate as RawSandboxTemplate,
-        exec_sandbox_event,
+        exec_sandbox_event, policy_merge_operation,
     };
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
@@ -3767,8 +3771,8 @@ mod tests {
     };
     #[cfg(feature = "runtime")]
     use steward_types::{
-        AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
-        ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
+        AgentType, DisposableExecutionBinding, EgressHost, ExecutionProviderProfile,
+        ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
         TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
     };
 
@@ -3776,14 +3780,14 @@ mod tests {
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpaqueToken, OpenShellConnectionConfig,
-        OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
-        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
-        TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, EGRESS_POLICY_RULE, INFERENCE_PROVIDER, OpaqueToken,
+        OpenShellConnectionConfig, OpenShellTaskLogMode, ProviderReconciliation,
+        STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream,
+        TaskProcessLaunchMode, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
         WorkloadExchangeTokenProvider, WorkloadSourceCredential,
         attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
-        deletion_names, failed_output_archive_command, load_source_credential,
-        output_archive_command, project_request, provider_reconciliation,
+        deletion_names, egress_policy_operations, failed_output_archive_command,
+        load_source_credential, output_archive_command, project_request, provider_reconciliation,
         provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
         request_model_providers, required_output_failure_reason, sandbox_spec,
         sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
@@ -6531,6 +6535,95 @@ mod tests {
                 "the bounded transcript reader must be valid POSIX shell"
             );
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn egress_policy_plan_converges_only_the_steward_rule() {
+        let host = |name: &str| EgressHost {
+            host: name.to_owned(),
+            port: 443,
+        };
+        let endpoint = |name: &str| NetworkEndpoint {
+            host: name.to_owned(),
+            port: 443,
+            protocol: "rest".to_owned(),
+            enforcement: "enforce".to_owned(),
+            access: "full".to_owned(),
+            ..NetworkEndpoint::default()
+        };
+        let rule = |names: &[&str]| NetworkPolicyRule {
+            name: EGRESS_POLICY_RULE.to_owned(),
+            endpoints: names.iter().map(|name| endpoint(name)).collect(),
+            binaries: vec![NetworkBinary {
+                path: "/**".to_owned(),
+                ..NetworkBinary::default()
+            }],
+        };
+        let policy = |rules: Vec<(&str, NetworkPolicyRule)>| SandboxPolicy {
+            network_policies: rules
+                .into_iter()
+                .map(|(name, rule)| (name.to_owned(), rule))
+                .collect(),
+            ..SandboxPolicy::default()
+        };
+        let add = |names: &[&str]| {
+            policy_merge_operation::Operation::AddRule(openshell_sdk::raw::proto::AddNetworkRule {
+                rule_name: EGRESS_POLICY_RULE.to_owned(),
+                rule: Some(rule(names)),
+            })
+        };
+        let remove = || {
+            policy_merge_operation::Operation::RemoveRule(
+                openshell_sdk::raw::proto::RemoveNetworkRule {
+                    rule_name: EGRESS_POLICY_RULE.to_owned(),
+                },
+            )
+        };
+        let operations = |current: Option<&SandboxPolicy>, hosts: &[EgressHost]| {
+            egress_policy_operations(current, hosts)
+                .into_iter()
+                .map(|operation| operation.operation)
+                .collect::<Vec<_>>()
+        };
+        let advisories = "advisories.example.com";
+        let feeds = "feeds.example.org";
+
+        assert_eq!(
+            operations(None, &[]),
+            [],
+            "no grant and no rule needs nothing"
+        );
+        assert_eq!(
+            operations(None, &[host(advisories)]),
+            [Some(add(&[advisories]))],
+            "a grant adds one rule: every method, any binary, the exact host"
+        );
+        let current = policy(vec![(EGRESS_POLICY_RULE, rule(&[advisories]))]);
+        assert_eq!(
+            operations(Some(&current), &[host(advisories)]),
+            [],
+            "an unchanged grant is a no-op"
+        );
+        assert_eq!(
+            operations(Some(&current), &[host(advisories), host(feeds)]),
+            [Some(remove()), Some(add(&[advisories, feeds]))],
+            "a changed grant replaces the rule"
+        );
+        assert_eq!(
+            operations(Some(&current), &[]),
+            [Some(remove())],
+            "a revoked grant removes the rule"
+        );
+
+        let foreign = rule(&["mcp.example.test"]);
+        let with_foreign = policy(vec![("deployment-rule", foreign)]);
+        assert_eq!(operations(Some(&with_foreign), &[]), []);
+        assert_eq!(
+            operations(Some(&with_foreign), &[host(advisories)]),
+            [Some(add(&[advisories]))],
+            "rules Steward does not own are never touched"
+        );
     }
 
     #[cfg(feature = "runtime")]

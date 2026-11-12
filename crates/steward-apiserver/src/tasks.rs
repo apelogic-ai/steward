@@ -7412,9 +7412,9 @@ mod workflow_request_tests {
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
         direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches,
         format_workspace_bytes, prepare_task_input_archive, resolve_scratch_workspace_entry,
-        resolve_versioned_task_plan, source_port_error, source_port_error_with_reporter,
-        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
-        versioned_workflow_reference, workspace_admission_policy,
+        resolve_versioned_task_plan, runtime_egress, source_port_error,
+        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
         workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
         workspace_submodule_is_selected, workspace_submodule_repository_url,
         workspace_tree_inventory,
@@ -9022,7 +9022,13 @@ mod workflow_request_tests {
     #[test]
     fn versioned_task_runtime_snapshots_the_envelope_egress_grant() -> Result<(), String> {
         let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
-        let config = task_config(Some("https://mcp-gw.example.test/mcp"))?;
+        let config =
+            task_config(Some("https://mcp-gw.example.test/mcp"))?.with_egress_ceiling(vec![
+                EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                },
+            ]);
         let plan = resolve_versioned_task_plan(
             &identity,
             workflow(),
@@ -9041,6 +9047,10 @@ mod workflow_request_tests {
                 port: 443,
             }],
         };
+        let catalog_dropped = EgressHost {
+            host: "dropped.example.org".to_owned(),
+            port: 443,
+        };
         let mut envelope = provisioned_envelope(identity.canonical_user_id.as_str())?;
         for snapshot in [
             envelope.template_envelope.as_mut(),
@@ -9050,16 +9060,61 @@ mod workflow_request_tests {
         .into_iter()
         .flatten()
         {
-            snapshot.spec.egress = Some(grant.clone());
+            let mut hosts = grant.hosts.clone();
+            hosts.push(catalog_dropped.clone());
+            snapshot.spec.egress = Some(EgressAuthority { hosts });
         }
-        let plan = resolve_versioned_task_plan(&identity, workflow(), vec![envelope], &config)
-            .map_err(|error| format!("resolve Task plan with egress: {error:?}"))?;
+        let plan =
+            resolve_versioned_task_plan(&identity, workflow(), vec![envelope.clone()], &config)
+                .map_err(|error| format!("resolve Task plan with egress: {error:?}"))?;
         assert_eq!(
             plan.spec.egress,
             Some(grant),
-            "the runtime carries the approved Envelope's egress grant"
+            "the runtime carries the Envelope grant, minus hosts the catalog no longer lists"
+        );
+
+        let without_catalog = task_config(Some("https://mcp-gw.example.test/mcp"))?;
+        let plan =
+            resolve_versioned_task_plan(&identity, workflow(), vec![envelope], &without_catalog)
+                .map_err(|error| format!("resolve Task plan without catalog egress: {error:?}"))?;
+        assert_eq!(
+            plan.spec.egress, None,
+            "a deployment whose catalog lists no egress host gives a Task no egress"
         );
         Ok(())
+    }
+
+    #[test]
+    fn runtime_egress_is_the_envelope_grant_within_the_catalog() {
+        let host = |name: &str| EgressHost {
+            host: name.to_owned(),
+            port: 443,
+        };
+        let grant = EgressAuthority {
+            hosts: vec![host("advisories.example.com"), host("dropped.example.org")],
+        };
+        assert_eq!(
+            runtime_egress(Some(&grant), &[host("advisories.example.com")]),
+            Some(EgressAuthority {
+                hosts: vec![host("advisories.example.com")],
+            })
+        );
+        assert_eq!(runtime_egress(Some(&grant), &[]), None);
+        assert_eq!(
+            runtime_egress(None, &[host("advisories.example.com")]),
+            None
+        );
+        assert_eq!(
+            runtime_egress(
+                Some(&grant),
+                &[EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 8443,
+                }],
+            ),
+            None,
+            "a catalog host on another port does not cover the grant"
+        );
     }
 
     #[test]
