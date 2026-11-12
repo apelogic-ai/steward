@@ -1292,9 +1292,16 @@ pub struct EgressHost {
         max_length = 253,
         pattern = r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
     )]
+    #[schemars(
+        regex(
+            pattern = r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        ),
+        length(min = 1, max = 253)
+    )]
     pub host: String,
     #[serde(default = "default_egress_port")]
     #[schema(minimum = 1, maximum = 65535, default = 443)]
+    #[schemars(range(min = 1, max = 65535))]
     pub port: u16,
 }
 

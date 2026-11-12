@@ -21,16 +21,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   person picks hosts from the template (none by default), and approvers and the template editor
   see them. Migration 0077 lets a request record exceedances in all twelve admission dimensions.
 - Task sandboxes enforce the Envelope `egress` grant. A Task's runtime records the Envelope's
-  hosts that the capability catalog still lists (a host the catalog drops reaches no new Task),
-  and admission refuses a runtime host the Envelope doesn't grant. The OpenShell adapter keeps one
-  sandbox network rule, `steward-egress`, set to exactly those hosts: each host on its port over
-  HTTPS with every HTTP method, from any binary in the sandbox. Every other public host is refused
-  at the proxy with `CONNECT` 403, and revoking the grant removes the rule. The adapter changes
-  only its own rule and reads the policy back to confirm it. A deployment with a global OpenShell
-  policy can't use per-sandbox rules: OpenShell refuses the update, so a Task with an egress grant
-  fails to start there instead of running without it. No provider profile, bundle or preflight
-  change is needed. Runtimes without egress serialize exactly as before, so their digests don't
-  change. The `AgentRuntime` CRD adds the optional `spec.egress` field.
+  hosts that the capability catalog still lists, and admission refuses a runtime host the Envelope
+  doesn't grant. The OpenShell adapter keeps one sandbox network rule, `steward-egress`, set to
+  exactly those hosts: each host on its port over HTTPS with every HTTP method, from any binary in
+  the sandbox. The Task starts only after the sandbox has loaded the rule; a load that fails, or
+  doesn't finish within 120 seconds, fails the Task with a named reason. Every other public host is
+  refused at the proxy with `CONNECT` 403. The adapter changes only its own rule, repairs drift in
+  it, and refuses wildcard hosts and port 0 before calling OpenShell; the `AgentRuntime` CRD adds
+  the optional `spec.egress` field with the same host and port rules. Like its models and tools, a
+  Task keeps the egress it was admitted with until it ends: revoking a host on the Envelope, or
+  removing it from the catalog, applies to new Tasks. A deployment with a global OpenShell policy
+  can't use per-sandbox rules: OpenShell refuses the update, and a Task with an egress grant fails
+  to start with a reason naming the global policy instead of running without its hosts. Runtimes
+  without egress serialize exactly as before, so their digests don't change.
 
 ### Changed
 

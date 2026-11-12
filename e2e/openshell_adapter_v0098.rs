@@ -891,37 +891,9 @@ fn probe_value<'a>(output: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
 }
 
-/// Runs the probe until `accept` holds. Policy changes reach a running sandbox asynchronously,
-/// so each expectation gets a bounded wait rather than a single sample.
-async fn await_egress_probe<F>(
-    runtime: &OpenShellRuntime,
-    sandbox: &SandboxRequest,
-    caller_archive: &[u8],
-    attempt_prefix: u32,
-    expectation: &str,
-    accept: F,
-) -> Result<String, String>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut last = String::new();
-    for attempt in 0..12_u32 {
-        let id = format!(
-            "00000000-0000-4000-8000-{:08}{:04}",
-            attempt_prefix, attempt
-        );
-        last = run_egress_probe(runtime, sandbox, caller_archive, &id).await?;
-        if accept(&last) {
-            return Ok(last);
-        }
-        sleep(Duration::from_secs(5)).await;
-    }
-    Err(format!("{expectation}; last probe output:\n{last}"))
-}
-
 /// Egress enforcement through the real OpenShell proxy: a granted host answers any method from
-/// any binary, an ungranted host is refused at CONNECT, revoking the grant refuses the host
-/// again, and a runtime without a grant gets no egress rule.
+/// any binary as soon as the sandbox runs, an ungranted host is refused at CONNECT, an emptied
+/// egress list removes the rule, and a runtime without a grant gets no egress rule.
 async fn verify_egress_enforcement(
     runtime: &OpenShellRuntime,
     caller_archive: &[u8],
@@ -959,19 +931,23 @@ async fn verify_egress_enforcement(
                 })
             })
         };
-        let output = await_egress_probe(
+        // One probe, right after Running: the adapter reports Running only once the sandbox
+        // has loaded the rule, so there is nothing to wait for.
+        let output = run_egress_probe(
             runtime,
             &sandbox,
             caller_archive,
-            1,
-            "a granted host must answer GET and POST from curl and Python",
-            |output| {
-                reached(output, "granted_get")
-                    && reached(output, "granted_post")
-                    && probe_value(output, "python_get") == Some("200")
-            },
+            "00000000-0000-4000-8000-000000010000",
         )
         .await?;
+        if !(reached(&output, "granted_get")
+            && reached(&output, "granted_post")
+            && probe_value(&output, "python_get") == Some("200"))
+        {
+            return Err(format!(
+                "a granted host must answer GET and POST from curl and Python as soon as the sandbox runs:\n{output}"
+            ));
+        }
         if probe_value(&output, "ungranted_get")
             .and_then(|value| value.split_once('/'))
             .map(|(connect, _)| connect)
@@ -982,18 +958,24 @@ async fn verify_egress_enforcement(
             ));
         }
 
+        // The adapter converges the rule to the runtime's egress list: emptying the list removes
+        // the rule. Task runtimes keep their egress for life; this checks the adapter's removal.
         sandbox.egress = Vec::new();
         wait_running(runtime, &sandbox).await?;
-        await_egress_probe(
+        let output = run_egress_probe(
             runtime,
             &sandbox,
             caller_archive,
-            2,
-            "revoking the Envelope grant must remove the egress rule",
-            refused,
+            "00000000-0000-4000-8000-000000020000",
         )
-        .await
-        .map(|_| ())
+        .await?;
+        if refused(&output) {
+            Ok(())
+        } else {
+            Err(format!(
+                "an emptied egress list must remove the rule and refuse the host:\n{output}"
+            ))
+        }
     }
     .await;
     let cleanup = delete_sandbox(runtime, &sandbox).await;

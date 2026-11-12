@@ -74,21 +74,27 @@ the same host set always gives the same Envelope digest, and an Envelope without
 A Task's sandbox can reach exactly the hosts its Envelope grants:
 
 - when a Task is admitted, its runtime records the Envelope's `egress` hosts
-  that the capability catalog still lists, so a host removed from the catalog
-  reaches no new Task; admission refuses a runtime that names a host its
-  Envelope doesn't grant;
+  that the capability catalog still lists; admission refuses a runtime that
+  names a host its Envelope doesn't grant;
 - the sandbox adapter keeps one OpenShell sandbox network rule,
   `steward-egress`, set to exactly those hosts: each host on its port over
   HTTPS, every HTTP method, from any binary in the sandbox;
+- the Task starts only after the sandbox has loaded that rule. If OpenShell
+  can't load it, or the load doesn't finish within 120 seconds, the Task fails
+  and the controller logs the reason;
 - every other public host is refused by OpenShell's proxy (`CONNECT` returns
-  403);
-- when the grant is removed, the rule is removed and the host is refused again.
+  403).
 
-The adapter changes only the `steward-egress` rule and never touches other rules
-in the sandbox policy. Per-sandbox rules need OpenShell without a global policy:
-when a global policy is set, OpenShell refuses the update, and a Task with an
-egress grant fails to start instead of running without its hosts. Tasks without
-an egress grant are unaffected.
+Like its models and tools, a Task keeps the egress it was admitted with until it
+ends. Revoking a host on the Envelope, or removing it from the catalog, applies
+to new Tasks, not to Tasks already running.
+
+The adapter changes only the `steward-egress` rule, repairs drift in it, and
+never touches other rules in the sandbox policy. Per-sandbox rules need OpenShell
+without a global policy: when a global policy is set, OpenShell refuses the
+update, and a Task with an egress grant fails to start with a reason that names
+the global policy instead of running without its hosts. Tasks without an egress
+grant are unaffected.
 
 ## Multiple active Envelopes and Task selection
 

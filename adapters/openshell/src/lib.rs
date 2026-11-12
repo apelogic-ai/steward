@@ -32,9 +32,9 @@ use openshell_sdk::raw::proto::{
     AddNetworkRule, AttachSandboxProviderRequest, CreateProviderRequest,
     DetachSandboxProviderRequest, ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, ListSandboxProvidersRequest,
-    PolicyMergeOperation, RemoveNetworkRule, Sandbox as RawSandbox,
-    SandboxPhase as RawSandboxPhase, UpdateConfigRequest, exec_sandbox_event,
-    policy_merge_operation,
+    PolicyMergeOperation, PolicyStatus, RemoveNetworkRule, Sandbox as RawSandbox,
+    SandboxPhase as RawSandboxPhase, SandboxPolicyRevision, UpdateConfigRequest,
+    exec_sandbox_event, policy_merge_operation,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -111,6 +111,9 @@ const INFERENCE_PROVIDER: &str = "steward-litellm";
 /// every other rule in the sandbox policy belongs to someone else and is never changed.
 #[cfg(feature = "runtime")]
 const EGRESS_POLICY_RULE: &str = "steward-egress";
+/// How long a stored egress rule may wait for the sandbox to load it before the Task fails.
+#[cfg(feature = "runtime")]
+const EGRESS_POLICY_LOAD_TIMEOUT_MS: i64 = 120_000;
 #[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
@@ -1035,39 +1038,88 @@ fn egress_policy_rule(hosts: &[EgressHost]) -> NetworkPolicyRule {
     }
 }
 
-/// Whether an existing Steward rule already grants exactly `hosts` with the Steward shape.
+/// Whether an existing Steward rule is exactly the rule Steward would write for `hosts`. Every
+/// endpoint field counts, so drift anywhere is repaired; the server's `ports: [port]` form of a
+/// single port is the same endpoint.
 #[cfg(feature = "runtime")]
 fn egress_rule_matches(rule: &NetworkPolicyRule, hosts: &[EgressHost]) -> bool {
-    let endpoint_ports = |endpoint: &NetworkEndpoint| {
-        if endpoint.ports.is_empty() {
-            vec![endpoint.port]
-        } else {
-            endpoint.ports.clone()
+    let normalized = |endpoint: &NetworkEndpoint| {
+        let mut endpoint = endpoint.clone();
+        if let [port] = endpoint.ports.as_slice()
+            && (endpoint.port == 0 || endpoint.port == *port)
+        {
+            endpoint.port = *port;
+            endpoint.ports.clear();
         }
+        endpoint
     };
-    let actual = rule
-        .endpoints
-        .iter()
-        .flat_map(|endpoint| {
-            endpoint_ports(endpoint)
-                .into_iter()
-                .map(|port| (endpoint.host.clone(), port))
+    let desired = egress_policy_rule(hosts);
+    rule.name == desired.name
+        && rule.binaries == desired.binaries
+        && rule.endpoints.len() == desired.endpoints.len()
+        && desired.endpoints.iter().all(|wanted| {
+            rule.endpoints
+                .iter()
+                .any(|actual| normalized(actual) == *wanted)
         })
-        .collect::<BTreeSet<_>>();
-    let desired = hosts
-        .iter()
-        .map(|host| (host.host.clone(), u32::from(host.port)))
-        .collect::<BTreeSet<_>>();
-    actual == desired
-        && rule.endpoints.iter().all(|endpoint| {
-            endpoint.protocol == "rest"
-                && endpoint.enforcement == "enforce"
-                && endpoint.access == "full"
-                && endpoint.rules.is_empty()
-                && endpoint.allowed_ips.is_empty()
-        })
-        && rule.binaries.len() == 1
-        && rule.binaries.iter().all(|binary| binary.path == "/**")
+}
+
+/// Whether the sandbox has loaded a stored policy revision. A rule that is stored but not
+/// loaded doesn't count: the proxy still enforces the previous policy.
+#[derive(Debug)]
+#[cfg(feature = "runtime")]
+enum EgressPolicyLoad {
+    Loaded,
+    Pending,
+}
+
+/// Classifies the latest policy revision. A failed load keeps the previous policy active, and a
+/// revision the sandbox never loads would leave the grant unenforced, so both are terminal.
+#[cfg(feature = "runtime")]
+fn egress_policy_load(
+    revision: Option<&SandboxPolicyRevision>,
+    active_version: u32,
+    now_ms: i64,
+) -> Result<EgressPolicyLoad, PortError> {
+    let Some(revision) = revision else {
+        return Ok(EgressPolicyLoad::Loaded);
+    };
+    if revision.status == PolicyStatus::Loaded as i32 || active_version >= revision.version {
+        return Ok(EgressPolicyLoad::Loaded);
+    }
+    if revision.status == PolicyStatus::Failed as i32 {
+        return Err(PortError::Rejected {
+            reason: format!(
+                "OpenShell could not load the sandbox egress rule: {}",
+                revision.load_error
+            ),
+        });
+    }
+    if now_ms.saturating_sub(revision.created_at_ms) > EGRESS_POLICY_LOAD_TIMEOUT_MS {
+        return Err(PortError::Rejected {
+            reason: format!(
+                "the sandbox did not load its egress rule within {} seconds",
+                EGRESS_POLICY_LOAD_TIMEOUT_MS / 1000
+            ),
+        });
+    }
+    Ok(EgressPolicyLoad::Pending)
+}
+
+/// Classifies a refused egress update. OpenShell refuses sandbox rules while a global policy is
+/// set, which no retry can fix; a version conflict re-plans on the next reconcile.
+#[cfg(feature = "runtime")]
+fn egress_update_failure(status: &tonic::Status) -> Result<EgressPolicyLoad, PortError> {
+    match status.code() {
+        tonic::Code::FailedPrecondition => Err(PortError::Rejected {
+            reason: format!(
+                "OpenShell refused the sandbox egress rule; sandbox egress needs OpenShell without a global OpenShell policy: {}",
+                status.message()
+            ),
+        }),
+        tonic::Code::Aborted => Ok(EgressPolicyLoad::Pending),
+        _ => Err(raw_port_failure(status)),
+    }
 }
 
 /// Merge operations that bring the Steward egress rule to exactly the granted hosts: add it,
@@ -1106,6 +1158,10 @@ fn project_request(
     stable_bridge_image: Option<&str>,
     connections_bridge_image: Option<&str>,
 ) -> Result<OpenShellProjection, PortError> {
+    for host in &request.egress {
+        host.validate()
+            .map_err(|reason| PortError::Rejected { reason })?;
+    }
     let image = bridge_image_for_execution(
         &request.agent_type,
         request.execution_class,
@@ -2542,33 +2598,28 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    /// The sandbox's current policy: its latest policy revision, or its create-time policy while
-    /// no revision exists.
-    async fn sandbox_policy(
+    /// Brings the sandbox's Steward egress rule to exactly the granted hosts and reports whether
+    /// the sandbox has loaded it. A change is written and reported `Pending`; the next ensure
+    /// confirms the load. Rules Steward doesn't own are never changed.
+    async fn converge_egress_policy(
         &self,
         workspace: &str,
         sandbox: &str,
-    ) -> Result<Option<SandboxPolicy>, PortError> {
+        hosts: &[EgressHost],
+    ) -> Result<EgressPolicyLoad, PortError> {
         let mut client = self.authenticated_client().await?.raw_grpc();
-        match client
-            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                name: sandbox.to_owned(),
-                version: 0,
-                global: false,
-                workspace: workspace.to_owned(),
-            })
-            .await
-        {
-            Ok(response) => {
-                return Ok(response
-                    .into_inner()
-                    .revision
-                    .and_then(|revision| revision.policy));
-            }
-            Err(error) if error.code() as i32 == GRPC_NOT_FOUND => {}
+        let status_request = |version: u32| GetSandboxPolicyStatusRequest {
+            name: sandbox.to_owned(),
+            version,
+            global: false,
+            workspace: workspace.to_owned(),
+        };
+        let latest = match client.get_sandbox_policy_status(status_request(0)).await {
+            Ok(response) => Some(response.into_inner()),
+            Err(error) if error.code() as i32 == GRPC_NOT_FOUND => None,
             Err(error) => return Err(raw_port_failure(error)),
-        }
-        let snapshot = client
+        };
+        let raw_sandbox = client
             .get_sandbox(GetSandboxRequest {
                 name: sandbox.to_owned(),
                 workspace: workspace.to_owned(),
@@ -2580,43 +2631,57 @@ impl OpenShellRuntime {
             .ok_or_else(|| PortError::Failed {
                 reason: "OpenShell returned an empty sandbox response".to_owned(),
             })?;
-        Ok(snapshot.spec.and_then(|spec| spec.policy))
-    }
-
-    /// Brings the sandbox's Steward egress rule to exactly the granted hosts, then reads the
-    /// policy back to confirm it converged.
-    async fn converge_egress_policy(
-        &self,
-        workspace: &str,
-        sandbox: &str,
-        hosts: &[EgressHost],
-    ) -> Result<(), PortError> {
-        let operations = egress_policy_operations(
-            self.sandbox_policy(workspace, sandbox).await?.as_ref(),
-            hosts,
-        );
-        if operations.is_empty() {
-            return Ok(());
+        let revision = latest.as_ref().and_then(|latest| latest.revision.as_ref());
+        let stored_policy = match revision {
+            Some(revision) => revision.policy.clone(),
+            None => raw_sandbox
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.clone()),
+        };
+        let operations = egress_policy_operations(stored_policy.as_ref(), hosts);
+        if !operations.is_empty() {
+            let resource_version = raw_sandbox
+                .metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.resource_version);
+            return match client
+                .update_config(UpdateConfigRequest {
+                    name: sandbox.to_owned(),
+                    merge_operations: operations,
+                    expected_resource_version: resource_version,
+                    workspace: workspace.to_owned(),
+                    ..UpdateConfigRequest::default()
+                })
+                .await
+            {
+                Ok(_) => Ok(EgressPolicyLoad::Pending),
+                Err(status) => egress_update_failure(&status),
+            };
         }
-        let mut client = self.authenticated_client().await?.raw_grpc();
-        client
-            .update_config(UpdateConfigRequest {
-                name: sandbox.to_owned(),
-                merge_operations: operations,
-                workspace: workspace.to_owned(),
-                ..UpdateConfigRequest::default()
-            })
-            .await
-            .map_err(raw_port_failure)?;
-        let converged = self.sandbox_policy(workspace, sandbox).await?;
-        if egress_policy_operations(converged.as_ref(), hosts).is_empty() {
-            Ok(())
-        } else {
-            Err(PortError::Failed {
-                reason: "OpenShell sandbox egress rule did not converge to the granted hosts"
-                    .to_owned(),
-            })
+        let active_version = latest.as_ref().map_or(0, |latest| latest.active_version);
+        if let Some(revision) = revision
+            && revision.status == PolicyStatus::Failed as i32
+        {
+            // The sandbox still runs the last policy it loaded. That is fine only if that policy
+            // already has exactly the rule Steward wants.
+            let active = client
+                .get_sandbox_policy_status(status_request(active_version))
+                .await
+                .map_err(raw_port_failure)?
+                .into_inner()
+                .revision
+                .and_then(|revision| revision.policy);
+            if egress_policy_operations(active.as_ref(), hosts).is_empty() {
+                return Ok(EgressPolicyLoad::Loaded);
+            }
         }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+            });
+        egress_policy_load(revision, active_version, now_ms)
     }
 
     async fn attached_providers(
@@ -2932,15 +2997,13 @@ impl SandboxRuntime for OpenShellRuntime {
         }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
-            SandboxPhase::Ready => {
-                self.converge_egress_policy(
-                    &projection.workspace,
-                    &projection.sandbox,
-                    &request.egress,
-                )
-                .await?;
-                Ok(SandboxObservation::Running { refs })
-            }
+            SandboxPhase::Ready => match self
+                .converge_egress_policy(&projection.workspace, &projection.sandbox, &request.egress)
+                .await?
+            {
+                EgressPolicyLoad::Loaded => Ok(SandboxObservation::Running { refs }),
+                EgressPolicyLoad::Pending => Ok(SandboxObservation::Provisioning { refs }),
+            },
             SandboxPhase::Error => Err(PortError::SandboxFailed),
             _ => Ok(SandboxObservation::Provisioning { refs }),
         }

@@ -5126,6 +5126,10 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 {
                     Ok(decision) => decision,
                     Err(error) if runtime_start_failed(&error) => {
+                        eprintln!(
+                            "runtime start failed: runtime={} reason={error}",
+                            runtime.name_any()
+                        );
                         ReconcileDecision::Status(failed_runtime_status(&runtime)?)
                     }
                     Err(error) => return Err(ControllerError::Reconcile(error)),
