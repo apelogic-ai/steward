@@ -3928,10 +3928,10 @@ mod tests {
     };
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
-        ExecSandboxEvent, ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout,
-        Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
-        SandboxStatus as RawSandboxStatus, SandboxTemplate as RawSandboxTemplate,
-        exec_sandbox_event, policy_merge_operation,
+        ExecSandboxEvent, ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout, PolicyStatus,
+        Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxPolicyRevision,
+        SandboxSpec as RawSandboxSpec, SandboxStatus as RawSandboxStatus,
+        SandboxTemplate as RawSandboxTemplate, exec_sandbox_event, policy_merge_operation,
     };
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
@@ -3964,19 +3964,21 @@ mod tests {
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, EGRESS_POLICY_RULE, INFERENCE_PROVIDER, OpaqueToken,
-        OpenShellConnectionConfig, OpenShellTaskLogMode, ProviderReconciliation,
-        STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream,
-        TaskProcessLaunchMode, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, EGRESS_POLICY_LOAD_TIMEOUT_MS, EGRESS_POLICY_RULE,
+        EgressPolicyLoad, INFERENCE_PROVIDER, OpaqueToken, OpenShellConnectionConfig,
+        OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
+        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
+        TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
         WorkloadExchangeTokenProvider, WorkloadSourceCredential,
         attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
-        deletion_names, egress_policy_operations, failed_output_archive_command,
-        load_source_credential, output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
-        request_model_providers, required_output_failure_reason, sandbox_spec,
-        sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
-        staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_attempt_cancel_command, task_attempt_detached_launch_command, task_attempt_directory,
+        deletion_names, egress_policy_load, egress_policy_operations, egress_update_failure,
+        failed_output_archive_command, load_source_credential, output_archive_command,
+        project_request, provider_reconciliation, provider_reconciliation_plan,
+        provider_reconciliation_targets, repository_prompt_context, request_model_providers,
+        required_output_failure_reason, sandbox_spec, sanitized_provider_control_transcript,
+        staging_append_command, staging_archive_chunks, staging_extract_command,
+        staging_prepare_command, task_agent_failure_category, task_attempt_cancel_command,
+        task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_failed_output_command,
         task_attempt_observation_command, task_attempt_transcript_stream_command,
         task_failure_category, task_process_launch_mode, task_process_log_record,
@@ -6723,6 +6725,121 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
+    fn egress_policy_counts_as_converged_only_once_the_sandbox_loads_it() {
+        let now = 1_000_000_i64;
+        let revision = |status: PolicyStatus, created_at_ms: i64| SandboxPolicyRevision {
+            version: 4,
+            status: status as i32,
+            load_error: "bad endpoint".to_owned(),
+            created_at_ms,
+            ..SandboxPolicyRevision::default()
+        };
+        assert!(matches!(
+            egress_policy_load(None, 0, now),
+            Ok(EgressPolicyLoad::Loaded)
+        ));
+        assert!(matches!(
+            egress_policy_load(Some(&revision(PolicyStatus::Loaded, now)), 4, now),
+            Ok(EgressPolicyLoad::Loaded)
+        ));
+        assert!(
+            matches!(
+                egress_policy_load(Some(&revision(PolicyStatus::Pending, now - 1_000)), 3, now),
+                Ok(EgressPolicyLoad::Pending)
+            ),
+            "a stored but unloaded rule must not let the Task start"
+        );
+        assert!(
+            matches!(
+                egress_policy_load(
+                    Some(&revision(
+                        PolicyStatus::Pending,
+                        now - EGRESS_POLICY_LOAD_TIMEOUT_MS - 1
+                    )),
+                    3,
+                    now,
+                ),
+                Err(PortError::Rejected { reason }) if reason.contains("did not load")
+            ),
+            "a rule the sandbox never loads is a terminal, named failure"
+        );
+        assert!(
+            matches!(
+                egress_policy_load(Some(&revision(PolicyStatus::Failed, now)), 3, now),
+                Err(PortError::Rejected { reason }) if reason.contains("bad endpoint")
+            ),
+            "a failed load keeps the previous policy active, so it must be reported, not ignored"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn egress_policy_update_refusals_are_terminal_and_conflicts_replan() {
+        assert!(
+            matches!(
+                egress_update_failure(&tonic::Status::failed_precondition(
+                    "policy is managed globally; delete global policy before sandbox policy update",
+                )),
+                Err(PortError::Rejected { reason }) if reason.contains("global OpenShell policy")
+            ),
+            "a global OpenShell policy must fail the Task with a named reason, not retry forever"
+        );
+        assert!(
+            matches!(
+                egress_update_failure(&tonic::Status::aborted("resource version changed")),
+                Ok(EgressPolicyLoad::Pending)
+            ),
+            "a concurrent change re-plans on the next reconcile"
+        );
+        assert!(matches!(
+            egress_update_failure(&tonic::Status::unavailable("gateway restarting")),
+            Err(PortError::Failed { .. })
+        ));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn invalid_egress_hosts_never_reach_openshell() {
+        for host in [
+            EgressHost {
+                host: "**.com".to_owned(),
+                port: 443,
+            },
+            EgressHost {
+                host: "*.example.com".to_owned(),
+                port: 443,
+            },
+            EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 0,
+            },
+        ] {
+            let result = project_request(
+                &SandboxRequest {
+                    runtime: RuntimeId("runtime-uid-a".to_owned()),
+                    workspace_key: "team-a".to_owned(),
+                    execution_class: SandboxExecutionClass::Agent,
+                    agent_type: AgentType {
+                        name: "base".to_owned(),
+                    },
+                    models: Vec::new(),
+                    tools: Vec::new(),
+                    egress: vec![host.clone()],
+                    refs: RuntimeRefs::default(),
+                    execution_binding: None,
+                },
+                None,
+                None,
+            );
+            assert!(
+                matches!(result, Err(PortError::Rejected { .. })),
+                "egress host {host:?} must be refused before any OpenShell call"
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
     fn egress_policy_plan_converges_only_the_steward_rule() {
         let host = |name: &str| EgressHost {
             host: name.to_owned(),
@@ -6799,6 +6916,35 @@ mod tests {
             [Some(remove())],
             "a revoked grant removes the rule"
         );
+
+        let mut normalized = rule(&[advisories]);
+        normalized.endpoints[0].port = 0;
+        normalized.endpoints[0].ports = vec![443];
+        assert_eq!(
+            operations(
+                Some(&policy(vec![(EGRESS_POLICY_RULE, normalized)])),
+                &[host(advisories)]
+            ),
+            [],
+            "the server's ports form of the same rule is not drift"
+        );
+        for drift in [
+            |endpoint: &mut NetworkEndpoint| endpoint.tls = "skip".to_owned(),
+            |endpoint: &mut NetworkEndpoint| endpoint.path = "/v1/**".to_owned(),
+            |endpoint: &mut NetworkEndpoint| endpoint.allowed_ips = vec!["10.0.0.0/8".to_owned()],
+            |endpoint: &mut NetworkEndpoint| endpoint.request_body_credential_rewrite = true,
+        ] {
+            let mut drifted = rule(&[advisories]);
+            drift(&mut drifted.endpoints[0]);
+            assert_eq!(
+                operations(
+                    Some(&policy(vec![(EGRESS_POLICY_RULE, drifted)])),
+                    &[host(advisories)]
+                ),
+                [Some(remove()), Some(add(&[advisories]))],
+                "drift in Steward's own rule is repaired"
+            );
+        }
 
         let foreign = rule(&["mcp.example.test"]);
         let with_foreign = policy(vec![("deployment-rule", foreign)]);

@@ -1812,6 +1812,27 @@ mod tests {
     }
 
     #[test]
+    fn egress_host_schema_refuses_wildcards_and_port_zero() -> Result<(), String> {
+        let schema = serde_json::to_value(schemars::schema_for!(super::EgressHost))
+            .map_err(|error| error.to_string())?;
+        let pattern = schema
+            .pointer("/properties/host/pattern")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("the host schema needs a pattern: {schema}"))?;
+        assert!(pattern.starts_with('^') && pattern.ends_with('$') && !pattern.contains('*'));
+        assert_eq!(
+            schema.pointer("/properties/host/maxLength"),
+            Some(&serde_json::json!(253))
+        );
+        assert_eq!(
+            schema.pointer("/properties/port/minimum"),
+            Some(&serde_json::json!(1)),
+            "port 0 must be refused by the CRD"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn agent_runtime_spec_omits_absent_egress() -> Result<(), String> {
         let spec: super::AgentRuntimeSpec = serde_json::from_value(serde_json::json!({
             "principal": {"kind": "user", "actingUser": "alice@example.com"},
