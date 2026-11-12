@@ -30,9 +30,10 @@ use steward_admission::{
 use steward_ports::{
     DecisionChannel, DecisionRequest, INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities,
     InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
-    MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
-    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    TASK_AGENT_START_FAILURE, TaskAttemptId,
+    MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SANDBOX_EGRESS_REJECTION_PREFIX,
+    SANDBOX_EGRESS_UNAVAILABLE_FAILURE, SandboxExecutionClass, SandboxTaskObservation,
+    SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime, TASK_AGENT_START_FAILURE,
+    TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -52,8 +53,9 @@ use steward_types::task_output_archive::{
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Budget, DisposableExecutionBinding,
     Duration, PENDING_APPROVAL_ANNOTATION, Phase, RUNTIME_TERMINATION_STARTED_CONDITION, RuntimeId,
-    RuntimeRefs, TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase,
-    runtime_activated_condition, runtime_termination_started_condition,
+    RuntimeRefs, SANDBOX_EGRESS_CONDITION, TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding,
+    TaskPhase, runtime_activated_condition, runtime_termination_started_condition,
+    sandbox_egress_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1722,7 +1724,7 @@ async fn reconcile_shared_runtime_observation(
             .enter_task_cleanup(
                 work.task.task_uid,
                 work.operation.generation,
-                failed_task_runtime_cleanup_cause(&work.task),
+                failed_task_runtime_cleanup_cause(&work.task, &runtime),
                 TASK_ORCHESTRATOR_ACTOR,
             )
             .await
@@ -1813,7 +1815,14 @@ fn task_runtime_observation_is_failed(runtime: &AgentRuntime) -> Result<bool, Ta
     }))
 }
 
-fn failed_task_runtime_cleanup_cause(task: &TaskRecord) -> TaskCleanupCause<'static> {
+fn failed_task_runtime_cleanup_cause(
+    task: &TaskRecord,
+    runtime: &AgentRuntime,
+) -> TaskCleanupCause<'static> {
+    // The sandbox never ran the Task, so there is no spend to settle first.
+    if runtime_failed_on_egress(runtime) {
+        return TaskCleanupCause::Failed(SANDBOX_EGRESS_UNAVAILABLE_FAILURE);
+    }
     if sandbox_execution_class(&task.runtime_spec) == SandboxExecutionClass::Agent
         && task.runtime_spec.budget.single_run_limit.is_some()
     {
@@ -2070,7 +2079,7 @@ async fn reconcile_runtime_activation(
                 .enter_task_cleanup(
                     work.task.task_uid,
                     work.operation.generation,
-                    failed_task_runtime_cleanup_cause(&work.task),
+                    failed_task_runtime_cleanup_cause(&work.task, &observed),
                     TASK_ORCHESTRATOR_ACTOR,
                 )
                 .await
@@ -2194,7 +2203,7 @@ async fn reconcile_runtime_activation(
             .enter_task_cleanup(
                 work.task.task_uid,
                 work.operation.generation,
-                failed_task_runtime_cleanup_cause(&work.task),
+                failed_task_runtime_cleanup_cause(&work.task, &observed),
                 TASK_ORCHESTRATOR_ACTOR,
             )
             .await
@@ -5130,7 +5139,20 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             "runtime start failed: runtime={} reason={error}",
                             runtime.name_any()
                         );
-                        ReconcileDecision::Status(failed_runtime_status(&runtime)?)
+                        let mut status = failed_runtime_status(&runtime)?;
+                        if let Some(condition) =
+                            start_failure_condition(&error, status.observed_generation)
+                            && !status.conditions.iter().any(|existing| {
+                                existing.type_ == condition.type_
+                                    && existing.message == condition.message
+                            })
+                        {
+                            status
+                                .conditions
+                                .retain(|existing| existing.type_ != condition.type_);
+                            status.conditions.push(condition);
+                        }
+                        ReconcileDecision::Status(status)
                     }
                     Err(error) => return Err(ControllerError::Reconcile(error)),
                 };
@@ -5794,6 +5816,30 @@ fn failed_runtime_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, C
     };
     reset_termination_started_condition_for_phase(runtime, &mut status);
     Ok(status)
+}
+
+/// The runtime condition for a start failure the user should be told about: today, a sandbox
+/// that could not be given its granted egress.
+fn start_failure_condition(
+    error: &ReconcileError,
+    observed_generation: i64,
+) -> Option<steward_types::RuntimeCondition> {
+    let ReconcileError::Runtime(PortError::Rejected { reason }) = error else {
+        return None;
+    };
+    reason
+        .starts_with(SANDBOX_EGRESS_REJECTION_PREFIX)
+        .then(|| sandbox_egress_condition(observed_generation, reason))
+}
+
+fn runtime_failed_on_egress(runtime: &AgentRuntime) -> bool {
+    runtime.status.as_ref().is_some_and(|status| {
+        status.phase == Phase::Failed
+            && status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == SANDBOX_EGRESS_CONDITION)
+    })
 }
 
 fn runtime_start_failed(error: &ReconcileError) -> bool {
@@ -7972,7 +8018,8 @@ mod tests {
     }
 
     #[test]
-    fn egress_start_failure_is_recorded_on_the_runtime_and_names_the_task_cause() {
+    fn egress_start_failure_is_recorded_on_the_runtime_and_names_the_task_cause()
+    -> Result<(), String> {
         let egress_refusal = super::ReconcileError::Runtime(PortError::Rejected {
             reason: format!(
                 "{}OpenShell refused the rule: a global OpenShell policy is set",
@@ -7980,7 +8027,7 @@ mod tests {
             ),
         });
         let condition = super::start_failure_condition(&egress_refusal, 3)
-            .unwrap_or_else(|| panic!("an egress refusal must be recorded on the runtime"));
+            .ok_or_else(|| "an egress refusal must be recorded on the runtime".to_owned())?;
         assert_eq!(condition.type_, steward_types::SANDBOX_EGRESS_CONDITION);
         assert_eq!(condition.status, "False");
         assert!(condition.message.contains("global OpenShell policy"));
@@ -8006,6 +8053,7 @@ mod tests {
         });
         assert!(super::runtime_failed_on_egress(&failed));
         assert!(!super::runtime_failed_on_egress(&fixture()));
+        Ok(())
     }
 
     #[test]

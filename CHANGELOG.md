@@ -24,15 +24,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   hosts that the capability catalog still lists, and admission refuses a runtime host the Envelope
   doesn't grant. The OpenShell adapter keeps one sandbox network rule, `steward-egress`, set to
   exactly those hosts: each host on its port over HTTPS with every HTTP method, from any binary in
-  the sandbox. The Task starts only after the sandbox has loaded the rule; a load that fails, or
-  doesn't finish within 120 seconds, fails the Task with a named reason. Every other public host is
-  refused at the proxy with `CONNECT` 403. The adapter changes only its own rule, repairs drift in
-  it, and refuses wildcard hosts and port 0 before calling OpenShell; the `AgentRuntime` CRD adds
-  the optional `spec.egress` field with the same host and port rules. Like its models and tools, a
+  the sandbox. The Task starts only after the sandbox has loaded Steward's own write of the rule; a
+  load that fails, or doesn't finish within 120 seconds, fails the Task. Other writers' policy
+  revisions never hold up or fail a Task. Every other public host is refused at the proxy with
+  `CONNECT` 403. The adapter changes only its own rule, repairs drift in it, refuses wildcard hosts,
+  port 0 and repeated hosts, and refuses a granted host that another sandbox rule already covers
+  (OpenShell would otherwise merge the two), naming that rule; the `AgentRuntime` CRD adds the
+  optional `spec.egress` field with the same host and port rules. When a sandbox can't be given its
+  hosts, the runtime gets a `SandboxEgress` condition with OpenShell's reason and the Task fails
+  with "This run could not start because its sandbox could not be given the public hosts its
+  Envelope grants." Like its models and tools, a
   Task keeps the egress it was admitted with until it ends: revoking a host on the Envelope, or
   removing it from the catalog, applies to new Tasks. A deployment with a global OpenShell policy
   can't use per-sandbox rules: OpenShell refuses the update, and a Task with an egress grant fails
-  to start with a reason naming the global policy instead of running without its hosts. Runtimes
+  to start, with the runtime condition naming the global policy, instead of running without its
+  hosts. Runtimes
   without egress serialize exactly as before, so their digests don't change.
 
 ### Changed

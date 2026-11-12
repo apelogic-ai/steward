@@ -31,10 +31,11 @@ use openshell_sdk::raw::proto::sandbox::v1::{
 use openshell_sdk::raw::proto::{
     AddNetworkRule, AttachSandboxProviderRequest, CreateProviderRequest,
     DetachSandboxProviderRequest, ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, ListSandboxProvidersRequest,
-    PolicyMergeOperation, PolicyStatus, RemoveNetworkRule, Sandbox as RawSandbox,
-    SandboxPhase as RawSandboxPhase, SandboxPolicyRevision, UpdateConfigRequest,
-    exec_sandbox_event, policy_merge_operation,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse, GetSandboxRequest,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, PolicyMergeOperation, PolicyStatus,
+    RemoveNetworkRule, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
+    SandboxPolicyRevision, UpdateConfigRequest, UpdateConfigResponse, exec_sandbox_event,
+    policy_merge_operation,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -52,11 +53,11 @@ use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
     MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProviderControlExecutionBindings,
-    REQUIRED_OUTPUT_MISSING_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
-    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
-    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE, TaskAttemptId,
-    WORKSPACE_PREPARATION_FAILURE,
+    REQUIRED_OUTPUT_MISSING_FAILURE, SANDBOX_EGRESS_REJECTION_PREFIX,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass, SandboxObservation,
+    SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime, SandboxTaskTranscript, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE,
+    TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -111,9 +112,6 @@ const INFERENCE_PROVIDER: &str = "steward-litellm";
 /// every other rule in the sandbox policy belongs to someone else and is never changed.
 #[cfg(feature = "runtime")]
 const EGRESS_POLICY_RULE: &str = "steward-egress";
-/// How long a stored egress rule may wait for the sandbox to load it before the Task fails.
-#[cfg(feature = "runtime")]
-const EGRESS_POLICY_LOAD_TIMEOUT_MS: i64 = 120_000;
 #[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
@@ -1039,8 +1037,8 @@ fn egress_policy_rule(hosts: &[EgressHost]) -> NetworkPolicyRule {
 }
 
 /// Whether an existing Steward rule is exactly the rule Steward would write for `hosts`. Every
-/// endpoint field counts, so drift anywhere is repaired; the server's `ports: [port]` form of a
-/// single port is the same endpoint.
+/// endpoint field counts, so drift anywhere is repaired. Endpoints and binaries compare as sets,
+/// and OpenShell's normalised `ports: [port]` form of a single port is the same endpoint.
 #[cfg(feature = "runtime")]
 fn egress_rule_matches(rule: &NetworkPolicyRule, hosts: &[EgressHost]) -> bool {
     let normalized = |endpoint: &NetworkEndpoint| {
@@ -1054,18 +1052,25 @@ fn egress_rule_matches(rule: &NetworkPolicyRule, hosts: &[EgressHost]) -> bool {
         endpoint
     };
     let desired = egress_policy_rule(hosts);
-    rule.name == desired.name
-        && rule.binaries == desired.binaries
-        && rule.endpoints.len() == desired.endpoints.len()
-        && desired.endpoints.iter().all(|wanted| {
-            rule.endpoints
+    let binaries = |rule: &NetworkPolicyRule| {
+        rule.binaries
+            .iter()
+            .map(|binary| binary.path.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let covers = |left: &NetworkPolicyRule, right: &NetworkPolicyRule| {
+        left.endpoints.iter().all(|endpoint| {
+            let endpoint = normalized(endpoint);
+            right
+                .endpoints
                 .iter()
-                .any(|actual| normalized(actual) == *wanted)
+                .any(|other| normalized(other) == endpoint)
         })
+    };
+    binaries(rule) == binaries(&desired) && covers(rule, &desired) && covers(&desired, rule)
 }
 
-/// Whether the sandbox has loaded a stored policy revision. A rule that is stored but not
-/// loaded doesn't count: the proxy still enforces the previous policy.
+/// Whether the sandbox runs the wanted egress rule yet.
 #[derive(Debug)]
 #[cfg(feature = "runtime")]
 enum EgressPolicyLoad {
@@ -1073,53 +1078,256 @@ enum EgressPolicyLoad {
     Pending,
 }
 
-/// Classifies the latest policy revision. A failed load keeps the previous policy active, and a
-/// revision the sandbox never loads would leave the grant unenforced, so both are terminal.
 #[cfg(feature = "runtime")]
-fn egress_policy_load(
-    revision: Option<&SandboxPolicyRevision>,
-    active_version: u32,
-    now_ms: i64,
-) -> Result<EgressPolicyLoad, PortError> {
-    let Some(revision) = revision else {
-        return Ok(EgressPolicyLoad::Loaded);
-    };
-    if revision.status == PolicyStatus::Loaded as i32 || active_version >= revision.version {
-        return Ok(EgressPolicyLoad::Loaded);
+fn egress_rejection(reason: impl std::fmt::Display) -> PortError {
+    PortError::Rejected {
+        reason: format!("{SANDBOX_EGRESS_REJECTION_PREFIX}{reason}"),
     }
-    if revision.status == PolicyStatus::Failed as i32 {
-        return Err(PortError::Rejected {
-            reason: format!(
-                "OpenShell could not load the sandbox egress rule: {}",
-                revision.load_error
-            ),
-        });
-    }
-    if now_ms.saturating_sub(revision.created_at_ms) > EGRESS_POLICY_LOAD_TIMEOUT_MS {
-        return Err(PortError::Rejected {
-            reason: format!(
-                "the sandbox did not load its egress rule within {} seconds",
-                EGRESS_POLICY_LOAD_TIMEOUT_MS / 1000
-            ),
-        });
-    }
-    Ok(EgressPolicyLoad::Pending)
 }
 
-/// Classifies a refused egress update. OpenShell refuses sandbox rules while a global policy is
-/// set, which no retry can fix; a version conflict re-plans on the next reconcile.
+/// Classifies a refused egress update. OpenShell's refusals of the policy itself can't be fixed
+/// by retrying, so they are terminal and keep OpenShell's message; a version conflict re-plans;
+/// transport failures and an unavailable gateway are retried.
 #[cfg(feature = "runtime")]
 fn egress_update_failure(status: &tonic::Status) -> Result<EgressPolicyLoad, PortError> {
     match status.code() {
-        tonic::Code::FailedPrecondition => Err(PortError::Rejected {
-            reason: format!(
-                "OpenShell refused the sandbox egress rule; sandbox egress needs OpenShell without a global OpenShell policy: {}",
-                status.message()
-            ),
-        }),
+        tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => {
+            let message = status.message();
+            let category = if message.contains("managed globally") {
+                "a global OpenShell policy is set; sandbox egress needs OpenShell without one"
+            } else if message.contains("ambiguous") || message.contains("ambiguity") {
+                "the rule's endpoints are ambiguous with another rule in the sandbox policy"
+            } else if message.contains("unsafe content") {
+                "OpenShell found unsafe content in the resulting policy"
+            } else {
+                "OpenShell could not merge the rule into the sandbox policy"
+            };
+            Err(egress_rejection(format_args!("{category}: {message}")))
+        }
         tonic::Code::Aborted => Ok(EgressPolicyLoad::Pending),
         _ => Err(raw_port_failure(status)),
     }
+}
+
+/// The provenance Steward attaches to its own policy writes, so the revision it produced can be
+/// found again without keeping state.
+#[cfg(feature = "runtime")]
+const EGRESS_PROVENANCE_KEY: &str = "agents.apelogic.ai/egress-rule";
+
+/// A stable digest of the wanted egress rule, written as the provenance value.
+#[cfg(feature = "runtime")]
+fn egress_rule_digest(hosts: &[EgressHost]) -> String {
+    use sha2::{Digest, Sha256};
+    let hosts = hosts
+        .iter()
+        .map(|host| format!("{}:{}", host.host, host.port))
+        .collect::<BTreeSet<_>>();
+    let mut digest = Sha256::new();
+    digest.update(b"steward-egress/v1");
+    for host in hosts {
+        digest.update(b"\n");
+        digest.update(host.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The first rule Steward doesn't own that already covers a granted host and port. OpenShell's
+/// add-rule folds a new rule into such a rule (same host, path and port; provider rules
+/// excluded), so Steward refuses instead of widening someone else's rule.
+#[cfg(feature = "runtime")]
+fn foreign_egress_rule(policy: Option<&SandboxPolicy>, hosts: &[EgressHost]) -> Option<String> {
+    let policy = policy?;
+    let mut names = policy.network_policies.keys().collect::<Vec<_>>();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        if name == EGRESS_POLICY_RULE || name.starts_with("_provider_") {
+            return None;
+        }
+        let rule = policy.network_policies.get(name)?;
+        rule.endpoints
+            .iter()
+            .any(|endpoint| {
+                let ports = if endpoint.ports.is_empty() {
+                    vec![endpoint.port]
+                } else {
+                    endpoint.ports.clone()
+                };
+                endpoint.path.is_empty()
+                    && hosts.iter().any(|host| {
+                        endpoint.host.eq_ignore_ascii_case(&host.host)
+                            && ports.contains(&u32::from(host.port))
+                    })
+            })
+            .then(|| name.clone())
+    })
+}
+
+/// The gateway calls egress convergence needs, for one sandbox.
+#[cfg(feature = "runtime")]
+trait EgressPolicyGateway {
+    /// One policy revision with its policy; version 0 is the latest. `None` when the sandbox has
+    /// no revision yet.
+    async fn policy_revision(
+        &mut self,
+        version: u32,
+    ) -> Result<Option<GetSandboxPolicyStatusResponse>, tonic::Status>;
+    /// Recent revisions, newest first, without their policies.
+    async fn recent_revisions(&mut self) -> Result<Vec<SandboxPolicyRevision>, tonic::Status>;
+    async fn update(
+        &mut self,
+        request: UpdateConfigRequest,
+    ) -> Result<UpdateConfigResponse, tonic::Status>;
+}
+
+#[cfg(feature = "runtime")]
+struct GrpcEgressGateway<'a> {
+    client: openshell_sdk::raw::AuthedGrpcClient,
+    workspace: &'a str,
+    sandbox: &'a str,
+}
+
+#[cfg(feature = "runtime")]
+impl EgressPolicyGateway for GrpcEgressGateway<'_> {
+    async fn policy_revision(
+        &mut self,
+        version: u32,
+    ) -> Result<Option<GetSandboxPolicyStatusResponse>, tonic::Status> {
+        match self
+            .client
+            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                name: self.sandbox.to_owned(),
+                version,
+                global: false,
+                workspace: self.workspace.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => Ok(Some(response.into_inner())),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
+
+    async fn recent_revisions(&mut self) -> Result<Vec<SandboxPolicyRevision>, tonic::Status> {
+        Ok(self
+            .client
+            .list_sandbox_policies(ListSandboxPoliciesRequest {
+                name: self.sandbox.to_owned(),
+                limit: 50,
+                offset: 0,
+                global: false,
+                workspace: self.workspace.to_owned(),
+            })
+            .await?
+            .into_inner()
+            .revisions)
+    }
+
+    async fn update(
+        &mut self,
+        request: UpdateConfigRequest,
+    ) -> Result<UpdateConfigResponse, tonic::Status> {
+        Ok(self.client.update_config(request).await?.into_inner())
+    }
+}
+
+/// How long Steward's own egress revision may stay unloaded before the runtime fails.
+#[cfg(feature = "runtime")]
+const EGRESS_POLICY_LOAD_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+
+/// Brings the sandbox's Steward egress rule to exactly `hosts` and reports whether the sandbox
+/// runs it.
+///
+/// - If the policy the sandbox has loaded already holds exactly the wanted rule (or none is
+///   wanted and none exists), the runtime is Running; other writers' revisions never gate or
+///   fail it.
+/// - Otherwise Steward writes the change, tagged with its provenance and guarded by the sandbox
+///   resource version, and tracks only the revision that write produced: Running once the
+///   sandbox loads it, terminal if the load fails or doesn't finish within
+///   [`EGRESS_POLICY_LOAD_TIMEOUT`] (measured by `pending_for`, the adapter's own clock).
+/// - A granted host already covered by a rule Steward doesn't own is refused by name.
+#[cfg(feature = "runtime")]
+async fn converge_egress_policy<G: EgressPolicyGateway>(
+    gateway: &mut G,
+    sandbox: &RawSandbox,
+    hosts: &[EgressHost],
+    pending_for: impl FnOnce(u32) -> StdDuration,
+) -> Result<EgressPolicyLoad, PortError> {
+    let metadata = sandbox.metadata.as_ref().ok_or_else(|| PortError::Failed {
+        reason: "OpenShell returned a sandbox without metadata".to_owned(),
+    })?;
+    let create_policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
+    let latest = gateway.policy_revision(0).await.map_err(raw_port_failure)?;
+    let active_version = latest.as_ref().map_or(0, |latest| latest.active_version);
+    let latest_revision = latest.as_ref().and_then(|latest| latest.revision.as_ref());
+    let active_policy = if active_version == 0 {
+        create_policy.cloned()
+    } else if latest_revision.is_some_and(|revision| revision.version == active_version) {
+        latest_revision.and_then(|revision| revision.policy.clone())
+    } else {
+        gateway
+            .policy_revision(active_version)
+            .await
+            .map_err(raw_port_failure)?
+            .and_then(|response| response.revision)
+            .and_then(|revision| revision.policy)
+    };
+    if egress_policy_operations(active_policy.as_ref(), hosts).is_empty() {
+        return Ok(EgressPolicyLoad::Loaded);
+    }
+
+    let stored_policy = match latest_revision {
+        Some(revision) => revision.policy.as_ref(),
+        None => create_policy,
+    };
+    let digest = egress_rule_digest(hosts);
+    let operations = egress_policy_operations(stored_policy, hosts);
+    if !operations.is_empty() {
+        if let Some(rule) = foreign_egress_rule(stored_policy, hosts) {
+            return Err(egress_rejection(format_args!(
+                "a granted host is already covered by the sandbox rule {rule:?}, which Steward does not own"
+            )));
+        }
+        return match gateway
+            .update(UpdateConfigRequest {
+                name: metadata.name.clone(),
+                merge_operations: operations,
+                expected_resource_version: metadata.resource_version,
+                annotations: [(EGRESS_PROVENANCE_KEY.to_owned(), digest)]
+                    .into_iter()
+                    .collect(),
+                workspace: metadata.workspace.clone(),
+                ..UpdateConfigRequest::default()
+            })
+            .await
+        {
+            Ok(_) => Ok(EgressPolicyLoad::Pending),
+            Err(status) => egress_update_failure(&status),
+        };
+    }
+
+    // The stored policy already holds the wanted rule; follow the revision Steward wrote.
+    let revisions = gateway.recent_revisions().await.map_err(raw_port_failure)?;
+    let ours = revisions
+        .iter()
+        .find(|revision| revision.provenance.get(EGRESS_PROVENANCE_KEY) == Some(&digest))
+        .or(latest_revision);
+    let Some(ours) = ours else {
+        return Ok(EgressPolicyLoad::Pending);
+    };
+    if ours.status == PolicyStatus::Failed as i32 {
+        return Err(egress_rejection(format_args!(
+            "OpenShell could not load the egress rule: {}",
+            ours.load_error
+        )));
+    }
+    if pending_for(ours.version) > EGRESS_POLICY_LOAD_TIMEOUT {
+        return Err(egress_rejection(format_args!(
+            "the sandbox did not load its egress rule within {} seconds",
+            EGRESS_POLICY_LOAD_TIMEOUT.as_secs()
+        )));
+    }
+    Ok(EgressPolicyLoad::Pending)
 }
 
 /// Merge operations that bring the Steward egress rule to exactly the granted hosts: add it,
@@ -1158,9 +1366,15 @@ fn project_request(
     stable_bridge_image: Option<&str>,
     connections_bridge_image: Option<&str>,
 ) -> Result<OpenShellProjection, PortError> {
+    let mut granted = BTreeSet::new();
     for host in &request.egress {
-        host.validate()
-            .map_err(|reason| PortError::Rejected { reason })?;
+        host.validate().map_err(egress_rejection)?;
+        if !granted.insert((host.host.as_str(), host.port)) {
+            return Err(egress_rejection(format_args!(
+                "egress host {}:{} is listed more than once",
+                host.host, host.port
+            )));
+        }
     }
     let image = bridge_image_for_execution(
         &request.agent_type,
@@ -2075,6 +2289,12 @@ pub struct OpenShellRuntime {
     bridge_gateway_version: Option<String>,
     runtime_class_name: String,
     bridge_runtime_namespace: Option<String>,
+    /// When this adapter first saw each of Steward's egress revisions still unloaded, keyed by
+    /// sandbox and revision version. The load timeout is measured on this one clock.
+    egress_pending_since: Arc<std::sync::Mutex<HashMap<(String, u32), Instant>>>,
+    /// Sandboxes last seen with no egress wanted and no Steward rule, so their next ensure can
+    /// skip reading the policy.
+    egress_clear_sandboxes: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 #[cfg(feature = "runtime")]
@@ -2123,6 +2343,8 @@ impl OpenShellRuntime {
             bridge_gateway_version: config.bridge_gateway_version,
             runtime_class_name: config.runtime_class_name,
             bridge_runtime_namespace: config.bridge_runtime_namespace,
+            egress_pending_since: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            egress_clear_sandboxes: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
         };
         runtime.authenticated_client().await?;
         Ok(runtime)
@@ -2441,6 +2663,32 @@ impl OpenShellRuntime {
         expected_image: Option<&str>,
         require_ready: bool,
     ) -> Result<String, PortError> {
+        self.raw_sandbox_binding(
+            workspace,
+            sandbox,
+            runtime_uid,
+            expected_image,
+            require_ready,
+        )
+        .await?
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id.clone())
+        .filter(|sandbox_id| !sandbox_id.is_empty())
+        .ok_or_else(|| PortError::Rejected {
+            reason: "OpenShell raw sandbox has no stable ID".to_owned(),
+        })
+    }
+
+    /// The raw sandbox, verified to belong to this runtime.
+    async fn raw_sandbox_binding(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        runtime_uid: &str,
+        expected_image: Option<&str>,
+        require_ready: bool,
+    ) -> Result<RawSandbox, PortError> {
         let mut client = self
             .authenticated_client()
             .await?
@@ -2460,14 +2708,7 @@ impl OpenShellRuntime {
                 reason: "OpenShell returned an empty sandbox response".to_owned(),
             })?;
         validate_raw_sandbox_binding(&snapshot, runtime_uid, expected_image, require_ready)?;
-        snapshot
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.id.clone())
-            .filter(|sandbox_id| !sandbox_id.is_empty())
-            .ok_or_else(|| PortError::Rejected {
-                reason: "OpenShell raw sandbox has no stable ID".to_owned(),
-            })
+        Ok(snapshot)
     }
 
     async fn ensure_workspace(&self, name: &str, workspace_key: &str) -> Result<(), PortError> {
@@ -2598,90 +2839,57 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    /// Brings the sandbox's Steward egress rule to exactly the granted hosts and reports whether
-    /// the sandbox has loaded it. A change is written and reported `Pending`; the next ensure
-    /// confirms the load. Rules Steward doesn't own are never changed.
-    async fn converge_egress_policy(
+    /// Converges the sandbox's Steward egress rule (see [`converge_egress_policy`]) and keeps the
+    /// adapter's own pending clock and no-egress cache.
+    async fn converge_sandbox_egress(
         &self,
         workspace: &str,
         sandbox: &str,
+        raw_sandbox: &RawSandbox,
         hosts: &[EgressHost],
     ) -> Result<EgressPolicyLoad, PortError> {
-        let mut client = self.authenticated_client().await?.raw_grpc();
-        let status_request = |version: u32| GetSandboxPolicyStatusRequest {
-            name: sandbox.to_owned(),
-            version,
-            global: false,
-            workspace: workspace.to_owned(),
+        let poisoned = || PortError::Failed {
+            reason: "egress state lock was poisoned".to_owned(),
         };
-        let latest = match client.get_sandbox_policy_status(status_request(0)).await {
-            Ok(response) => Some(response.into_inner()),
-            Err(error) if error.code() as i32 == GRPC_NOT_FOUND => None,
-            Err(error) => return Err(raw_port_failure(error)),
-        };
-        let raw_sandbox = client
-            .get_sandbox(GetSandboxRequest {
-                name: sandbox.to_owned(),
-                workspace: workspace.to_owned(),
-            })
-            .await
-            .map_err(raw_port_failure)?
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| PortError::Failed {
-                reason: "OpenShell returned an empty sandbox response".to_owned(),
-            })?;
-        let revision = latest.as_ref().and_then(|latest| latest.revision.as_ref());
-        let stored_policy = match revision {
-            Some(revision) => revision.policy.clone(),
-            None => raw_sandbox
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.policy.clone()),
-        };
-        let operations = egress_policy_operations(stored_policy.as_ref(), hosts);
-        if !operations.is_empty() {
-            let resource_version = raw_sandbox
-                .metadata
-                .as_ref()
-                .map_or(0, |metadata| metadata.resource_version);
-            return match client
-                .update_config(UpdateConfigRequest {
-                    name: sandbox.to_owned(),
-                    merge_operations: operations,
-                    expected_resource_version: resource_version,
-                    workspace: workspace.to_owned(),
-                    ..UpdateConfigRequest::default()
-                })
-                .await
-            {
-                Ok(_) => Ok(EgressPolicyLoad::Pending),
-                Err(status) => egress_update_failure(&status),
-            };
-        }
-        let active_version = latest.as_ref().map_or(0, |latest| latest.active_version);
-        if let Some(revision) = revision
-            && revision.status == PolicyStatus::Failed as i32
+        if hosts.is_empty()
+            && self
+                .egress_clear_sandboxes
+                .lock()
+                .map_err(|_| poisoned())?
+                .contains(sandbox)
         {
-            // The sandbox still runs the last policy it loaded. That is fine only if that policy
-            // already has exactly the rule Steward wants.
-            let active = client
-                .get_sandbox_policy_status(status_request(active_version))
-                .await
-                .map_err(raw_port_failure)?
-                .into_inner()
-                .revision
-                .and_then(|revision| revision.policy);
-            if egress_policy_operations(active.as_ref(), hosts).is_empty() {
-                return Ok(EgressPolicyLoad::Loaded);
-            }
+            return Ok(EgressPolicyLoad::Loaded);
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-            });
-        egress_policy_load(revision, active_version, now_ms)
+        let mut gateway = GrpcEgressGateway {
+            client: self.authenticated_client().await?.raw_grpc(),
+            workspace,
+            sandbox,
+        };
+        let pending_since = &self.egress_pending_since;
+        let result = converge_egress_policy(&mut gateway, raw_sandbox, hosts, |version| {
+            pending_since
+                .lock()
+                .map_or(StdDuration::ZERO, |mut pending| {
+                    pending
+                        .entry((sandbox.to_owned(), version))
+                        .or_insert_with(Instant::now)
+                        .elapsed()
+                })
+        })
+        .await;
+        if matches!(result, Ok(EgressPolicyLoad::Loaded)) {
+            self.egress_pending_since
+                .lock()
+                .map_err(|_| poisoned())?
+                .retain(|(name, _), _| name != sandbox);
+        }
+        let mut clear = self.egress_clear_sandboxes.lock().map_err(|_| poisoned())?;
+        if hosts.is_empty() && matches!(result, Ok(EgressPolicyLoad::Loaded)) {
+            clear.insert(sandbox.to_owned());
+        } else {
+            clear.remove(sandbox);
+        }
+        result
     }
 
     async fn attached_providers(
@@ -2955,14 +3163,15 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox does not match the persisted execution binding".to_owned(),
             });
         }
-        self.resolve_raw_sandbox_binding(
-            &projection.workspace,
-            &projection.sandbox,
-            &projection.runtime_uid,
-            projection.image.as_deref(),
-            false,
-        )
-        .await?;
+        let raw_sandbox = self
+            .raw_sandbox_binding(
+                &projection.workspace,
+                &projection.sandbox,
+                &projection.runtime_uid,
+                projection.image.as_deref(),
+                false,
+            )
+            .await?;
         let observed = self
             .attached_providers(&projection.workspace, &projection.sandbox)
             .await?;
@@ -2998,7 +3207,12 @@ impl SandboxRuntime for OpenShellRuntime {
         let refs = runtime_refs(&projection);
         match snapshot.phase {
             SandboxPhase::Ready => match self
-                .converge_egress_policy(&projection.workspace, &projection.sandbox, &request.egress)
+                .converge_sandbox_egress(
+                    &projection.workspace,
+                    &projection.sandbox,
+                    &raw_sandbox,
+                    &request.egress,
+                )
                 .await?
             {
                 EgressPolicyLoad::Loaded => Ok(SandboxObservation::Running { refs }),
@@ -7034,7 +7248,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn resource_version_race_replans() {
+    fn resource_version_race_replans() -> Result<(), String> {
         let hosts = [egress_test_host("advisories.example.com")];
         let mut gateway = FakeEgressGateway {
             update_result: Some(Err(tonic::Status::aborted("resource version changed"))),
@@ -7050,7 +7264,7 @@ mod tests {
             Ok(EgressPolicyLoad::Pending)
         ));
         let [update] = gateway.updates.as_slice() else {
-            panic!("exactly one update is sent");
+            return Err("exactly one update is sent".to_owned());
         };
         assert_eq!(update.expected_resource_version, 17);
         assert_eq!(
@@ -7058,6 +7272,7 @@ mod tests {
             Some(&egress_rule_digest(&hosts)),
             "Steward's write is tagged so its revision can be found again"
         );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

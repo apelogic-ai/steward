@@ -79,9 +79,10 @@ A Task's sandbox can reach exactly the hosts its Envelope grants:
 - the sandbox adapter keeps one OpenShell sandbox network rule,
   `steward-egress`, set to exactly those hosts: each host on its port over
   HTTPS, every HTTP method, from any binary in the sandbox;
-- the Task starts only after the sandbox has loaded that rule. If OpenShell
-  can't load it, or the load doesn't finish within 120 seconds, the Task fails
-  and the controller logs the reason;
+- the Task starts only after the sandbox has loaded Steward's write of that
+  rule. If OpenShell can't load it, or the load doesn't finish within 120
+  seconds, the Task fails; other writers' policy revisions never hold up or
+  fail a Task;
 - every other public host is refused by OpenShell's proxy (`CONNECT` returns
   403).
 
@@ -90,11 +91,19 @@ ends. Revoking a host on the Envelope, or removing it from the catalog, applies
 to new Tasks, not to Tasks already running.
 
 The adapter changes only the `steward-egress` rule, repairs drift in it, and
-never touches other rules in the sandbox policy. Per-sandbox rules need OpenShell
+never touches other rules in the sandbox policy. If another rule already covers a
+granted host and port, OpenShell would merge Steward's rule into it, so the Task
+fails instead and the reason names that rule. Per-sandbox rules need OpenShell
 without a global policy: when a global policy is set, OpenShell refuses the
-update, and a Task with an egress grant fails to start with a reason that names
-the global policy instead of running without its hosts. Tasks without an egress
-grant are unaffected.
+update, and a Task with an egress grant fails to start instead of running without
+its hosts. Tasks without an egress grant are unaffected.
+
+When a sandbox can't be given its hosts, the `AgentRuntime` status gets a
+`SandboxEgress` condition whose message carries the category (global policy,
+ambiguous endpoints, unsafe content, merge error, failed or slow load, or a
+covering rule) and OpenShell's own text. The person who started the Task sees
+"This run could not start because its sandbox could not be given the public
+hosts its Envelope grants."
 
 ## Multiple active Envelopes and Task selection
 

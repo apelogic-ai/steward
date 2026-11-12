@@ -19,8 +19,8 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_ports::{
     INFERENCE_REQUEST_REJECTED_FAILURE, REQUIRED_OUTPUT_MISSING_FAILURE,
-    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE,
-    WORKSPACE_PREPARATION_FAILURE,
+    SANDBOX_EGRESS_UNAVAILABLE_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+    TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE, WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
@@ -2926,6 +2926,7 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if matches!(
         reason,
         REQUIRED_OUTPUT_MISSING_FAILURE
+            | SANDBOX_EGRESS_UNAVAILABLE_FAILURE
             | SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
             | TASK_AGENT_START_FAILURE
             | TASK_TOOL_FAILURE

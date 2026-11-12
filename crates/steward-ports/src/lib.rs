@@ -55,6 +55,10 @@ pub const WORKSPACE_PREPARATION_FAILURE: &str = "The workspace could not be prep
 pub const INFERENCE_REQUEST_REJECTED_FAILURE: &str =
     "This run stopped because its model access or spending settings were not accepted.";
 /// Safe failure returned when an accepted runtime cannot start its coding agent.
+/// Every refusal a sandbox adapter returns for a sandbox's egress rule starts with this prefix,
+/// so the controller can record it on the runtime and name it to the Task.
+pub const SANDBOX_EGRESS_REJECTION_PREFIX: &str = "sandbox egress: ";
+pub const SANDBOX_EGRESS_UNAVAILABLE_FAILURE: &str = "This run could not start because its sandbox could not be given the public hosts its Envelope grants. Ask an administrator to check the sandbox network policy.";
 pub const TASK_AGENT_START_FAILURE: &str = "This run could not start its coding agent. Try again or ask an administrator to check the installation.";
 /// Safe failure returned when an approved tool cannot complete an agent request.
 pub const TASK_TOOL_FAILURE: &str =

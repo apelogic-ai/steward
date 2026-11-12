@@ -207,6 +207,23 @@ pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     }
 }
 
+/// The Kubernetes condition type used in `AgentRuntimeStatus.conditions`.
+pub type RuntimeCondition = Condition;
+
+/// Runtime condition recording why a sandbox could not be given its granted egress.
+pub const SANDBOX_EGRESS_CONDITION: &str = "SandboxEgress";
+
+pub fn sandbox_egress_condition(observed_generation: i64, message: &str) -> Condition {
+    Condition {
+        type_: SANDBOX_EGRESS_CONDITION.to_owned(),
+        status: "False".to_owned(),
+        observed_generation: Some(observed_generation),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        reason: "EgressRuleUnavailable".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
 pub const RUNTIME_TERMINATION_STARTED_CONDITION: &str = "TerminationStarted";
 
 pub fn runtime_termination_started_condition(observed_generation: i64) -> Condition {
