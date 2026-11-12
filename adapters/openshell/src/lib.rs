@@ -1105,6 +1105,11 @@ fn egress_update_failure(status: &tonic::Status) -> Result<EgressPolicyLoad, Por
             Err(egress_rejection(format_args!("{category}: {message}")))
         }
         tonic::Code::Aborted => Ok(EgressPolicyLoad::Pending),
+        // OpenShell 0.0.98 reports a stale expected resource version as INTERNAL
+        // ("persist policy revision failed: resource version conflict ...").
+        tonic::Code::Internal if status.message().contains("resource version conflict") => {
+            Ok(EgressPolicyLoad::Pending)
+        }
         _ => Err(raw_port_failure(status)),
     }
 }
@@ -1165,6 +1170,8 @@ fn foreign_egress_rule(policy: Option<&SandboxPolicy>, hosts: &[EgressHost]) -> 
 /// The gateway calls egress convergence needs, for one sandbox.
 #[cfg(feature = "runtime")]
 trait EgressPolicyGateway {
+    /// The raw sandbox, read fresh so its resource version guards the write that follows.
+    async fn sandbox(&mut self) -> Result<RawSandbox, tonic::Status>;
     /// One policy revision with its policy; version 0 is the latest. `None` when the sandbox has
     /// no revision yet.
     async fn policy_revision(
@@ -1188,6 +1195,18 @@ struct GrpcEgressGateway<'a> {
 
 #[cfg(feature = "runtime")]
 impl EgressPolicyGateway for GrpcEgressGateway<'_> {
+    async fn sandbox(&mut self) -> Result<RawSandbox, tonic::Status> {
+        self.client
+            .get_sandbox(GetSandboxRequest {
+                name: self.sandbox.to_owned(),
+                workspace: self.workspace.to_owned(),
+            })
+            .await?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| tonic::Status::internal("OpenShell returned an empty sandbox response"))
+    }
+
     async fn policy_revision(
         &mut self,
         version: u32,
@@ -1249,10 +1268,11 @@ const EGRESS_POLICY_LOAD_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 #[cfg(feature = "runtime")]
 async fn converge_egress_policy<G: EgressPolicyGateway>(
     gateway: &mut G,
-    sandbox: &RawSandbox,
     hosts: &[EgressHost],
     pending_for: impl FnOnce(u32) -> StdDuration,
 ) -> Result<EgressPolicyLoad, PortError> {
+    // Resource version first, then the policy: the write is rejected if the sandbox changed.
+    let sandbox = &gateway.sandbox().await.map_err(raw_port_failure)?;
     let metadata = sandbox.metadata.as_ref().ok_or_else(|| PortError::Failed {
         reason: "OpenShell returned a sandbox without metadata".to_owned(),
     })?;
@@ -2663,32 +2683,6 @@ impl OpenShellRuntime {
         expected_image: Option<&str>,
         require_ready: bool,
     ) -> Result<String, PortError> {
-        self.raw_sandbox_binding(
-            workspace,
-            sandbox,
-            runtime_uid,
-            expected_image,
-            require_ready,
-        )
-        .await?
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.id.clone())
-        .filter(|sandbox_id| !sandbox_id.is_empty())
-        .ok_or_else(|| PortError::Rejected {
-            reason: "OpenShell raw sandbox has no stable ID".to_owned(),
-        })
-    }
-
-    /// The raw sandbox, verified to belong to this runtime.
-    async fn raw_sandbox_binding(
-        &self,
-        workspace: &str,
-        sandbox: &str,
-        runtime_uid: &str,
-        expected_image: Option<&str>,
-        require_ready: bool,
-    ) -> Result<RawSandbox, PortError> {
         let mut client = self
             .authenticated_client()
             .await?
@@ -2708,7 +2702,14 @@ impl OpenShellRuntime {
                 reason: "OpenShell returned an empty sandbox response".to_owned(),
             })?;
         validate_raw_sandbox_binding(&snapshot, runtime_uid, expected_image, require_ready)?;
-        Ok(snapshot)
+        snapshot
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.id.clone())
+            .filter(|sandbox_id| !sandbox_id.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "OpenShell raw sandbox has no stable ID".to_owned(),
+            })
     }
 
     async fn ensure_workspace(&self, name: &str, workspace_key: &str) -> Result<(), PortError> {
@@ -2845,7 +2846,6 @@ impl OpenShellRuntime {
         &self,
         workspace: &str,
         sandbox: &str,
-        raw_sandbox: &RawSandbox,
         hosts: &[EgressHost],
     ) -> Result<EgressPolicyLoad, PortError> {
         let poisoned = || PortError::Failed {
@@ -2866,7 +2866,7 @@ impl OpenShellRuntime {
             sandbox,
         };
         let pending_since = &self.egress_pending_since;
-        let result = converge_egress_policy(&mut gateway, raw_sandbox, hosts, |version| {
+        let result = converge_egress_policy(&mut gateway, hosts, |version| {
             pending_since
                 .lock()
                 .map_or(StdDuration::ZERO, |mut pending| {
@@ -3163,15 +3163,14 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox does not match the persisted execution binding".to_owned(),
             });
         }
-        let raw_sandbox = self
-            .raw_sandbox_binding(
-                &projection.workspace,
-                &projection.sandbox,
-                &projection.runtime_uid,
-                projection.image.as_deref(),
-                false,
-            )
-            .await?;
+        self.resolve_raw_sandbox_binding(
+            &projection.workspace,
+            &projection.sandbox,
+            &projection.runtime_uid,
+            projection.image.as_deref(),
+            false,
+        )
+        .await?;
         let observed = self
             .attached_providers(&projection.workspace, &projection.sandbox)
             .await?;
@@ -3210,7 +3209,6 @@ impl SandboxRuntime for OpenShellRuntime {
                 .converge_sandbox_egress(
                     &projection.workspace,
                     &projection.sandbox,
-                    &raw_sandbox,
                     &request.egress,
                 )
                 .await?
@@ -7004,6 +7002,7 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[derive(Default)]
     struct FakeEgressGateway {
+        sandbox: RawSandbox,
         latest: Option<GetSandboxPolicyStatusResponse>,
         by_version: HashMap<u32, SandboxPolicyRevision>,
         revisions: Vec<SandboxPolicyRevision>,
@@ -7013,6 +7012,10 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     impl EgressPolicyGateway for FakeEgressGateway {
+        async fn sandbox(&mut self) -> Result<RawSandbox, tonic::Status> {
+            Ok(self.sandbox.clone())
+        }
+
         async fn policy_revision(
             &mut self,
             version: u32,
@@ -7117,7 +7120,10 @@ mod tests {
             .map_err(|error| PortError::Failed {
                 reason: error.to_string(),
             })?
-            .block_on(converge_egress_policy(gateway, sandbox, hosts, |_| pending))
+            .block_on(async {
+                gateway.sandbox = sandbox.clone();
+                converge_egress_policy(gateway, hosts, |_| pending).await
+            })
     }
 
     #[cfg(feature = "runtime")]
@@ -7338,6 +7344,15 @@ mod tests {
             egress_update_failure(&tonic::Status::aborted("resource version changed")),
             Ok(EgressPolicyLoad::Pending)
         ));
+        assert!(
+            matches!(
+                egress_update_failure(&tonic::Status::internal(
+                    "persist policy revision failed: resource version conflict: expected version does not match current",
+                )),
+                Ok(EgressPolicyLoad::Pending)
+            ),
+            "OpenShell 0.0.98 reports a stale resource version as INTERNAL; it re-plans"
+        );
         assert!(matches!(
             egress_update_failure(&tonic::Status::unavailable("gateway restarting")),
             Err(PortError::Failed { .. })
