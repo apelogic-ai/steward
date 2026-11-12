@@ -523,6 +523,24 @@ mod tests {
     }
 
     #[test]
+    fn status_provider_catalog_accepts_optional_egress_hosts() -> Result<(), String> {
+        let providers = status_providers_from_catalog_json(
+            r#"{
+              "schemaVersion":"steward.capability-catalog/v2",
+              "models":[],
+              "tools":[],
+              "catalogs":[
+                {"provider":"github","catalogId":"github-tools","version":"1.0.0","available":true}
+              ],
+              "egressHosts":[{"host":"api.example.com"},{"host":"feeds.example.org","port":8443}]
+            }"#,
+        )
+        .map_err(|error| format!("parse catalog with egress hosts: {error}"))?;
+        assert_eq!(providers, BTreeSet::from(["github".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
     fn status_provider_catalog_accepts_optional_display_name() -> Result<(), String> {
         let providers = status_providers_from_catalog_json(
             r#"{

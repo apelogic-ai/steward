@@ -2841,6 +2841,157 @@ mod tests {
         Ok(())
     }
 
+    fn egress_template(hosts: &[&str]) -> AvailableEnvelopeTemplate {
+        let mut template = template();
+        template.ceiling.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+        });
+        template
+    }
+
+    async fn post_egress_request(
+        broker: TestBroker,
+        hosts: &[&str],
+        idempotency_key: &str,
+    ) -> Result<(StatusCode, serde_json::Value), String> {
+        let mut requested = template().ceiling;
+        requested.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+        });
+        let response = inner_router(broker)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": idempotency_key,
+                            "justification": "Needed to read public advisories",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build {idempotency_key} request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit {idempotency_key} request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read {idempotency_key} response: {error}"))?;
+        let value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse {idempotency_key} response: {error}"))?;
+        Ok((status, value))
+    }
+
+    #[tokio::test]
+    async fn egress_request_within_the_template_still_needs_the_catalog_host() -> Result<(), String>
+    {
+        let broker = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            capability_violation_fields: vec![EnvelopeRequestField::EgressHosts],
+            ..TestBroker::default()
+        };
+        let (status, value) =
+            post_egress_request(broker.clone(), &["advisories.example.com"], "within-not-catalog")
+                .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "lock create calls")?
+                .is_empty(),
+            "a host outside the deployment catalog must not be provisioned, even within a template"
+        );
+
+        let stale_model_catalog = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            capability_violation_fields: vec![EnvelopeRequestField::Llms],
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            stale_model_catalog,
+            &["advisories.example.com"],
+            "within-stale-model",
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "within-template requests keep tolerating a stale model catalog: {value}"
+        );
+        assert_eq!(value["request"]["status"], "provisioned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn egress_request_above_the_template_waits_for_review_or_is_refused_outside_the_catalog()
+    -> Result<(), String> {
+        let broker = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            broker,
+            &["advisories.example.com", "feeds.example.org"],
+            "above-template",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert_eq!(value["request"]["status"], "pending");
+        assert_eq!(
+            value["request"]["ceilingExceedances"],
+            serde_json::json!([{
+                "dimension": "egressHosts",
+                "requested": [{"host": "feeds.example.org", "port": 443}],
+                "ceiling": [{"host": "advisories.example.com", "port": 443}],
+            }])
+        );
+
+        let refused = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            capability_violation_fields: vec![EnvelopeRequestField::EgressHosts],
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            refused.clone(),
+            &["advisories.example.com", "other.example.net"],
+            "above-not-catalog",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert!(
+            refused
+                .create_owners
+                .lock()
+                .map_err(|_| "lock create calls")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
     #[test]
     fn egress_hosts_outside_the_capability_catalog_are_unavailable() {
         let requested = template().ceiling;

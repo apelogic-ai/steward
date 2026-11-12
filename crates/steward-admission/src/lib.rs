@@ -1683,6 +1683,41 @@ mod tests {
     }
 
     #[test]
+    fn egress_host_order_and_default_port_do_not_change_the_serialized_envelope()
+    -> Result<(), String> {
+        let mut ordered = envelope_with_budget("100.00").spec;
+        ordered.egress = Some(egress(&[
+            ("advisories.example.com", 443),
+            ("feeds.example.org", 443),
+        ]));
+        let mut reversed = ordered.clone();
+        reversed.egress = Some(egress(&[
+            ("feeds.example.org", 443),
+            ("advisories.example.com", 443),
+        ]));
+        let ordered_bytes = serde_json::to_vec(&ordered).map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_vec(&reversed).map_err(|error| error.to_string())?,
+            ordered_bytes,
+            "the same host set must serialize identically, so it keeps one Envelope digest"
+        );
+
+        let mut wire = serde_json::to_value(&ordered).map_err(|error| error.to_string())?;
+        wire["egress"] = serde_json::json!({"hosts": [
+            {"host": "feeds.example.org"},
+            {"host": "advisories.example.com", "port": 443}
+        ]});
+        let parsed: EnvelopeSpec =
+            serde_json::from_value(wire).map_err(|error| error.to_string())?;
+        assert_eq!(
+            serde_json::to_vec(&parsed).map_err(|error| error.to_string())?,
+            ordered_bytes,
+            "an omitted default port and another order normalize to the same stored form"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn malformed_egress_hosts_are_rejected_before_they_become_authority() {
         let long_label = format!("{}.example.com", "a".repeat(64));
         let refused: Vec<Vec<(&str, u16)>> = vec![

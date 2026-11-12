@@ -965,6 +965,108 @@ mod tests {
         Ok(())
     }
 
+    fn egress_envelope(host: &str) -> serde_json::Value {
+        serde_json::json!({
+            "revision": 1,
+            "spec": {
+                "llms": [{"provider": "provider-a", "model": "model-a"}],
+                "tools": [],
+                "budget": {"monthlyLimit": "50.00", "currency": "USD"},
+                "ttl": "24h",
+                "runner": {},
+                "egress": {"hosts": [{"host": host}]}
+            }
+        })
+    }
+
+    fn ceiling(hosts: &[&str]) -> axum::Extension<crate::user_envelopes::DeploymentEgressCeiling> {
+        axum::Extension(crate::user_envelopes::DeploymentEgressCeiling(
+            hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn operator_template_apply_and_provision_check_egress_against_the_deployment_ceiling()
+    -> Result<(), String> {
+        let apply = |app: Router, host: &str| {
+            let body = serde_json::json!({
+                "displayName": "Default",
+                "memberRoles": ["engineer"],
+                "ceiling": egress_envelope(host),
+            })
+            .to_string();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/admin/operator/v1/templates/default/revisions/1")
+                        .header(header::AUTHORIZATION, "Bearer operator-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .map_err(|error| format!("build egress template apply: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute egress template apply: {error}"))
+            }
+        };
+        let app = || {
+            router(
+                FakeOperatorLedger::default(),
+                FakeAuthenticator { is_admin: true },
+            )
+        };
+        let unlisted = apply(app().layer(ceiling(&["feeds.example.org"])), "advisories.example.com")
+            .await?;
+        assert_eq!(unlisted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let no_ceiling = apply(app(), "advisories.example.com").await?;
+        assert_eq!(
+            no_ceiling.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "without a configured ceiling no egress host is available"
+        );
+        let listed = apply(
+            app().layer(ceiling(&["advisories.example.com"])),
+            "advisories.example.com",
+        )
+        .await?;
+        assert!(
+            listed.status().is_success(),
+            "a listed host may be applied: {}",
+            listed.status()
+        );
+
+        let provision = app()
+            .layer(ceiling(&["feeds.example.org"]))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/operator/v1/envelopes/provision")
+                    .header(header::AUTHORIZATION, "Bearer operator-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+                            "templateId": "default",
+                            "templateRevision": 1,
+                            "requestedEnvelope": egress_envelope("advisories.example.com"),
+                            "idempotencyKey": "egress-provision",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build egress provision: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute egress provision: {error}"))?;
+        assert_eq!(provision.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn template_writes_reject_the_retired_auto_provision_threshold() -> Result<(), String> {
         let envelope = serde_json::json!({

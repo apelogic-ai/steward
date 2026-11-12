@@ -6830,6 +6830,15 @@ mod tests {
             max_history_depth: Some(100),
             max_submodule_depth: Some(1),
         });
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
         let recorded = review_ledger.user_envelopes.clone();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
@@ -6874,11 +6883,11 @@ mod tests {
         assert_eq!(rejection["error"], "capability_not_available");
         assert_eq!(
             rejection["fields"],
-            serde_json::json!(["llms", "tools", "workspace"])
+            serde_json::json!(["llms", "tools", "egressHosts", "workspace"])
         );
         assert_eq!(
             rejection["failureReason"],
-            "This deployment does not provide the requested models, tools, workspace."
+            "This deployment does not provide the requested models, tools, egress hosts, workspace."
         );
         assert!(
             recorded
@@ -7213,6 +7222,76 @@ mod tests {
         assert_eq!(grants.len(), 1, "the grant authority must be append-only");
         assert_eq!(grants[0].1.base_limit, "100.00");
         assert_eq!(grants[0].1.target_limit, "125.00");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_envelope_authoring_checks_egress_against_the_deployment_ceiling()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let ledger = ledger();
+        let mut envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .clone();
+        envelope.revision += 1;
+        envelope.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let body = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+        let author = |app: axum::Router, body: Vec<u8>| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/envelopes/engineer")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .map_err(|error| format!("build legacy envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("legacy envelope request failed: {error}"))
+        };
+
+        let without_ceiling = author(
+            router(
+                runtimes.clone(),
+                ledger.clone(),
+                FakeAuthenticator,
+                FakeDecisionChannel::default(),
+            ),
+            body.clone(),
+        )
+        .await?;
+        assert_eq!(
+            without_ceiling.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a host outside the deployment ceiling cannot be authored"
+        );
+
+        let with_ceiling = author(
+            router(
+                runtimes,
+                ledger,
+                FakeAuthenticator,
+                FakeDecisionChannel::default(),
+            )
+            .layer(axum::Extension(user_envelopes::DeploymentEgressCeiling(vec![
+                steward_types::EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                },
+            ]))),
+            body,
+        )
+        .await?;
+        assert_eq!(with_ceiling.status(), StatusCode::CREATED);
         Ok(())
     }
 

@@ -865,6 +865,33 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("mcpGatewayAuthorityContract is unsupported", result.stderr)
 
+    def test_accepts_capability_catalog_egress_hosts(self) -> None:
+        self.input["capabilityCatalog"]["egressHosts"] = [
+            {"host": "api.example.com"},
+            {"host": "feeds.example.org", "port": 8443},
+        ]
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_malformed_capability_catalog_egress_hosts(self) -> None:
+        for hosts, message in (
+            ([{"host": "*.example.com"}], "egressHosts[0].host"),
+            ([{"host": "203.0.113.7"}], "egressHosts[0].host"),
+            ([{"host": "localhost"}], "egressHosts[0].host"),
+            ([{"host": "api.example.com", "port": 0}], "egressHosts[0].port"),
+            ([{"host": "api.example.com", "path": "/"}], "egressHosts[0] contains unsupported fields"),
+            (
+                [{"host": "api.example.com"}, {"host": "api.example.com", "port": 443}],
+                "egressHosts[1] repeats api.example.com:443",
+            ),
+        ):
+            with self.subTest(hosts=hosts):
+                self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+                self.input["capabilityCatalog"]["egressHosts"] = hosts
+                result = self.run_validate(self.input)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_rejects_empty_capability_catalog(self) -> None:
         self.input["capabilityCatalog"]["models"] = []
         self.input["capabilityCatalog"]["tools"] = []
