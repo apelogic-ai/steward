@@ -4230,6 +4230,12 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
 #[tokio::test]
 async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
 -> Result<(), Box<dyn Error>> {
+    // The scenario's future is several MiB in debug builds; keep it on the heap, not the test
+    // thread's stack.
+    Box::pin(two_reconcilers_scenario()).await
+}
+
+async fn two_reconcilers_scenario() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for orchestration fault injection")
