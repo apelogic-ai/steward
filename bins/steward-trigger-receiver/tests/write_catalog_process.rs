@@ -453,6 +453,7 @@ async fn seed_read_envelope(
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
