@@ -228,7 +228,7 @@ pub struct CapabilityCatalog {
     pub models: Vec<ModelRef>,
     pub tools: Vec<CapabilityTool>,
     pub catalogs: Vec<CapabilityProviderCatalog>,
-    /// Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means
+    /// Public hosts this deployment allows Envelopes to grant for egress. Empty means
     /// no public egress is available; omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_hosts: Vec<steward_types::EgressHost>,

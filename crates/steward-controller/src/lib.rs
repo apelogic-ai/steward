@@ -726,6 +726,12 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         agent_type: runtime.spec.agent_type.clone(),
         models: runtime.spec.llms.clone(),
         tools: runtime.spec.tools.clone(),
+        egress: runtime
+            .spec
+            .egress
+            .as_ref()
+            .map(|egress| egress.hosts.clone())
+            .unwrap_or_default(),
         refs: runtime
             .status
             .as_ref()
@@ -7093,6 +7099,7 @@ mod tests {
     #[tokio::test]
     async fn core_only_runtime_rejects_sandbox_creation_and_deletion() {
         let request = SandboxRequest {
+            egress: Vec::new(),
             runtime: RuntimeId("core-only-test".to_owned()),
             workspace_key: "core-only-test".to_owned(),
             execution_class: SandboxExecutionClass::Agent,

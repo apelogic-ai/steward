@@ -3785,40 +3785,6 @@ mod tests {
         runtime_grant_origin: &str,
         service_cidr: &str,
     ) -> Result<RenderedProviderProfileBundle, String> {
-        render_test_provider_profile_bundle_with_egress(
-            bundle_directory,
-            version,
-            mcp_gateway_origin,
-            inference_gateway_origin,
-            runtime_grant_origin,
-            service_cidr,
-            &serde_json::json!([]),
-        )
-    }
-
-    fn render_test_provider_profile_bundle_1_4_0(
-        egress_hosts: &serde_json::Value,
-    ) -> Result<RenderedProviderProfileBundle, String> {
-        render_test_provider_profile_bundle_with_egress(
-            "v1.4.0",
-            "1.4.0",
-            "https://mcp.gateway.test",
-            "https://inference.gateway.test",
-            "https://mint.gateway.test",
-            "192.0.2.0/24",
-            egress_hosts,
-        )
-    }
-
-    fn render_test_provider_profile_bundle_with_egress(
-        bundle_directory: &str,
-        version: &str,
-        mcp_gateway_origin: &str,
-        inference_gateway_origin: &str,
-        runtime_grant_origin: &str,
-        service_cidr: &str,
-        egress_hosts: &serde_json::Value,
-    ) -> Result<RenderedProviderProfileBundle, String> {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| "xtask manifest directory must have a repository parent".to_owned())?;
@@ -3847,7 +3813,7 @@ mod tests {
                 }
             ]
         });
-        if matches!(version, "1.2.1" | "1.2.2" | "1.3.0" | "1.4.0") {
+        if matches!(version, "1.2.1" | "1.2.2" | "1.3.0") {
             for profile in inputs["profiles"]
                 .as_array_mut()
                 .ok_or_else(|| "test provider profile inputs require profiles".to_owned())?
@@ -3855,15 +3821,6 @@ mod tests {
                 profile["inputs"]["mint-audience"] =
                     serde_json::Value::String("steward-mcp".to_owned());
             }
-        }
-        if version == "1.4.0" {
-            inputs["profiles"]
-                .as_array_mut()
-                .ok_or_else(|| "test provider profile inputs require profiles".to_owned())?
-                .push(serde_json::json!({
-                    "id": "steward-egress",
-                    "inputs": {"egress-hosts": egress_hosts}
-                }));
         }
         render_provider_profile_bundle_directory(
             &repository
@@ -3988,161 +3945,6 @@ mod tests {
             if validate_provider_profile_upgrade_delta(&current, &escaped, "1.2.2", "1.3.0").is_ok()
             {
                 return Err("provider profile upgrade must reject broader command paths".to_owned());
-            }
-            Ok(())
-        })();
-        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
-        result
-    }
-
-    #[test]
-    fn provider_profile_bundle_1_4_0_renders_one_credential_free_profile_per_egress_host()
-    -> Result<(), String> {
-        let rendered = render_test_provider_profile_bundle_1_4_0(&serde_json::json!([
-            {"host": "feeds.example.org", "port": 8443},
-            {"host": "advisories.example.com"}
-        ]))?;
-        assert_eq!(
-            rendered.profiles.keys().map(String::as_str).collect::<Vec<_>>(),
-            [
-                "steward-egress-advisories-example-com-443",
-                "steward-egress-feeds-example-org-8443",
-                "steward-litellm",
-                "steward-mcp-gw",
-            ],
-            "each catalog host gets its own profile; the template itself is never a profile"
-        );
-        let profile = rendered
-            .profiles
-            .get("steward-egress-advisories-example-com-443")
-            .ok_or_else(|| "egress profile is required".to_owned())?;
-        assert_eq!(
-            profile.get("credentials"),
-            Some(&serde_json::json!([])),
-            "an egress profile carries no credential or token grant"
-        );
-        assert_eq!(
-            profile.get("endpoints"),
-            Some(&serde_json::json!([{
-                "host": "advisories.example.com",
-                "port": 443,
-                "protocol": "rest",
-                "tls": "required",
-                "enforcement": "enforce",
-                "access": "full"
-            }])),
-            "one exact public host and port, every method, and no private-address allowance"
-        );
-        assert_eq!(
-            profile.get("binaries"),
-            Some(&serde_json::json!(["/**"])),
-            "any binary in the sandbox may use a granted host"
-        );
-
-        let without_egress = render_test_provider_profile_bundle_1_4_0(&serde_json::json!([]))?;
-        assert_eq!(
-            without_egress
-                .profiles
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["steward-litellm", "steward-mcp-gw"],
-            "no catalog egress hosts render no egress profile"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn provider_profile_bundle_1_4_0_rejects_invalid_or_colliding_egress_hosts() {
-        for hosts in [
-            serde_json::json!([{"host": "Advisories.Example.com"}]),
-            serde_json::json!([{"host": "192.0.2.10"}]),
-            serde_json::json!([{"host": "*.example.com"}]),
-            serde_json::json!([{"host": "localhost"}]),
-            serde_json::json!([{"host": "advisories.example.com", "port": 0}]),
-            serde_json::json!([{"host": "advisories.example.com", "path": "/"}]),
-            serde_json::json!([
-                {"host": "advisories.example.com"},
-                {"host": "advisories.example.com", "port": 443}
-            ]),
-            serde_json::json!([{"host": "a-b.example.com"}, {"host": "a.b-example.com"}]),
-            serde_json::json!({"host": "advisories.example.com"}),
-        ] {
-            assert!(
-                render_test_provider_profile_bundle_1_4_0(&hosts).is_err(),
-                "egress hosts must be exact, unique DNS names with distinct profile ids: {hosts}"
-            );
-        }
-    }
-
-    #[test]
-    fn provider_profile_upgrade_to_1_4_0_keeps_existing_profiles_and_adds_only_egress()
-    -> Result<(), String> {
-        let current = render_test_provider_profile_bundle(
-            "v1.3.0",
-            "1.3.0",
-            "https://mcp.gateway.test",
-            "https://inference.gateway.test",
-            "https://mint.gateway.test",
-            "192.0.2.0/24",
-        )?;
-        let replacement = render_test_provider_profile_bundle_1_4_0(&serde_json::json!([
-            {"host": "advisories.example.com"}
-        ]))?;
-        for (id, profile) in &current.profiles {
-            assert_eq!(
-                replacement.profiles.get(id),
-                Some(profile),
-                "bundle 1.4.0 must keep {id} byte-identical"
-            );
-        }
-        let directory = std::env::temp_dir().join(format!(
-            "steward-provider-profile-upgrade-1-4-0-test-{}-{}",
-            std::process::id(),
-            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
-        let output = directory.join("installed");
-        let result = (|| {
-            install_rendered_provider_profile_bundle(&output, &current)?;
-            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
-            reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
-
-            let mut widened = RenderedProviderProfileBundle {
-                profiles: replacement.profiles.clone(),
-                state: replacement.state.clone(),
-            };
-            *widened
-                .profiles
-                .get_mut("steward-mcp-gw")
-                .and_then(|profile| profile.pointer_mut("/endpoints/0/rules/0/allow/path"))
-                .ok_or_else(|| "widened route fixture is required".to_owned())? =
-                serde_json::json!("/**");
-            widened.state["profiles"] = serde_json::to_value(&widened.profiles)
-                .map_err(|error| format!("render widened state: {error}"))?;
-            if validate_provider_profile_upgrade_delta(&current, &widened, "1.3.0", "1.4.0").is_ok()
-            {
-                return Err("the 1.4.0 upgrade must not change an existing profile".to_owned());
-            }
-
-            let mut foreign = RenderedProviderProfileBundle {
-                profiles: replacement.profiles.clone(),
-                state: replacement.state.clone(),
-            };
-            let mut extra = current
-                .profiles
-                .get("steward-mcp-gw")
-                .cloned()
-                .ok_or_else(|| "MCP profile fixture is required".to_owned())?;
-            extra["id"] = serde_json::json!("example-extra-profile");
-            foreign
-                .profiles
-                .insert("example-extra-profile".to_owned(), extra);
-            foreign.state["profiles"] = serde_json::to_value(&foreign.profiles)
-                .map_err(|error| format!("render foreign state: {error}"))?;
-            if validate_provider_profile_upgrade_delta(&current, &foreign, "1.3.0", "1.4.0").is_ok()
-            {
-                return Err("the 1.4.0 upgrade may add only egress profiles".to_owned());
             }
             Ok(())
         })();

@@ -98,24 +98,9 @@ class PlatformPreflightTests(unittest.TestCase):
             "command = sys.argv[1]\n"
             "inputs_path = sys.argv[sys.argv.index('--inputs') + 1]\n"
             "inputs = json.load(open(inputs_path, encoding='utf-8'))\n"
-            "def egress_profiles():\n"
-            "  rendered = {}\n"
-            "  for profile in inputs['profiles']:\n"
-            "    if profile['id'] != 'steward-egress':\n"
-            "      continue\n"
-            "    for host in profile['inputs']['egress-hosts']:\n"
-            "      port = host.get('port', 443)\n"
-            "      rendered['steward-egress-' + host['host'].replace('.', '-') + '-' + str(port)] = {\n"
-            "        'endpoints': [{'host': host['host'], 'port': port, 'protocol': 'rest', 'tls': 'required', 'enforcement': 'enforce', 'access': 'full'}],\n"
-            "        'credentials': [],\n"
-            "        'binaries': ['/**'],\n"
-            "      }\n"
-            "  return rendered\n"
             "if command == 'render':\n"
-            "  profiles = egress_profiles()\n"
+            "  profiles = {}\n"
             "  for profile in inputs['profiles']:\n"
-            "    if profile['id'] == 'steward-egress':\n"
-            "      continue\n"
             "    origin = urllib.parse.urlsplit(profile['inputs']['gateway-origin'])\n"
             "    binaries = ['/usr/bin/curl']\n"
             f"    if profile['id'] == 'steward-mcp-gw' and {include_bridge_binary!r}:\n"
@@ -158,7 +143,7 @@ class PlatformPreflightTests(unittest.TestCase):
             "    'operation': 'validate',\n"
             "    'status': 'valid',\n"
             f"    'bundle': {{'id': 'steward-runtime-providers', 'version': {bundle_version!r}}},\n"
-            f"    'profiles': {validated_profiles} + [{{'id': profile_id, 'digest': 'sha256:' + '9' * 64}} for profile_id in sorted(egress_profiles())]\n"
+            f"    'profiles': {validated_profiles}\n"
             "  }, separators=(',', ':')))\n",
             encoding="utf-8",
         )
@@ -906,108 +891,6 @@ class PlatformPreflightTests(unittest.TestCase):
                 result = self.run_validate(self.input)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
-
-    def generate_values(self, value: dict) -> tuple[subprocess.CompletedProcess[str], dict | None, dict | None]:
-        with tempfile.TemporaryDirectory() as temporary:
-            base = pathlib.Path(temporary)
-            input_path = base / "input.json"
-            output = base / "rendered"
-            input_path.write_text(json.dumps(value), encoding="utf-8")
-            result = subprocess.run(
-                [
-                    str(TOOL),
-                    "generate",
-                    "--input",
-                    str(input_path),
-                    "--provider-profile-bundle",
-                    str(self.profile_bundle),
-                    "--output",
-                    str(output),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                return result, None, None
-            return (
-                result,
-                json.loads((output / "steward-values.json").read_text(encoding="utf-8")),
-                json.loads((output / "provider-profile-inputs.json").read_text(encoding="utf-8")),
-            )
-
-    def test_selected_1_4_0_bundle_binds_one_egress_profile_per_catalog_host(self) -> None:
-        self.profile_bundle = self.profile_bundle.parent / "v1.4.0"
-        self.write_profile_installer(
-            include_bridge_binary=True,
-            bundle_version="1.4.0",
-            exact_routes=True,
-        )
-        self.input["capabilityCatalog"]["egressHosts"] = [
-            {"host": "feeds.example.org", "port": 8443},
-            {"host": "api.example.com"},
-        ]
-        result, values, profile_inputs = self.generate_values(self.input)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            {
-                "id": "steward-egress",
-                "inputs": {
-                    "egress-hosts": [
-                        {"host": "api.example.com", "port": 443},
-                        {"host": "feeds.example.org", "port": 8443},
-                    ]
-                },
-            },
-            profile_inputs["profiles"],
-        )
-        binding = values["config"]["apiserver"]["executionBindings"]["bindings"][0]
-        self.assertEqual(
-            binding["providerProfiles"]["egress"],
-            [
-                {
-                    "host": "api.example.com",
-                    "port": 443,
-                    "id": "steward-egress-api-example-com-443",
-                    "digest": "sha256:" + "9" * 64,
-                },
-                {
-                    "host": "feeds.example.org",
-                    "port": 8443,
-                    "id": "steward-egress-feeds-example-org-8443",
-                    "digest": "sha256:" + "9" * 64,
-                },
-            ],
-        )
-
-    def test_selected_1_4_0_bundle_without_catalog_egress_binds_no_egress_profile(self) -> None:
-        self.profile_bundle = self.profile_bundle.parent / "v1.4.0"
-        self.write_profile_installer(
-            include_bridge_binary=True,
-            bundle_version="1.4.0",
-            exact_routes=True,
-        )
-        self.input["capabilityCatalog"].pop("egressHosts", None)
-        result, values, profile_inputs = self.generate_values(self.input)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            {"id": "steward-egress", "inputs": {"egress-hosts": []}},
-            profile_inputs["profiles"],
-        )
-        binding = values["config"]["apiserver"]["executionBindings"]["bindings"][0]
-        self.assertNotIn("egress", binding["providerProfiles"])
-
-    def test_rejects_catalog_egress_hosts_with_a_bundle_before_1_4_0(self) -> None:
-        self.profile_bundle = self.profile_bundle.parent / "v1.3.0"
-        self.write_profile_installer(
-            include_bridge_binary=True,
-            bundle_version="1.3.0",
-            exact_routes=True,
-        )
-        self.input["capabilityCatalog"]["egressHosts"] = [{"host": "api.example.com"}]
-        result = self.run_validate(self.input)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("egressHosts requires provider-profile bundle 1.4.0", result.stderr)
 
     def test_rejects_empty_capability_catalog(self) -> None:
         self.input["capabilityCatalog"]["models"] = []

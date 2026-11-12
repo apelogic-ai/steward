@@ -39,8 +39,8 @@ impl GitTreePath {
     }
 }
 use steward_types::{
-    AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
-    ToolGrant,
+    AgentType, Budget, DisposableExecutionBinding, EgressHost, ModelRef, RuntimeId, RuntimeRefs,
+    SpendSummary, ToolGrant,
 };
 
 /// Maximum raw tar body accepted by the Task input endpoint.
@@ -244,6 +244,9 @@ pub struct SandboxRequest {
     pub agent_type: AgentType,
     pub models: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
+    /// Public hosts the runtime's Envelope grants. Only hosts with a profile in the execution
+    /// binding are reachable; empty means no public egress.
+    pub egress: Vec<EgressHost>,
     pub refs: RuntimeRefs,
     /// Immutable deployment binding persisted with a disposable Task.
     ///

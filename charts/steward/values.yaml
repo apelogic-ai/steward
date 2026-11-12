@@ -262,7 +262,7 @@ config:
     jiraAccountEmail: ""
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     # Deployment availability only. This catalog grants no Task or user authority.
-    # Optional egressHosts lists the public hosts Envelopes may grant for read-only egress, as
+    # Optional egressHosts lists the public hosts Envelopes may grant for egress, as
     # exact DNS names with an explicit port, for example:
     #   egressHosts: [{ host: api.example.com, port: 443 }, { host: feeds.example.org, port: 8443 }]
     # Leave it unset for no public egress.

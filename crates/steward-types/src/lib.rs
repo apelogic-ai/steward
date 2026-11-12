@@ -980,11 +980,6 @@ pub struct ExecutionProviderProfiles {
     pub tools: Option<ExecutionProviderProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<ExecutionProviderProfile>,
-    /// One credential-free public egress profile per deployment catalog host. A Task's sandbox
-    /// gets only the profiles whose host its Envelope grants. Omitted when empty, so bindings
-    /// without egress keep their digest.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub egress: Vec<ExecutionEgressProfile>,
 }
 
 impl ExecutionProviderProfiles {
@@ -992,49 +987,7 @@ impl ExecutionProviderProfiles {
         for profile in [&self.tools, &self.inference].into_iter().flatten() {
             profile.validate()?;
         }
-        let mut hosts = std::collections::BTreeSet::new();
-        let mut ids = std::collections::BTreeSet::new();
-        for profile in &self.egress {
-            profile.validate()?;
-            if !hosts.insert((profile.host.as_str(), profile.port))
-                || !ids.insert(profile.id.as_str())
-            {
-                return Err("execution egress profiles repeat a host or profile ID".to_owned());
-            }
-        }
         Ok(())
-    }
-
-    /// The egress profile for one granted host, if the binding has it.
-    pub fn egress_profile_for(&self, host: &EgressHost) -> Option<&ExecutionEgressProfile> {
-        self.egress
-            .iter()
-            .find(|profile| profile.host == host.host && profile.port == host.port)
-    }
-}
-
-/// A deployment-owned OpenShell profile that lets a sandbox reach one public host.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutionEgressProfile {
-    pub host: String,
-    pub port: u16,
-    pub id: String,
-    pub digest: String,
-}
-
-impl ExecutionEgressProfile {
-    pub fn validate(&self) -> Result<(), String> {
-        EgressHost {
-            host: self.host.clone(),
-            port: self.port,
-        }
-        .validate()?;
-        ExecutionProviderProfile {
-            id: self.id.clone(),
-            digest: self.digest.clone(),
-        }
-        .validate()
     }
 }
 
@@ -1317,7 +1270,7 @@ pub struct ToolGrant {
     pub action: String,
 }
 
-/// A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and
+/// A public host a Task sandbox may reach over HTTPS, with any method: an exact DNS name and
 /// port. Hosts are granted only through an Envelope, within the deployment capability catalog.
 #[derive(
     Clone,
@@ -1349,7 +1302,7 @@ const fn default_egress_port() -> u16 {
     443
 }
 
-/// Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,
+/// Public egress an Envelope grants: only the listed hosts. Hosts are stored sorted,
 /// with the port always written, so the same host set always serializes to the same Envelope
 /// digest.
 #[derive(
@@ -1521,8 +1474,9 @@ pub struct AgentRuntimeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Vec<BindingRef>>,
-    /// Public hosts the selected Envelope grants; the sandbox attaches only their egress
-    /// profiles. Omitted when absent so existing runtime-spec digests do not change.
+    /// Public hosts the selected Envelope grants, within the deployment capability catalog; the
+    /// sandbox may reach only these. Omitted when absent so existing runtime-spec digests do not
+    /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressAuthority>,
 }
@@ -1855,68 +1809,6 @@ mod tests {
                 "accepted malformed or unbounded OCI image reference {invalid}"
             );
         }
-    }
-
-    #[test]
-    fn egress_provider_profiles_are_omitted_when_absent_and_validated_when_present()
-    -> Result<(), String> {
-        let empty = super::ExecutionProviderProfiles::default();
-        assert_eq!(
-            serde_json::to_string(&empty).map_err(|error| error.to_string())?,
-            "{}",
-            "bindings without egress keep their canonical content and digest"
-        );
-        let profile = |host: &str, port: u16, id: &str, digest_char: char| {
-            super::ExecutionEgressProfile {
-                host: host.to_owned(),
-                port,
-                id: id.to_owned(),
-                digest: digest(digest_char),
-            }
-        };
-        let valid = super::ExecutionProviderProfiles {
-            egress: vec![profile(
-                "advisories.example.com",
-                443,
-                "steward-egress-advisories-example-com-443",
-                'a',
-            )],
-            ..super::ExecutionProviderProfiles::default()
-        };
-        valid.validate()?;
-        assert_eq!(
-            serde_json::to_value(&valid).map_err(|error| error.to_string())?,
-            serde_json::json!({"egress": [{
-                "host": "advisories.example.com",
-                "port": 443,
-                "id": "steward-egress-advisories-example-com-443",
-                "digest": digest('a'),
-            }]})
-        );
-        for invalid in [
-            vec![profile("*.example.com", 443, "steward-egress-x", 'a')],
-            vec![profile("advisories.example.com", 0, "steward-egress-x", 'a')],
-            vec![profile("advisories.example.com", 443, "has space", 'a')],
-            vec![profile("advisories.example.com", 443, "steward-egress-x", '0')],
-            vec![
-                profile("advisories.example.com", 443, "steward-egress-a", 'a'),
-                profile("advisories.example.com", 443, "steward-egress-b", 'b'),
-            ],
-            vec![
-                profile("advisories.example.com", 443, "steward-egress-a", 'a'),
-                profile("feeds.example.org", 443, "steward-egress-a", 'b'),
-            ],
-        ] {
-            let profiles = super::ExecutionProviderProfiles {
-                egress: invalid.clone(),
-                ..super::ExecutionProviderProfiles::default()
-            };
-            assert!(
-                profiles.validate().is_err(),
-                "egress profiles {invalid:?} must be refused"
-            );
-        }
-        Ok(())
     }
 
     #[test]

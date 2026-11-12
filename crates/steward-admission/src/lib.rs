@@ -270,7 +270,7 @@ pub struct EnvelopeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceAuthority>,
-    /// Public hosts the Envelope grants read-only. Absent means no public egress; it is omitted
+    /// Public hosts the Envelope grants. Absent means no public egress; it is omitted
     /// when absent so existing Envelope digests do not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressAuthority>,
@@ -686,7 +686,7 @@ pub fn evaluate(
     }
     evaluate_envelope_spec(
         &EnvelopeSpec {
-            egress: None,
+            egress: request.egress.clone(),
             llms: request.llms.clone(),
             tools: request.tools.clone(),
             budget: request.budget.clone(),

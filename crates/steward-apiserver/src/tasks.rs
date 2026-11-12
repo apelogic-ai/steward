@@ -59,8 +59,8 @@ use steward_types::task_output_archive::{
 };
 use steward_types::{
     AgentRuntimeSpec, CallerReference, CanonicalAuthorityBinding, CanonicalPrincipal,
-    CanonicalUserId, DisposableExecutionBinding, Email, InferenceMode, ModelRef, Principal,
-    RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
+    CanonicalUserId, DisposableExecutionBinding, EgressAuthority, Email, InferenceMode, ModelRef,
+    Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -846,7 +846,7 @@ fn resolve_versioned_task_plan(
     )
     .map_err(ApiError::Admission)?;
     let spec = AgentRuntimeSpec {
-        egress: None,
+        egress: approved.spec.egress.clone(),
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),
@@ -5023,7 +5023,12 @@ where
             .as_ref()
             .and_then(|requirements| requirements.authority.runtime_minutes_limit.clone()),
     )?;
-    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let spec = direct_runtime_spec(
+        identity,
+        &definition,
+        &effective_requirements,
+        approved.spec.egress.as_ref(),
+    )?;
     let model = ModelRef {
         provider: selected_model.provider.as_str().to_owned(),
         model: selected_model.model.as_str().to_owned(),
@@ -5811,7 +5816,12 @@ where
             .as_ref()
             .and_then(|requirements| requirements.authority.runtime_minutes_limit.clone()),
     )?;
-    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let spec = direct_runtime_spec(
+        identity,
+        &definition,
+        &effective_requirements,
+        approved.spec.egress.as_ref(),
+    )?;
     let model = steward_types::ModelRef {
         provider: selected_model.provider.as_str().to_owned(),
         model: selected_model.model.as_str().to_owned(),
@@ -6882,10 +6892,13 @@ fn direct_effective_requirements(
     Ok(effective)
 }
 
+/// Projects a direct Task's runtime. `egress` is the selected Envelope's grant: a Task receives
+/// every host its Envelope grants.
 fn direct_runtime_spec(
     identity: &TaskIdentity,
     definition: &DirectTaskDefinition,
     requirements: &DirectRequirements,
+    egress: Option<&EgressAuthority>,
 ) -> Result<AgentRuntimeSpec, ApiError> {
     let authority = serde_json::to_value(&requirements.authority).map_err(|error| {
         ApiError::Admission(format!("direct requirements cannot be projected: {error}"))
@@ -6902,7 +6915,7 @@ fn direct_runtime_spec(
     )
     .map_err(ApiError::Admission)?;
     Ok(AgentRuntimeSpec {
-        egress: None,
+        egress: egress.cloned(),
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),
@@ -7397,13 +7410,14 @@ mod workflow_request_tests {
         browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
         browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
-        direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches, format_workspace_bytes,
-        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches,
+        format_workspace_bytes, prepare_task_input_archive, resolve_scratch_workspace_entry,
+        resolve_versioned_task_plan, source_port_error, source_port_error_with_reporter,
+        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
+        versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -9016,7 +9030,10 @@ mod workflow_request_tests {
             &config,
         )
         .map_err(|error| format!("resolve Task plan without egress: {error:?}"))?;
-        assert_eq!(plan.spec.egress, None, "no Envelope egress means no runtime egress");
+        assert_eq!(
+            plan.spec.egress, None,
+            "no Envelope egress means no runtime egress"
+        );
 
         let grant = EgressAuthority {
             hosts: vec![EgressHost {
@@ -9060,7 +9077,16 @@ mod workflow_request_tests {
                 "model": {"provider": "openai", "model": "gpt-5.4"}
             },
             "promptText": "Check egress.",
-            "outputs": []
+            "outputs": [],
+            "requires": {
+                "authority": {
+                    "llms": [{"provider": "openai", "model": "gpt-5.4"}],
+                    "tools": [],
+                    "budget": {"monthlyLimit": "10.00", "singleRunLimit": "1.00", "currency": "USD"},
+                    "ttl": "15m",
+                    "runner": {"platforms": [], "memory": null, "compute": null, "storage": null}
+                }
+            }
         }))
         .map_err(|error| error.to_string())?;
         let requirements = direct_requirements_for_task(&definition, &ceiling.spec)
