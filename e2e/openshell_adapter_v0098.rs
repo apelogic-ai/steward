@@ -825,6 +825,15 @@ const EGRESS_PROBE: &str = r#"probe() {
 probe granted_get "https://example.com/"
 probe granted_post -X POST --data probe=1 "https://example.com/"
 probe ungranted_get "https://example.org/"
+if command -v git >/dev/null 2>&1; then
+  if git ls-remote https://github.com/octocat/Hello-World HEAD >/dev/null 2>&1; then
+    echo image_git=reached
+  else
+    echo image_git=refused
+  fi
+else
+  echo image_git=missing
+fi
 if command -v python3 >/dev/null 2>&1; then
   printf 'python_get=%s\n' "$(python3 -c 'import urllib.request; print(urllib.request.urlopen("https://example.com/", timeout=20).status)' 2>/dev/null || echo error)"
 else
@@ -891,9 +900,10 @@ fn probe_value<'a>(output: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
 }
 
-/// Egress enforcement through the real OpenShell proxy: a granted host answers any method from
-/// any binary as soon as the sandbox runs, an ungranted host is refused at CONNECT, an emptied
-/// egress list removes the rule, and a runtime without a grant gets no egress rule.
+/// Egress enforcement through the real OpenShell proxy. A granted sandbox gets Steward's
+/// create-time policy: the granted host answers any method from any binary, an ungranted host is
+/// refused at CONNECT, and the image's own network rules are gone. A sandbox without a grant keeps
+/// the image's policy untouched.
 async fn verify_egress_enforcement(
     runtime: &OpenShellRuntime,
     caller_archive: &[u8],
@@ -917,9 +927,6 @@ async fn verify_egress_enforcement(
         refs: RuntimeRefs::default(),
         execution_binding: Some(binding.clone()),
     };
-    let refused = |output: &str| {
-        probe_value(output, "granted_get").is_some_and(|value| value.starts_with("403/"))
-    };
 
     let mut sandbox = sandbox_request("runtime-egress-granted", vec![granted_host]);
     let granted = async {
@@ -931,8 +938,6 @@ async fn verify_egress_enforcement(
                 })
             })
         };
-        // One probe, right after Running: the adapter reports Running only once the sandbox
-        // has loaded the rule, so there is nothing to wait for.
         let output = run_egress_probe(
             runtime,
             &sandbox,
@@ -945,7 +950,7 @@ async fn verify_egress_enforcement(
             && probe_value(&output, "python_get") == Some("200"))
         {
             return Err(format!(
-                "a granted host must answer GET and POST from curl and Python as soon as the sandbox runs:\n{output}"
+                "a granted host must answer GET and POST from curl and Python:\n{output}"
             ));
         }
         if probe_value(&output, "ungranted_get")
@@ -957,25 +962,12 @@ async fn verify_egress_enforcement(
                 "an ungranted host must be refused at CONNECT with 403:\n{output}"
             ));
         }
-
-        // The adapter converges the rule to the runtime's egress list: emptying the list removes
-        // the rule. Task runtimes keep their egress for life; this checks the adapter's removal.
-        sandbox.egress = Vec::new();
-        wait_running(runtime, &sandbox).await?;
-        let output = run_egress_probe(
-            runtime,
-            &sandbox,
-            caller_archive,
-            "00000000-0000-4000-8000-000000020000",
-        )
-        .await?;
-        if refused(&output) {
-            Ok(())
-        } else {
-            Err(format!(
-                "an emptied egress list must remove the rule and refuse the host:\n{output}"
-            ))
+        if probe_value(&output, "image_git") != Some("refused") {
+            return Err(format!(
+                "a granted sandbox runs Steward's policy, so the image's own rules must be gone:\n{output}"
+            ));
         }
+        Ok(())
     }
     .await;
     let cleanup = delete_sandbox(runtime, &sandbox).await;
@@ -992,13 +984,17 @@ async fn verify_egress_enforcement(
             "00000000-0000-4000-8000-000000030000",
         )
         .await?;
-        if refused(&output) {
-            Ok(())
-        } else {
-            Err(format!(
-                "a runtime without an egress grant must not reach a public host:\n{output}"
-            ))
+        if !probe_value(&output, "granted_get").is_some_and(|value| value.starts_with("403/")) {
+            return Err(format!(
+                "a runtime without an egress grant must not reach the host:\n{output}"
+            ));
         }
+        if probe_value(&output, "image_git") != Some("reached") {
+            return Err(format!(
+                "a sandbox without a grant keeps the image's own policy untouched:\n{output}"
+            ));
+        }
+        Ok(())
     }
     .await;
     let cleanup = delete_sandbox(runtime, &ungranted).await;

@@ -4241,15 +4241,14 @@ mod tests {
     #[cfg(feature = "runtime")]
     use super::{
         CONNECTIONS_BRIDGE_AGENT_TYPE, EGRESS_POLICY_RULE, EGRESS_PROVENANCE_KEY,
-        EgressPolicyGateway, EgressPolicyLoad, INFERENCE_PROVIDER, OpaqueToken,
-        OpenShellConnectionConfig, OpenShellTaskLogMode, ProviderReconciliation,
-        STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream,
-        TaskProcessLaunchMode, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
-        WorkloadExchangeTokenProvider, WorkloadSourceCredential,
+        INFERENCE_PROVIDER, OpaqueToken, OpenShellConnectionConfig, OpenShellTaskLogMode,
+        ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, TOOL_PROVIDER,
+        TaskProcessEventStream, TaskProcessLaunchMode, TaskProcessLogContext, TaskProcessLogSink,
+        TaskProcessStream, WorkloadExchangeTokenProvider, WorkloadSourceCredential,
         attach_task_agent_failure_category, collect_task_process_stream, converge_egress_policy,
-        delete_owned_sandbox, deletion_names, egress_policy_operations, egress_policy_rule,
-        egress_rule_digest, egress_update_failure, failed_output_archive_command,
-        load_source_credential, output_archive_command, project_request, provider_reconciliation,
+        delete_owned_sandbox, deletion_names, egress_create_failure, egress_policy_rule,
+        egress_sandbox_policy, failed_output_archive_command, load_source_credential,
+        output_archive_command, project_request, provider_reconciliation,
         provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
         request_model_providers, required_output_failure_reason, sandbox_spec,
         sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
@@ -7000,362 +6999,127 @@ mod tests {
     }
 
     #[cfg(feature = "runtime")]
-    #[derive(Default)]
-    struct FakeEgressGateway {
-        sandbox: RawSandbox,
-        latest: Option<GetSandboxPolicyStatusResponse>,
-        by_version: HashMap<u32, SandboxPolicyRevision>,
-        revisions: Vec<SandboxPolicyRevision>,
-        update_result: Option<Result<UpdateConfigResponse, tonic::Status>>,
-        updates: Vec<UpdateConfigRequest>,
-    }
-
-    #[cfg(feature = "runtime")]
-    impl EgressPolicyGateway for FakeEgressGateway {
-        async fn sandbox(&mut self) -> Result<RawSandbox, tonic::Status> {
-            Ok(self.sandbox.clone())
-        }
-
-        async fn policy_revision(
-            &mut self,
-            version: u32,
-        ) -> Result<Option<GetSandboxPolicyStatusResponse>, tonic::Status> {
-            if version == 0 {
-                return Ok(self.latest.clone());
-            }
-            Ok(self.by_version.get(&version).cloned().map(|revision| {
-                GetSandboxPolicyStatusResponse {
-                    revision: Some(revision),
-                    active_version: self
-                        .latest
-                        .as_ref()
-                        .map_or(0, |latest| latest.active_version),
-                }
-            }))
-        }
-
-        async fn recent_revisions(&mut self) -> Result<Vec<SandboxPolicyRevision>, tonic::Status> {
-            Ok(self.revisions.clone())
-        }
-
-        async fn update(
-            &mut self,
-            request: UpdateConfigRequest,
-        ) -> Result<UpdateConfigResponse, tonic::Status> {
-            self.updates.push(request);
-            self.update_result
-                .clone()
-                .unwrap_or_else(|| Ok(UpdateConfigResponse::default()))
-        }
-    }
-
-    #[cfg(feature = "runtime")]
-    fn egress_test_host(name: &str) -> EgressHost {
-        EgressHost {
-            host: name.to_owned(),
-            port: 443,
-        }
-    }
-
-    #[cfg(feature = "runtime")]
-    fn egress_test_policy(rules: Vec<(&str, NetworkPolicyRule)>) -> SandboxPolicy {
-        SandboxPolicy {
-            network_policies: rules
-                .into_iter()
-                .map(|(name, rule)| (name.to_owned(), rule))
-                .collect(),
-            ..SandboxPolicy::default()
-        }
-    }
-
-    #[cfg(feature = "runtime")]
-    fn egress_test_sandbox(policy: Option<SandboxPolicy>) -> RawSandbox {
-        RawSandbox {
-            metadata: Some(ObjectMeta {
-                name: "sandbox-a".to_owned(),
-                workspace: "workspace-a".to_owned(),
-                resource_version: 17,
-                ..ObjectMeta::default()
-            }),
-            spec: Some(RawSandboxSpec {
-                policy,
-                ..RawSandboxSpec::default()
-            }),
-            ..RawSandbox::default()
-        }
-    }
-
-    #[cfg(feature = "runtime")]
-    fn egress_test_revision(
-        version: u32,
-        status: PolicyStatus,
-        policy: Option<SandboxPolicy>,
-        steward_hosts: Option<&[EgressHost]>,
-    ) -> SandboxPolicyRevision {
-        SandboxPolicyRevision {
-            version,
-            status: status as i32,
-            load_error: "endpoint could not be compiled".to_owned(),
-            policy,
-            provenance: steward_hosts
-                .map(|hosts| {
-                    [(EGRESS_PROVENANCE_KEY.to_owned(), egress_rule_digest(hosts))]
-                        .into_iter()
-                        .collect()
-                })
-                .unwrap_or_default(),
-            ..SandboxPolicyRevision::default()
-        }
-    }
-
-    #[cfg(feature = "runtime")]
-    fn converge_for_test(
-        gateway: &mut FakeEgressGateway,
-        sandbox: &RawSandbox,
-        hosts: &[EgressHost],
-        pending: Duration,
-    ) -> Result<EgressPolicyLoad, PortError> {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(|error| PortError::Failed {
-                reason: error.to_string(),
-            })?
-            .block_on(async {
-                gateway.sandbox = sandbox.clone();
-                converge_egress_policy(gateway, hosts, |_| pending).await
-            })
-    }
-
-    #[cfg(feature = "runtime")]
     #[test]
-    fn steward_revision_that_fails_to_load_fails_the_runtime() {
-        let hosts = [egress_test_host("advisories.example.com")];
-        let stored = egress_test_policy(vec![(EGRESS_POLICY_RULE, egress_policy_rule(&hosts))]);
-        let ours = egress_test_revision(1, PolicyStatus::Failed, Some(stored), Some(&hosts));
-        let mut gateway = FakeEgressGateway {
-            latest: Some(GetSandboxPolicyStatusResponse {
-                revision: Some(ours.clone()),
-                active_version: 0,
-            }),
-            revisions: vec![ours],
-            ..FakeEgressGateway::default()
-        };
-        let result = converge_for_test(
-            &mut gateway,
-            &egress_test_sandbox(None),
-            &hosts,
-            Duration::ZERO,
-        );
+    fn egress_grant_gets_a_steward_create_time_policy_and_no_grant_keeps_the_image_policy()
+    -> Result<(), String> {
         assert!(
-            matches!(
-                &result,
-                Err(PortError::Rejected { reason })
-                    if reason.starts_with(SANDBOX_EGRESS_REJECTION_PREFIX)
-                        && reason.contains("endpoint could not be compiled")
-            ),
-            "Steward's own failed load is terminal and carries OpenShell's error: {result:?}"
+            egress_sandbox_policy(&[]).is_none(),
+            "a sandbox without an egress grant keeps the image's own policy"
         );
-        assert!(gateway.updates.is_empty());
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn first_load_still_pending_with_no_active_version_is_not_running() {
-        let hosts = [egress_test_host("advisories.example.com")];
-        let stored = egress_test_policy(vec![(EGRESS_POLICY_RULE, egress_policy_rule(&hosts))]);
-        let ours = egress_test_revision(1, PolicyStatus::Pending, Some(stored), Some(&hosts));
-        let mut gateway = FakeEgressGateway {
-            latest: Some(GetSandboxPolicyStatusResponse {
-                revision: Some(ours.clone()),
-                active_version: 0,
-            }),
-            revisions: vec![ours],
-            ..FakeEgressGateway::default()
-        };
-        let sandbox = egress_test_sandbox(None);
-        assert!(
-            matches!(
-                converge_for_test(&mut gateway, &sandbox, &hosts, Duration::from_secs(5)),
-                Ok(EgressPolicyLoad::Pending)
-            ),
-            "active version 0 is never the stored policy; the rule is not loaded yet"
-        );
-        assert!(
-            matches!(
-                converge_for_test(&mut gateway, &sandbox, &hosts, Duration::from_secs(121)),
-                Err(PortError::Rejected { reason }) if reason.contains("did not load")
-            ),
-            "a rule pending for longer than 120 seconds is terminal"
-        );
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn foreign_pending_revision_never_gates_a_runtime_without_egress() {
-        let foreign_rule = egress_policy_rule(&[egress_test_host("mcp.example.test")]);
-        let active = egress_test_policy(vec![("deployment-rule", foreign_rule.clone())]);
-        let foreign = egress_test_revision(
-            2,
-            PolicyStatus::Pending,
-            Some(egress_test_policy(vec![("deployment-rule", foreign_rule)])),
-            None,
-        );
-        let mut gateway = FakeEgressGateway {
-            latest: Some(GetSandboxPolicyStatusResponse {
-                revision: Some(foreign),
-                active_version: 1,
-            }),
-            by_version: [(
-                1,
-                egress_test_revision(1, PolicyStatus::Loaded, Some(active), None),
-            )]
-            .into_iter()
-            .collect(),
-            ..FakeEgressGateway::default()
-        };
-        assert!(matches!(
-            converge_for_test(
-                &mut gateway,
-                &egress_test_sandbox(None),
-                &[],
-                Duration::ZERO
-            ),
-            Ok(EgressPolicyLoad::Loaded)
-        ));
-        assert!(gateway.updates.is_empty());
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn granted_host_covered_by_a_foreign_rule_is_refused_by_name() {
-        let hosts = [egress_test_host("advisories.example.com")];
-        let mut foreign = egress_policy_rule(&hosts);
-        foreign.name = "deployment-rule".to_owned();
-        foreign.endpoints[0].access = "read-only".to_owned();
-        let mut gateway = FakeEgressGateway::default();
-        let result = converge_for_test(
-            &mut gateway,
-            &egress_test_sandbox(Some(egress_test_policy(vec![("deployment-rule", foreign)]))),
-            &hosts,
-            Duration::ZERO,
-        );
-        assert!(
-            matches!(
-                &result,
-                Err(PortError::Rejected { reason }) if reason.contains("deployment-rule")
-            ),
-            "OpenShell would fold the Steward rule into the other rule, so it is refused: {result:?}"
-        );
-        assert!(
-            gateway.updates.is_empty(),
-            "AddRule is never sent when another rule already covers a granted host"
-        );
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn resource_version_race_replans() -> Result<(), String> {
-        let hosts = [egress_test_host("advisories.example.com")];
-        let mut gateway = FakeEgressGateway {
-            update_result: Some(Err(tonic::Status::aborted("resource version changed"))),
-            ..FakeEgressGateway::default()
-        };
-        assert!(matches!(
-            converge_for_test(
-                &mut gateway,
-                &egress_test_sandbox(None),
-                &hosts,
-                Duration::ZERO
-            ),
-            Ok(EgressPolicyLoad::Pending)
-        ));
-        let [update] = gateway.updates.as_slice() else {
-            return Err("exactly one update is sent".to_owned());
-        };
-        assert_eq!(update.expected_resource_version, 17);
+        let hosts = [
+            EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            },
+            EgressHost {
+                host: "feeds.example.org".to_owned(),
+                port: 8443,
+            },
+        ];
+        let policy = egress_sandbox_policy(&hosts)
+            .ok_or_else(|| "a granted sandbox must get a create-time policy".to_owned())?;
+        let filesystem = policy.filesystem.clone().unwrap_or_default();
+        assert!(filesystem.include_workdir);
         assert_eq!(
-            update.annotations.get(EGRESS_PROVENANCE_KEY),
-            Some(&egress_rule_digest(&hosts)),
-            "Steward's write is tagged so its revision can be found again"
+            filesystem.read_write,
+            ["/sandbox", "/tmp", "/dev/null"],
+            "the baseline keeps OpenShell's restrictive default filesystem"
+        );
+        assert_eq!(
+            policy
+                .landlock
+                .as_ref()
+                .map(|landlock| landlock.compatibility.as_str()),
+            Some("best_effort")
+        );
+        assert_eq!(
+            policy
+                .process
+                .as_ref()
+                .map(|process| (process.run_as_user.as_str(), process.run_as_group.as_str())),
+            Some(("sandbox", "sandbox"))
+        );
+        assert_eq!(
+            policy.network_policies.keys().collect::<Vec<_>>(),
+            [EGRESS_POLICY_RULE],
+            "the only network rule is Steward's; the image's rules are not carried over"
+        );
+        let rule = &policy.network_policies[EGRESS_POLICY_RULE];
+        assert_eq!(
+            rule.endpoints
+                .iter()
+                .map(|endpoint| (
+                    endpoint.host.as_str(),
+                    endpoint.port,
+                    endpoint.protocol.as_str(),
+                    endpoint.access.as_str(),
+                    endpoint.enforcement.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("advisories.example.com", 443, "rest", "full", "enforce"),
+                ("feeds.example.org", 8443, "rest", "full", "enforce"),
+            ]
+        );
+        assert_eq!(
+            rule.binaries
+                .iter()
+                .map(|binary| binary.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/**"]
         );
         Ok(())
     }
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn loaded_steward_rule_runs_without_another_write() {
-        let hosts = [egress_test_host("advisories.example.com")];
-        let policy = egress_test_policy(vec![(EGRESS_POLICY_RULE, egress_policy_rule(&hosts))]);
-        let ours = egress_test_revision(3, PolicyStatus::Loaded, Some(policy), Some(&hosts));
-        let mut gateway = FakeEgressGateway {
-            latest: Some(GetSandboxPolicyStatusResponse {
-                revision: Some(ours),
-                active_version: 3,
-            }),
-            ..FakeEgressGateway::default()
+    fn projection_carries_the_create_time_egress_policy() -> Result<(), String> {
+        let request = |egress: Vec<EgressHost>| SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: AgentType {
+                name: "base".to_owned(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            egress,
+            refs: RuntimeRefs::default(),
+            execution_binding: None,
         };
-        assert!(matches!(
-            converge_for_test(
-                &mut gateway,
-                &egress_test_sandbox(None),
-                &hosts,
-                Duration::ZERO
-            ),
-            Ok(EgressPolicyLoad::Loaded)
-        ));
-        assert!(gateway.updates.is_empty());
+        let without = project_request(&request(Vec::new()), None, None)
+            .map_err(|error| format!("project without egress: {error:?}"))?;
+        assert!(without.create_policy.is_none());
+        let host = EgressHost {
+            host: "advisories.example.com".to_owned(),
+            port: 443,
+        };
+        let with = project_request(&request(vec![host.clone()]), None, None)
+            .map_err(|error| format!("project with egress: {error:?}"))?;
+        assert_eq!(with.create_policy, egress_sandbox_policy(&[host]));
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn egress_policy_update_refusals_are_terminal_and_conflicts_replan() {
-        for (status, category) in [
-            (
-                tonic::Status::failed_precondition(
-                    "policy is managed globally; delete global policy before sandbox policy update",
-                ),
-                "global OpenShell policy",
-            ),
-            (
-                tonic::Status::invalid_argument("policy contains unsafe content: root user"),
-                "unsafe",
-            ),
-            (
-                tonic::Status::invalid_argument("endpoint advisories.example.com:443 is ambiguous"),
-                "ambiguous",
-            ),
-            (
-                tonic::Status::failed_precondition("endpoint has no L7 inspection"),
-                "merge",
-            ),
+    fn refused_egress_sandbox_creation_is_terminal_and_named() {
+        for status in [
+            tonic::Status::invalid_argument("policy contains unsafe content: root user"),
+            tonic::Status::failed_precondition("middleware selector is invalid"),
         ] {
             assert!(
                 matches!(
-                    egress_update_failure(&status),
-                    Err(PortError::Rejected { reason })
+                    egress_create_failure(&status),
+                    PortError::Rejected { reason }
                         if reason.starts_with(SANDBOX_EGRESS_REJECTION_PREFIX)
-                            && reason.contains(category)
                             && reason.contains(status.message())
                 ),
-                "{status:?} must be a terminal refusal naming {category}"
+                "{status:?} must fail the Task with a named reason"
             );
         }
         assert!(matches!(
-            egress_update_failure(&tonic::Status::aborted("resource version changed")),
-            Ok(EgressPolicyLoad::Pending)
-        ));
-        assert!(
-            matches!(
-                egress_update_failure(&tonic::Status::internal(
-                    "persist policy revision failed: resource version conflict: expected version does not match current",
-                )),
-                Ok(EgressPolicyLoad::Pending)
-            ),
-            "OpenShell 0.0.98 reports a stale resource version as INTERNAL; it re-plans"
-        );
-        assert!(matches!(
-            egress_update_failure(&tonic::Status::unavailable("gateway restarting")),
-            Err(PortError::Failed { .. })
+            egress_create_failure(&tonic::Status::unavailable("gateway restarting")),
+            PortError::Failed { .. }
         ));
     }
 
@@ -7407,124 +7171,6 @@ mod tests {
                 "egress hosts {host:?} must be refused before any OpenShell call"
             );
         }
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn egress_policy_plan_converges_only_the_steward_rule() {
-        let host = |name: &str| EgressHost {
-            host: name.to_owned(),
-            port: 443,
-        };
-        let endpoint = |name: &str| NetworkEndpoint {
-            host: name.to_owned(),
-            port: 443,
-            protocol: "rest".to_owned(),
-            enforcement: "enforce".to_owned(),
-            access: "full".to_owned(),
-            ..NetworkEndpoint::default()
-        };
-        let rule = |names: &[&str]| NetworkPolicyRule {
-            name: EGRESS_POLICY_RULE.to_owned(),
-            endpoints: names.iter().map(|name| endpoint(name)).collect(),
-            binaries: vec![NetworkBinary {
-                path: "/**".to_owned(),
-                ..NetworkBinary::default()
-            }],
-        };
-        let policy = |rules: Vec<(&str, NetworkPolicyRule)>| SandboxPolicy {
-            network_policies: rules
-                .into_iter()
-                .map(|(name, rule)| (name.to_owned(), rule))
-                .collect(),
-            ..SandboxPolicy::default()
-        };
-        let add = |names: &[&str]| {
-            policy_merge_operation::Operation::AddRule(openshell_sdk::raw::proto::AddNetworkRule {
-                rule_name: EGRESS_POLICY_RULE.to_owned(),
-                rule: Some(rule(names)),
-            })
-        };
-        let remove = || {
-            policy_merge_operation::Operation::RemoveRule(
-                openshell_sdk::raw::proto::RemoveNetworkRule {
-                    rule_name: EGRESS_POLICY_RULE.to_owned(),
-                },
-            )
-        };
-        let operations = |current: Option<&SandboxPolicy>, hosts: &[EgressHost]| {
-            egress_policy_operations(current, hosts)
-                .into_iter()
-                .map(|operation| operation.operation)
-                .collect::<Vec<_>>()
-        };
-        let advisories = "advisories.example.com";
-        let feeds = "feeds.example.org";
-
-        assert_eq!(
-            operations(None, &[]),
-            [],
-            "no grant and no rule needs nothing"
-        );
-        assert_eq!(
-            operations(None, &[host(advisories)]),
-            [Some(add(&[advisories]))],
-            "a grant adds one rule: every method, any binary, the exact host"
-        );
-        let current = policy(vec![(EGRESS_POLICY_RULE, rule(&[advisories]))]);
-        assert_eq!(
-            operations(Some(&current), &[host(advisories)]),
-            [],
-            "an unchanged grant is a no-op"
-        );
-        assert_eq!(
-            operations(Some(&current), &[host(advisories), host(feeds)]),
-            [Some(remove()), Some(add(&[advisories, feeds]))],
-            "a changed grant replaces the rule"
-        );
-        assert_eq!(
-            operations(Some(&current), &[]),
-            [Some(remove())],
-            "a revoked grant removes the rule"
-        );
-
-        let mut normalized = rule(&[advisories]);
-        normalized.endpoints[0].port = 0;
-        normalized.endpoints[0].ports = vec![443];
-        assert_eq!(
-            operations(
-                Some(&policy(vec![(EGRESS_POLICY_RULE, normalized)])),
-                &[host(advisories)]
-            ),
-            [],
-            "the server's ports form of the same rule is not drift"
-        );
-        for drift in [
-            |endpoint: &mut NetworkEndpoint| endpoint.tls = "skip".to_owned(),
-            |endpoint: &mut NetworkEndpoint| endpoint.path = "/v1/**".to_owned(),
-            |endpoint: &mut NetworkEndpoint| endpoint.allowed_ips = vec!["10.0.0.0/8".to_owned()],
-            |endpoint: &mut NetworkEndpoint| endpoint.request_body_credential_rewrite = true,
-        ] {
-            let mut drifted = rule(&[advisories]);
-            drift(&mut drifted.endpoints[0]);
-            assert_eq!(
-                operations(
-                    Some(&policy(vec![(EGRESS_POLICY_RULE, drifted)])),
-                    &[host(advisories)]
-                ),
-                [Some(remove()), Some(add(&[advisories]))],
-                "drift in Steward's own rule is repaired"
-            );
-        }
-
-        let foreign = rule(&["mcp.example.test"]);
-        let with_foreign = policy(vec![("deployment-rule", foreign)]);
-        assert_eq!(operations(Some(&with_foreign), &[]), []);
-        assert_eq!(
-            operations(Some(&with_foreign), &[host(advisories)]),
-            [Some(add(&[advisories]))],
-            "rules Steward does not own are never touched"
-        );
     }
 
     #[cfg(feature = "runtime")]
