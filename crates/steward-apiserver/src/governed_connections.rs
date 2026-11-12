@@ -2447,6 +2447,7 @@ pub fn plan_connection_operation(
     let (authority, authority_version, authority_digest) =
         connection_authority(&bindings.mcp_gw_version)?;
     let spec = AgentRuntimeSpec {
+        egress: None,
         principal: Principal::Service {
             name: CONNECTIONS_SERVICE.to_owned(),
             acting_user: Some(display_email.clone()),

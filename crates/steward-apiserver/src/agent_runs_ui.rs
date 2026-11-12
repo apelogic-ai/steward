@@ -3713,6 +3713,7 @@ mod tests {
             runtime_ownership: RuntimeOwnership::Provisioned,
             phase: TaskPhase::Succeeded,
             runtime_spec: AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::Service {
                     name: "steward-run".to_owned(),
                     acting_user: Some(Email("alice@example.com".to_owned())),

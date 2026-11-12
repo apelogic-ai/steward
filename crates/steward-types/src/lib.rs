@@ -980,6 +980,11 @@ pub struct ExecutionProviderProfiles {
     pub tools: Option<ExecutionProviderProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<ExecutionProviderProfile>,
+    /// One credential-free public egress profile per deployment catalog host. A Task's sandbox
+    /// gets only the profiles whose host its Envelope grants. Omitted when empty, so bindings
+    /// without egress keep their digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<ExecutionEgressProfile>,
 }
 
 impl ExecutionProviderProfiles {
@@ -987,7 +992,49 @@ impl ExecutionProviderProfiles {
         for profile in [&self.tools, &self.inference].into_iter().flatten() {
             profile.validate()?;
         }
+        let mut hosts = std::collections::BTreeSet::new();
+        let mut ids = std::collections::BTreeSet::new();
+        for profile in &self.egress {
+            profile.validate()?;
+            if !hosts.insert((profile.host.as_str(), profile.port))
+                || !ids.insert(profile.id.as_str())
+            {
+                return Err("execution egress profiles repeat a host or profile ID".to_owned());
+            }
+        }
         Ok(())
+    }
+
+    /// The egress profile for one granted host, if the binding has it.
+    pub fn egress_profile_for(&self, host: &EgressHost) -> Option<&ExecutionEgressProfile> {
+        self.egress
+            .iter()
+            .find(|profile| profile.host == host.host && profile.port == host.port)
+    }
+}
+
+/// A deployment-owned OpenShell profile that lets a sandbox reach one public host.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionEgressProfile {
+    pub host: String,
+    pub port: u16,
+    pub id: String,
+    pub digest: String,
+}
+
+impl ExecutionEgressProfile {
+    pub fn validate(&self) -> Result<(), String> {
+        EgressHost {
+            host: self.host.clone(),
+            port: self.port,
+        }
+        .validate()?;
+        ExecutionProviderProfile {
+            id: self.id.clone(),
+            digest: self.digest.clone(),
+        }
+        .validate()
     }
 }
 
@@ -1474,6 +1521,10 @@ pub struct AgentRuntimeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Vec<BindingRef>>,
+    /// Public hosts the selected Envelope grants; the sandbox attaches only their egress
+    /// profiles. Omitted when absent so existing runtime-spec digests do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressAuthority>,
 }
 
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1632,6 +1683,7 @@ mod tests {
     #[test]
     fn agent_runtime_spec_cannot_carry_remote_shell_targets() -> Result<(), String> {
         let spec = AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email::parse("alice@example.com")?,
             },

@@ -179,6 +179,7 @@ fn codex_task_command(prompt: &str) -> Result<Vec<String>, String> {
         }),
         remote_shell_targets: Default::default(),
         provider_profiles: ExecutionProviderProfiles {
+            egress: Vec::new(),
             tools: None,
             inference: Some(ExecutionProviderProfile {
                 id: "example-inference-profile-v7".to_owned(),

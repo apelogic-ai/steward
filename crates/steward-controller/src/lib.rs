@@ -9761,6 +9761,7 @@ mod tests {
         let mut runtime = AgentRuntime::new(
             "runtime-a",
             AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::User {
                     acting_user: Email("alice@example.com".to_owned()),
                 },

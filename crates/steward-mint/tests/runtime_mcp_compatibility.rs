@@ -87,6 +87,7 @@ fn s5_runtime() -> Result<AgentRuntime, String> {
     let mut runtime = AgentRuntime::new(
         S5_RUNTIME_NAME,
         AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email::parse(EMAIL)?,
             },

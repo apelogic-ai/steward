@@ -273,6 +273,7 @@ mod tests {
             }),
             remote_shell_targets: Default::default(),
             provider_profiles: ExecutionProviderProfiles {
+                egress: Vec::new(),
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
                     digest: format!("sha256:{}", "c".repeat(64)),

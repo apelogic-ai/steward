@@ -846,6 +846,7 @@ fn resolve_versioned_task_plan(
     )
     .map_err(ApiError::Admission)?;
     let spec = AgentRuntimeSpec {
+        egress: None,
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),
@@ -6901,6 +6902,7 @@ fn direct_runtime_spec(
     )
     .map_err(ApiError::Admission)?;
     Ok(AgentRuntimeSpec {
+        egress: None,
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),

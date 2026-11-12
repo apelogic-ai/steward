@@ -2255,6 +2255,7 @@ mod tests {
             runtime_ownership: RuntimeOwnership::Provisioned,
             phase: TaskPhase::Succeeded,
             runtime_spec: AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::Service {
                     name: "browser".to_owned(),
                     acting_user: Some(Email("alice@example.com".to_owned())),

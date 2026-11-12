@@ -3325,6 +3325,7 @@ mod request_projection_tests {
             expires_at: Some(expires_at.to_owned()),
             deltas: Vec::new(),
             proposed_spec: AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::User {
                     acting_user: Email::parse("alice@example.com")?,
                 },

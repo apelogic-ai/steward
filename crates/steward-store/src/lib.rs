@@ -13602,6 +13602,7 @@ mod task_execution_binding_tests {
             freshness_generation: 1,
         });
         let spec = AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },

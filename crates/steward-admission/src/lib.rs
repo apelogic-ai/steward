@@ -1524,6 +1524,7 @@ mod tests {
 
     fn request_with_budget(monthly_limit: &str) -> AgentRuntimeSpec {
         AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },

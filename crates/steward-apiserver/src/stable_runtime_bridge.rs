@@ -463,6 +463,7 @@ mod tests {
         let mut runtime = AgentRuntime::new(
             "runtime-a",
             AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::User {
                     acting_user: Email::parse("alice@example.com")?,
                 },
