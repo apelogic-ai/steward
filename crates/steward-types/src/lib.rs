@@ -1806,6 +1806,101 @@ mod tests {
     }
 
     #[test]
+    fn egress_provider_profiles_are_omitted_when_absent_and_validated_when_present()
+    -> Result<(), String> {
+        let empty = super::ExecutionProviderProfiles::default();
+        assert_eq!(
+            serde_json::to_string(&empty).map_err(|error| error.to_string())?,
+            "{}",
+            "bindings without egress keep their canonical content and digest"
+        );
+        let profile = |host: &str, port: u16, id: &str, digest_char: char| {
+            super::ExecutionEgressProfile {
+                host: host.to_owned(),
+                port,
+                id: id.to_owned(),
+                digest: digest(digest_char),
+            }
+        };
+        let valid = super::ExecutionProviderProfiles {
+            egress: vec![profile(
+                "advisories.example.com",
+                443,
+                "steward-egress-advisories-example-com-443",
+                'a',
+            )],
+            ..super::ExecutionProviderProfiles::default()
+        };
+        valid.validate()?;
+        assert_eq!(
+            serde_json::to_value(&valid).map_err(|error| error.to_string())?,
+            serde_json::json!({"egress": [{
+                "host": "advisories.example.com",
+                "port": 443,
+                "id": "steward-egress-advisories-example-com-443",
+                "digest": digest('a'),
+            }]})
+        );
+        for invalid in [
+            vec![profile("*.example.com", 443, "steward-egress-x", 'a')],
+            vec![profile("advisories.example.com", 0, "steward-egress-x", 'a')],
+            vec![profile("advisories.example.com", 443, "has space", 'a')],
+            vec![profile("advisories.example.com", 443, "steward-egress-x", '0')],
+            vec![
+                profile("advisories.example.com", 443, "steward-egress-a", 'a'),
+                profile("advisories.example.com", 443, "steward-egress-b", 'b'),
+            ],
+            vec![
+                profile("advisories.example.com", 443, "steward-egress-a", 'a'),
+                profile("feeds.example.org", 443, "steward-egress-a", 'b'),
+            ],
+        ] {
+            let profiles = super::ExecutionProviderProfiles {
+                egress: invalid.clone(),
+                ..super::ExecutionProviderProfiles::default()
+            };
+            assert!(
+                profiles.validate().is_err(),
+                "egress profiles {invalid:?} must be refused"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_runtime_spec_omits_absent_egress() -> Result<(), String> {
+        let spec: super::AgentRuntimeSpec = serde_json::from_value(serde_json::json!({
+            "principal": {"kind": "user", "actingUser": "alice@example.com"},
+            "owner": "alice@example.com",
+            "agentType": {"name": "codex@0.140.0"},
+            "llms": [],
+            "tools": [],
+            "budget": {"monthlyLimit": "1.00", "currency": "USD"},
+            "ttl": "1h"
+        }))
+        .map_err(|error| error.to_string())?;
+        assert_eq!(spec.egress, None);
+        let written = serde_json::to_value(&spec).map_err(|error| error.to_string())?;
+        assert!(
+            written.get("egress").is_none(),
+            "a runtime spec without egress keeps its spec digest: {written}"
+        );
+        let mut granted = spec;
+        granted.egress = Some(super::EgressAuthority {
+            hosts: vec![super::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let written = serde_json::to_value(&granted).map_err(|error| error.to_string())?;
+        assert_eq!(
+            written["egress"],
+            serde_json::json!({"hosts": [{"host": "advisories.example.com", "port": 443}]})
+        );
+        Ok(())
+    }
+
+    #[test]
     fn execution_provider_profiles_reject_placeholder_digests() {
         let profile = super::ExecutionProviderProfile {
             id: "example-profile-v1".to_owned(),
