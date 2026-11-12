@@ -7397,7 +7397,7 @@ mod workflow_request_tests {
         browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
         browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
-        direct_requirements_for_task, direct_task_evidence_matches, format_workspace_bytes,
+        direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches, format_workspace_bytes,
         prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
         source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
         task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
@@ -7422,8 +7422,8 @@ mod workflow_request_tests {
         WorkspaceEvidence, WorkspaceGitNamedRef, WorkspacePath,
     };
     use steward_types::{
-        Budget, CallerReference, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements,
-        ToolGrant,
+        Budget, CallerReference, CanonicalUserId, Duration, EgressAuthority, EgressHost, Email,
+        ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
 
@@ -9002,6 +9002,81 @@ mod workflow_request_tests {
                 && reservation.candidate_digest.len() == 71,
             "the persisted candidate digest must use the sha256:<64 lowercase hex> contract"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_task_runtime_snapshots_the_envelope_egress_grant() -> Result<(), String> {
+        let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        let config = task_config(Some("https://mcp-gw.example.test/mcp"))?;
+        let plan = resolve_versioned_task_plan(
+            &identity,
+            workflow(),
+            vec![provisioned_envelope(identity.canonical_user_id.as_str())?],
+            &config,
+        )
+        .map_err(|error| format!("resolve Task plan without egress: {error:?}"))?;
+        assert_eq!(plan.spec.egress, None, "no Envelope egress means no runtime egress");
+
+        let grant = EgressAuthority {
+            hosts: vec![EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        let mut envelope = provisioned_envelope(identity.canonical_user_id.as_str())?;
+        for snapshot in [
+            envelope.template_envelope.as_mut(),
+            Some(&mut envelope.requested_envelope),
+            envelope.approved_envelope.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            snapshot.spec.egress = Some(grant.clone());
+        }
+        let plan = resolve_versioned_task_plan(&identity, workflow(), vec![envelope], &config)
+            .map_err(|error| format!("resolve Task plan with egress: {error:?}"))?;
+        assert_eq!(
+            plan.spec.egress,
+            Some(grant),
+            "the runtime carries the approved Envelope's egress grant"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_task_runtime_snapshots_the_envelope_egress_grant() -> Result<(), String> {
+        let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        let ceiling = provisioned_envelope(identity.canonical_user_id.as_str())?
+            .approved_envelope
+            .ok_or_else(|| "approved Envelope is missing".to_owned())?;
+        let definition: DirectTaskDefinition = serde_json::from_value(serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "egress-check",
+            "version": 1,
+            "runtime": {
+                "agentRef": "example-agent@1.0.0",
+                "model": {"provider": "openai", "model": "gpt-5.4"}
+            },
+            "promptText": "Check egress.",
+            "outputs": []
+        }))
+        .map_err(|error| error.to_string())?;
+        let requirements = direct_requirements_for_task(&definition, &ceiling.spec)
+            .map_err(|error| format!("project requirements: {error:?}"))?;
+        let grant = EgressAuthority {
+            hosts: vec![EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        let spec = direct_runtime_spec(&identity, &definition, &requirements, Some(&grant))
+            .map_err(|error| format!("project runtime with egress: {error:?}"))?;
+        assert_eq!(spec.egress, Some(grant));
+        let spec = direct_runtime_spec(&identity, &definition, &requirements, None)
+            .map_err(|error| format!("project runtime without egress: {error:?}"))?;
+        assert_eq!(spec.egress, None);
         Ok(())
     }
 

@@ -10155,6 +10155,49 @@ mod tests {
         Ok(())
     }
 
+    struct EgressRecordingRuntime(Mutex<Vec<Vec<steward_types::EgressHost>>>);
+
+    impl SandboxRuntime for EgressRecordingRuntime {
+        async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            self.0
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "egress recording lock was poisoned".to_owned(),
+                })?
+                .push(request.egress.clone());
+            Ok(SandboxObservation::Absent)
+        }
+
+        async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Ok(SandboxObservation::Absent)
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_carries_only_the_runtime_egress_grant() -> Result<(), String> {
+        let host = steward_types::EgressHost {
+            host: "advisories.example.com".to_owned(),
+            port: 443,
+        };
+        let mut granted = fixture();
+        granted.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![host.clone()],
+        });
+        let recorder = EgressRecordingRuntime(Mutex::new(Vec::new()));
+        for runtime in [&granted, &fixture()] {
+            reconcile_once(runtime, ReconcileIntent::Ensure, &recorder)
+                .await
+                .map_err(|error| format!("ensure reconcile failed: {error:?}"))?;
+        }
+        let recorded = recorder
+            .0
+            .lock()
+            .map_err(|_| "egress recording lock was poisoned".to_owned())?
+            .clone();
+        assert_eq!(recorded, vec![vec![host], Vec::new()]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reconcile_is_idempotent_across_restart_and_delete() -> Result<(), String> {
         let runtime = fixture();

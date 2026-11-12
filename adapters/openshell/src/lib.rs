@@ -3767,9 +3767,9 @@ mod tests {
     };
     #[cfg(feature = "runtime")]
     use steward_types::{
-        AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
-        ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
-        TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
+        AgentType, DisposableExecutionBinding, EgressHost, ExecutionEgressProfile,
+        ExecutionProviderProfile, ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef,
+        RuntimeId, RuntimeRefs, TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
     };
 
     #[cfg(feature = "runtime")]
@@ -6522,6 +6522,124 @@ mod tests {
                 "the bounded transcript reader must be valid POSIX shell"
             );
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn granted_egress_attaches_only_bound_profiles_and_detaches_the_rest() -> Result<(), String> {
+        let egress_host = |host: &str| EgressHost {
+            host: host.to_owned(),
+            port: 443,
+        };
+        let egress_profile = |host: &str, id: &str, digest: char| ExecutionEgressProfile {
+            host: host.to_owned(),
+            port: 443,
+            id: id.to_owned(),
+            digest: format!("sha256:{}", digest.to_string().repeat(64)),
+        };
+        let mut binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: None,
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            models: None,
+            remote_shell_targets: Default::default(),
+            provider_profiles: ExecutionProviderProfiles {
+                egress: vec![
+                    egress_profile(
+                        "advisories.example.com",
+                        "steward-egress-advisories-example-com-443",
+                        'e',
+                    ),
+                    egress_profile(
+                        "feeds.example.org",
+                        "steward-egress-feeds-example-org-443",
+                        'f',
+                    ),
+                ],
+                tools: None,
+                inference: None,
+            },
+        };
+        seal_binding(&mut binding)?;
+        let request = |egress: Vec<EgressHost>| SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: AgentType {
+                name: binding.agent_ref.clone(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            egress,
+            refs: RuntimeRefs::default(),
+            execution_binding: Some(binding.clone()),
+        };
+
+        let granted = project_request(
+            &request(vec![
+                egress_host("advisories.example.com"),
+                egress_host("unbound.example.net"),
+            ]),
+            None,
+            None,
+        )
+        .map_err(|error| format!("granted egress projection failed: {error:?}"))?;
+        assert_eq!(
+            granted.providers,
+            ["steward-egress-advisories-example-com-443"],
+            "only a granted host with a bound profile is attached; a granted host without one is not"
+        );
+        assert!(
+            granted
+                .managed_providers
+                .iter()
+                .any(|provider| provider == "steward-egress-feeds-example-org-443"),
+            "every bound egress profile is managed, so an ungranted one is detached"
+        );
+
+        let none = project_request(&request(Vec::new()), None, None)
+            .map_err(|error| format!("no egress projection failed: {error:?}"))?;
+        assert!(
+            none.providers.is_empty(),
+            "a runtime without an egress grant attaches no egress profile"
+        );
+
+        let observed = [
+            attached_provider(
+                "steward-egress-advisories-example-com-443",
+                &granted.workspace,
+            ),
+            attached_provider("steward-egress-dropped-example-com-443", &granted.workspace),
+            attached_provider("customer-managed-provider", &granted.workspace),
+        ];
+        assert_eq!(
+            provider_reconciliation_plan(&none, &observed)
+                .map_err(|error| format!("egress provider plan failed: {error:?}"))?,
+            [
+                (
+                    "steward-egress-advisories-example-com-443".to_owned(),
+                    ProviderReconciliation::Detach,
+                ),
+                (
+                    "steward-egress-dropped-example-com-443".to_owned(),
+                    ProviderReconciliation::Detach,
+                ),
+            ],
+            "a revoked grant and a profile no longer in the binding both detach; other attachments stay"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

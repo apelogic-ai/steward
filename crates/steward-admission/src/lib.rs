@@ -1658,6 +1658,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_egress_outside_the_envelope_grant_is_rejected() -> Result<(), String> {
+        let mut envelope = envelope_with_budget("100.00");
+        envelope.spec.egress = Some(egress(&[("advisories.example.com", 443)]));
+        let mut granted = request_with_budget("100.00");
+        granted.egress = Some(egress(&[("advisories.example.com", 443)]));
+        assert_eq!(
+            evaluate(&granted, &envelope)
+                .map_err(|error| format!("evaluate granted runtime egress: {error:?}"))?,
+            AdmissionDecision::Admit
+        );
+        let mut widened = request_with_budget("100.00");
+        widened.egress = Some(egress(&[
+            ("advisories.example.com", 443),
+            ("other.example.net", 443),
+        ]));
+        assert_eq!(
+            evaluate(&widened, &envelope)
+                .map_err(|error| format!("evaluate widened runtime egress: {error:?}"))?,
+            AdmissionDecision::Reject {
+                deltas: vec![AdmissionDelta::EgressHosts {
+                    requested: egress(&[("other.example.net", 443)]).hosts,
+                    ceiling: egress(&[("advisories.example.com", 443)]).hosts,
+                }],
+            },
+            "a runtime must not reach a host its Envelope does not grant"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn absent_egress_is_omitted_so_existing_envelope_digests_do_not_change() -> Result<(), String> {
         let spec = envelope_with_budget("100.00").spec;
         let written = serde_json::to_value(&spec).map_err(|error| error.to_string())?;
