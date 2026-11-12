@@ -10,8 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
-use sqlx::postgres::PgPoolOptions;
+use std::borrow::Cow;
+use std::str::FromStr;
+
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::types::Uuid;
+use steward_admission::AdmissionDelta;
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_apiserver::browser_admin::CapabilityCatalog;
 use steward_apiserver::browser_auth::{
@@ -21,12 +25,14 @@ use steward_apiserver::browser_auth::{
 };
 use steward_apiserver::user_envelopes::{PgEnvelopeRequestBroker, protected_router};
 use steward_apiserver::{StewardRunRelease, StewardRunWorkflowInstallationMode, TaskApiConfig};
-use steward_store::{EnvelopeTemplatePublication, PgStore};
+use steward_store::{EnvelopeRequestReservationRequest, EnvelopeTemplatePublication, PgStore};
+use steward_types::direct_package::{WorkspaceAuthority, WorkspaceEntryType};
 use steward_types::{
     Budget, CanonicalUserId, Duration, EgressAuthority, EgressHost, Email,
     GOOGLE_ORGANIZATION_ISSUER, ModelRef, OrganizationId, OrganizationIdentity,
     OrganizationIdentityPolicy, RunnerRequirements,
 };
+use steward_types::{KubernetesQuantity, RunnerPlatform};
 use tower::ServiceExt;
 
 const ORIGIN: &str = "https://steward.example.test";
@@ -364,4 +370,222 @@ fn cookie(response: &axum::response::Response, name: &str) -> Result<String, io:
                 .map(str::to_owned)
         })
         .ok_or_else(|| io::Error::other(format!("response omitted the {name} cookie")))
+}
+
+/// The eleven dimensions migration 0069 bounded, one delta each.
+fn eleven_historical_deltas() -> Vec<AdmissionDelta> {
+    let quantity = || KubernetesQuantity("1".to_owned());
+    vec![
+        AdmissionDelta::Budget {
+            requested: "30.00".to_owned(),
+            ceiling: "25.00".to_owned(),
+            currency: "USD".to_owned(),
+        },
+        AdmissionDelta::SingleRunBudget {
+            requested: None,
+            ceiling: "5.00".to_owned(),
+            currency: "USD".to_owned(),
+        },
+        AdmissionDelta::RuntimeMinutes {
+            requested: None,
+            ceiling: "60".to_owned(),
+        },
+        AdmissionDelta::Ttl {
+            requested: "2h".to_owned(),
+            ceiling: "1h".to_owned(),
+        },
+        AdmissionDelta::Models {
+            requested: Vec::new(),
+            ceiling: Vec::new(),
+        },
+        AdmissionDelta::Tools {
+            requested: Vec::new(),
+            ceiling: Vec::new(),
+        },
+        AdmissionDelta::RunnerPlatforms {
+            requested: vec![RunnerPlatform::Linux],
+            ceiling: Vec::new(),
+        },
+        AdmissionDelta::RunnerMemory {
+            requested: quantity(),
+            ceiling: None,
+        },
+        AdmissionDelta::RunnerCompute {
+            requested: quantity(),
+            ceiling: None,
+        },
+        AdmissionDelta::RunnerStorage {
+            requested: quantity(),
+            ceiling: None,
+        },
+        AdmissionDelta::Workspace {
+            requested: WorkspaceAuthority {
+                allowed_types: vec![WorkspaceEntryType::Git],
+                max_total_size: None,
+                max_files: None,
+                max_history_depth: None,
+                max_submodule_depth: None,
+            },
+            ceiling: None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn migration_0077_upgrades_historical_envelope_requests_to_twelve_exceedances()
+-> Result<(), Box<dyn Error>> {
+    super::install_rustls_crypto_provider()?;
+    let admin_options = PgConnectOptions::from_str(&env::var("STEWARD_TEST_DATABASE_URL")?)?;
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(admin_options.clone())
+        .await?;
+    let database = format!("steward_upgrade_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(admin_options.database(&database))
+        .await?;
+    let outcome = upgrade_with_historical_rows(pool.clone()).await;
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await?;
+    outcome
+}
+
+async fn upgrade_with_historical_rows(pool: sqlx::PgPool) -> Result<(), Box<dyn Error>> {
+    let mut before = sqlx::migrate!("../migrations");
+    before.migrations = Cow::Owned(
+        before
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < 77)
+            .cloned()
+            .collect(),
+    );
+    before.run(&pool).await?;
+    let store = PgStore::new(pool.clone());
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                GOOGLE_ORGANIZATION_ISSUER,
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                GOOGLE_ORGANIZATION_ISSUER,
+                "upgrade-subject",
+                "example.com",
+                "upgrade@example.com",
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let template = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "25.00".to_owned(),
+                single_run_limit: Some("5.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: None,
+            workspace: None,
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+            egress: None,
+        },
+    };
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: "upgrade",
+            display_name: "Upgrade",
+            member_roles: &["engineer".to_owned()],
+            ceiling: &template,
+            auto_provision_threshold: None,
+            allow_inline_browser_tasks: true,
+            authored_by: "test-bootstrap",
+        })
+        .await?;
+    let historical = eleven_historical_deltas();
+    let reserve = |key: &'static str, deltas: Vec<AdmissionDelta>| {
+        let store = store.clone();
+        let owner = identity.user_id.clone();
+        let template = template.clone();
+        async move {
+            store
+                .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                    owner_user_id: &owner,
+                    template_id: Some("upgrade"),
+                    template_revision: Some(1),
+                    requested_envelope: &template,
+                    idempotency_key: key,
+                    justification: Some("Upgrade rehearsal"),
+                    ceiling_exceedances: &deltas,
+                    actor: "test-bootstrap",
+                })
+                .await
+        }
+    };
+    reserve("historical-none", Vec::new()).await?;
+    reserve("historical-one", historical[3..4].to_vec()).await?;
+    reserve("historical-eleven", historical.clone()).await?;
+    let before_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT idempotency_key, ceiling_exceedances FROM envelope_requests ORDER BY idempotency_key",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(before_rows.len(), 3);
+
+    sqlx::migrate!("../migrations").run(&pool).await?;
+
+    let after_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT idempotency_key, ceiling_exceedances FROM envelope_requests ORDER BY idempotency_key",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        after_rows, before_rows,
+        "historical requests survive the upgrade unchanged"
+    );
+
+    let mut twelve = historical;
+    twelve.push(AdmissionDelta::EgressHosts {
+        requested: hosts(&["feeds.example.org"]).hosts,
+        ceiling: Vec::new(),
+    });
+    reserve("upgraded-twelve", twelve.clone()).await?;
+
+    let mut thirteen = serde_json::to_value(&twelve)?;
+    if let serde_json::Value::Array(deltas) = &mut thirteen {
+        deltas.push(deltas[0].clone());
+    }
+    let over_bound = sqlx::query(
+        "INSERT INTO envelope_requests \
+         SELECT (jsonb_populate_record(NULL::envelope_requests, to_jsonb(existing) \
+           || jsonb_build_object('id', gen_random_uuid(), 'idempotency_key', 'over-bound', \
+                                 'ceiling_exceedances', $1::jsonb))).* \
+         FROM envelope_requests existing WHERE idempotency_key = 'upgraded-twelve'",
+    )
+    .bind(thirteen)
+    .execute(&pool)
+    .await;
+    let message = over_bound
+        .err()
+        .map(|error| error.to_string())
+        .ok_or_else(|| io::Error::other("thirteen exceedances must be refused by the database"))?;
+    assert!(
+        message.contains("envelope_requests_ceiling_exceedances_check"),
+        "the new bound refuses thirteen exceedances: {message}"
+    );
+    Ok(())
 }
