@@ -59,8 +59,8 @@ use steward_types::task_output_archive::{
 };
 use steward_types::{
     AgentRuntimeSpec, CallerReference, CanonicalAuthorityBinding, CanonicalPrincipal,
-    CanonicalUserId, DisposableExecutionBinding, Email, InferenceMode, ModelRef, Principal,
-    RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
+    CanonicalUserId, DisposableExecutionBinding, EgressAuthority, EgressHost, Email, InferenceMode,
+    ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -430,6 +430,9 @@ pub struct TaskApiConfig {
     inference_mode: InferenceMode,
     managed_inference_cipher: Option<ManagedInferenceKeyCipher>,
     workspace_policy: WorkspaceDeploymentPolicy,
+    /// Public hosts the deployment capability catalog lists. A Task's runtime gets only the
+    /// Envelope-granted hosts that are still in this list.
+    egress_ceiling: Vec<EgressHost>,
 }
 
 impl Default for TaskApiConfig {
@@ -446,6 +449,7 @@ impl Default for TaskApiConfig {
             inference_mode: InferenceMode::Stock,
             managed_inference_cipher: None,
             workspace_policy: WorkspaceDeploymentPolicy::default(),
+            egress_ceiling: Vec::new(),
         }
     }
 }
@@ -589,6 +593,12 @@ impl TaskApiConfig {
             }
         }
         Ok(self)
+    }
+
+    /// Sets the capability catalog's egress hosts, the ceiling for every Task runtime's egress.
+    pub fn with_egress_ceiling(mut self, hosts: Vec<EgressHost>) -> Self {
+        self.egress_ceiling = hosts;
+        self
     }
 
     pub fn with_workspace_policy_json(mut self, value: Option<&str>) -> Result<Self, String> {
@@ -846,6 +856,7 @@ fn resolve_versioned_task_plan(
     )
     .map_err(ApiError::Admission)?;
     let spec = AgentRuntimeSpec {
+        egress: runtime_egress(approved.spec.egress.as_ref(), &config.egress_ceiling),
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),
@@ -5022,7 +5033,12 @@ where
             .as_ref()
             .and_then(|requirements| requirements.authority.runtime_minutes_limit.clone()),
     )?;
-    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let spec = direct_runtime_spec(
+        identity,
+        &definition,
+        &effective_requirements,
+        runtime_egress(approved.spec.egress.as_ref(), &config.egress_ceiling).as_ref(),
+    )?;
     let model = ModelRef {
         provider: selected_model.provider.as_str().to_owned(),
         model: selected_model.model.as_str().to_owned(),
@@ -5810,7 +5826,12 @@ where
             .as_ref()
             .and_then(|requirements| requirements.authority.runtime_minutes_limit.clone()),
     )?;
-    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let spec = direct_runtime_spec(
+        identity,
+        &definition,
+        &effective_requirements,
+        runtime_egress(approved.spec.egress.as_ref(), &config.egress_ceiling).as_ref(),
+    )?;
     let model = steward_types::ModelRef {
         provider: selected_model.provider.as_str().to_owned(),
         model: selected_model.model.as_str().to_owned(),
@@ -6881,10 +6902,29 @@ fn direct_effective_requirements(
     Ok(effective)
 }
 
+/// The egress a Task runtime receives: the Envelope's granted hosts that the capability catalog
+/// still lists. A host the catalog has dropped is not given to new Tasks. `None` when nothing
+/// remains, so the runtime spec omits egress.
+fn runtime_egress(
+    grant: Option<&EgressAuthority>,
+    ceiling: &[EgressHost],
+) -> Option<EgressAuthority> {
+    let hosts = grant?
+        .hosts
+        .iter()
+        .filter(|host| ceiling.contains(host))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!hosts.is_empty()).then_some(EgressAuthority { hosts })
+}
+
+/// Projects a direct Task's runtime. `egress` is the Envelope grant within the catalog (see
+/// [`runtime_egress`]).
 fn direct_runtime_spec(
     identity: &TaskIdentity,
     definition: &DirectTaskDefinition,
     requirements: &DirectRequirements,
+    egress: Option<&EgressAuthority>,
 ) -> Result<AgentRuntimeSpec, ApiError> {
     let authority = serde_json::to_value(&requirements.authority).map_err(|error| {
         ApiError::Admission(format!("direct requirements cannot be projected: {error}"))
@@ -6901,6 +6941,7 @@ fn direct_runtime_spec(
     )
     .map_err(ApiError::Admission)?;
     Ok(AgentRuntimeSpec {
+        egress: egress.cloned(),
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),
@@ -7395,13 +7436,14 @@ mod workflow_request_tests {
         browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
         browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
-        direct_requirements_for_task, direct_task_evidence_matches, format_workspace_bytes,
-        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches,
+        format_workspace_bytes, prepare_task_input_archive, resolve_scratch_workspace_entry,
+        resolve_versioned_task_plan, runtime_egress, source_port_error,
+        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -7420,8 +7462,8 @@ mod workflow_request_tests {
         WorkspaceEvidence, WorkspaceGitNamedRef, WorkspacePath,
     };
     use steward_types::{
-        Budget, CallerReference, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements,
-        ToolGrant,
+        Budget, CallerReference, CanonicalUserId, Duration, EgressAuthority, EgressHost, Email,
+        ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
 
@@ -9000,6 +9042,148 @@ mod workflow_request_tests {
                 && reservation.candidate_digest.len() == 71,
             "the persisted candidate digest must use the sha256:<64 lowercase hex> contract"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_task_runtime_snapshots_the_envelope_egress_grant() -> Result<(), String> {
+        let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        let config =
+            task_config(Some("https://mcp-gw.example.test/mcp"))?.with_egress_ceiling(vec![
+                EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                },
+            ]);
+        let plan = resolve_versioned_task_plan(
+            &identity,
+            workflow(),
+            vec![provisioned_envelope(identity.canonical_user_id.as_str())?],
+            &config,
+        )
+        .map_err(|error| format!("resolve Task plan without egress: {error:?}"))?;
+        assert_eq!(
+            plan.spec.egress, None,
+            "no Envelope egress means no runtime egress"
+        );
+
+        let grant = EgressAuthority {
+            hosts: vec![EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        let catalog_dropped = EgressHost {
+            host: "dropped.example.org".to_owned(),
+            port: 443,
+        };
+        let mut envelope = provisioned_envelope(identity.canonical_user_id.as_str())?;
+        for snapshot in [
+            envelope.template_envelope.as_mut(),
+            Some(&mut envelope.requested_envelope),
+            envelope.approved_envelope.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mut hosts = grant.hosts.clone();
+            hosts.push(catalog_dropped.clone());
+            snapshot.spec.egress = Some(EgressAuthority { hosts });
+        }
+        let plan =
+            resolve_versioned_task_plan(&identity, workflow(), vec![envelope.clone()], &config)
+                .map_err(|error| format!("resolve Task plan with egress: {error:?}"))?;
+        assert_eq!(
+            plan.spec.egress,
+            Some(grant),
+            "the runtime carries the Envelope grant, minus hosts the catalog no longer lists"
+        );
+
+        let without_catalog = task_config(Some("https://mcp-gw.example.test/mcp"))?;
+        let plan =
+            resolve_versioned_task_plan(&identity, workflow(), vec![envelope], &without_catalog)
+                .map_err(|error| format!("resolve Task plan without catalog egress: {error:?}"))?;
+        assert_eq!(
+            plan.spec.egress, None,
+            "a deployment whose catalog lists no egress host gives a Task no egress"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_egress_is_the_envelope_grant_within_the_catalog() {
+        let host = |name: &str| EgressHost {
+            host: name.to_owned(),
+            port: 443,
+        };
+        let grant = EgressAuthority {
+            hosts: vec![host("advisories.example.com"), host("dropped.example.org")],
+        };
+        assert_eq!(
+            runtime_egress(Some(&grant), &[host("advisories.example.com")]),
+            Some(EgressAuthority {
+                hosts: vec![host("advisories.example.com")],
+            })
+        );
+        assert_eq!(runtime_egress(Some(&grant), &[]), None);
+        assert_eq!(
+            runtime_egress(None, &[host("advisories.example.com")]),
+            None
+        );
+        assert_eq!(
+            runtime_egress(
+                Some(&grant),
+                &[EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 8443,
+                }],
+            ),
+            None,
+            "a catalog host on another port does not cover the grant"
+        );
+    }
+
+    #[test]
+    fn direct_task_runtime_snapshots_the_envelope_egress_grant() -> Result<(), String> {
+        let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        let ceiling = provisioned_envelope(identity.canonical_user_id.as_str())?
+            .approved_envelope
+            .ok_or_else(|| "approved Envelope is missing".to_owned())?;
+        let definition: DirectTaskDefinition = serde_json::from_value(serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "egress-check",
+            "version": 1,
+            "runtime": {
+                "agentRef": "example-agent@1.0.0",
+                "model": {"provider": "openai", "model": "gpt-5.4"}
+            },
+            "promptText": "Check egress.",
+            "outputs": [],
+            "requires": {
+                "authority": {
+                    "llms": [{"provider": "openai", "model": "gpt-5.4"}],
+                    "tools": [],
+                    "budget": {"monthlyLimit": "10.00", "singleRunLimit": "1.00", "currency": "USD"},
+                    "ttl": "15m",
+                    "runner": {"platforms": [], "memory": null, "compute": null, "storage": null}
+                }
+            }
+        }))
+        .map_err(|error| error.to_string())?;
+        let requirements = direct_requirements_for_task(&definition, &ceiling.spec)
+            .map_err(|error| format!("project requirements: {error:?}"))?;
+        let grant = EgressAuthority {
+            hosts: vec![EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        let spec = direct_runtime_spec(&identity, &definition, &requirements, Some(&grant))
+            .map_err(|error| format!("project runtime with egress: {error:?}"))?;
+        assert_eq!(spec.egress, Some(grant));
+        let spec = direct_runtime_spec(&identity, &definition, &requirements, None)
+            .map_err(|error| format!("project runtime without egress: {error:?}"))?;
+        assert_eq!(spec.egress, None);
         Ok(())
     }
 

@@ -10750,6 +10750,7 @@ mod tests {
 
     fn runtime() -> AgentRuntime {
         let spec = AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },
@@ -18570,6 +18571,7 @@ mod tests {
         let ledger = versioned_task_ledger()?;
         let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
         let spec = AgentRuntimeSpec {
+            egress: None,
             principal: Principal::Service {
                 name: "steward-run".to_owned(),
                 acting_user: Some(Email("alice@example.com".to_owned())),
@@ -19178,6 +19180,7 @@ mod tests {
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
             phase: TaskPhase::Failed,
             runtime_spec: AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::Service {
                     name: "steward-run".to_owned(),
                     acting_user: Some(Email("alice@example.com".to_owned())),

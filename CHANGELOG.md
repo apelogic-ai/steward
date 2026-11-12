@@ -20,7 +20,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   exactly as before. The platform preflight accepts and validates `egressHosts`. In the web app a
   person picks hosts from the template (none by default), and approvers and the template editor
   see them. Migration 0077 lets a request record exceedances in all twelve admission dimensions.
-  Task sandboxes don't use the grant yet.
+- Task sandboxes enforce the Envelope `egress` grant. A Task's runtime records the Envelope's
+  hosts that the capability catalog still lists, and admission refuses a runtime host the Envelope
+  doesn't grant. A sandbox with an egress grant is created with a Steward policy: OpenShell's
+  restrictive default filesystem and landlock settings, the `sandbox` user and group, and one
+  network rule, `steward-egress`, that allows each granted host on its port over HTTPS with every
+  HTTP method, from any binary in the sandbox. Every other public host is refused at the proxy with
+  `CONNECT` 403. The policy is set when the sandbox is created and never changed, so a Task keeps
+  the egress it was admitted with until it ends, like its models and tools; revoking a host or
+  removing it from the catalog applies to new Tasks. **Granting egress replaces the image's own
+  sandbox policy for that sandbox, including its network rules.** The reference images' policy
+  (`/etc/openshell/policy.yaml`) allows Claude Code hosts (api.anthropic.com,
+  statsig.anthropic.com, sentry.io, raw.githubusercontent.com, platform.claude.com), git over
+  HTTPS and the REST API on github.com and api.github.com, NVIDIA inference
+  (integrate.api.nvidia.com), GitHub Copilot, PyPI, VS Code, Cursor, opencode and npm, and OpenAI
+  and ChatGPT (api.openai.com, auth.openai.com, chatgpt.com); a sandbox with an egress grant can
+  reach none of these unless the Envelope grants them. Sandboxes without a grant keep the image's
+  policy exactly as before. The adapter refuses wildcard hosts, port 0 and repeated hosts before
+  calling OpenShell, and the `AgentRuntime` CRD adds the optional `spec.egress` field with the same
+  host and port rules. When OpenShell refuses an egress sandbox's policy, the runtime gets a
+  `SandboxEgress` condition with OpenShell's reason and the Task fails with "This run could not
+  start because its sandbox could not be given the public hosts its Envelope grants." Under a
+  global OpenShell policy, OpenShell runs the global policy instead, so granted hosts are not
+  reachable. Runtimes without egress serialize exactly as before, so their digests don't change.
 
 ### Changed
 

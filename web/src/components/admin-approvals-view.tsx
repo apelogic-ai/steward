@@ -69,7 +69,7 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec, workspaceDeployment?:
     ["Runner compute", runner?.compute ?? "Not set"],
     ["Runner storage", runner?.storage ?? "Not set"],
     ["Workspace", <WorkspaceAuthorityDetails deployment={workspaceDeployment} key="workspace" showDeploymentFallback workspace={spec.workspace} />],
-    ["Public egress (read-only)", spec.egress?.hosts.map((host) => `${host.host}:${host.port}`).join(", ") || "None"],
+    ["Public egress", spec.egress?.hosts.map((host) => `${host.host}:${host.port}`).join(", ") || "None"],
   ];
 }
 

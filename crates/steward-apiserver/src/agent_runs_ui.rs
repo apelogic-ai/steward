@@ -19,8 +19,8 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_ports::{
     INFERENCE_REQUEST_REJECTED_FAILURE, REQUIRED_OUTPUT_MISSING_FAILURE,
-    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE,
-    WORKSPACE_PREPARATION_FAILURE,
+    SANDBOX_EGRESS_UNAVAILABLE_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+    TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE, WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
@@ -2926,6 +2926,7 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if matches!(
         reason,
         REQUIRED_OUTPUT_MISSING_FAILURE
+            | SANDBOX_EGRESS_UNAVAILABLE_FAILURE
             | SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
             | TASK_AGENT_START_FAILURE
             | TASK_TOOL_FAILURE
@@ -3184,6 +3185,11 @@ mod tests {
             Some("agent-start")
         );
 
+        assert_eq!(
+            public_run_failure_reason(Some(steward_ports::SANDBOX_EGRESS_UNAVAILABLE_FAILURE)),
+            Some(steward_ports::SANDBOX_EGRESS_UNAVAILABLE_FAILURE),
+            "a sandbox that could not be given its granted hosts tells the user why the run failed"
+        );
         assert_eq!(
             public_run_failure_reason(Some(steward_ports::TASK_TOOL_FAILURE)),
             Some("This run stopped because an approved tool could not complete the request.")
@@ -3713,6 +3719,7 @@ mod tests {
             runtime_ownership: RuntimeOwnership::Provisioned,
             phase: TaskPhase::Succeeded,
             runtime_spec: AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::Service {
                     name: "steward-run".to_owned(),
                     acting_user: Some(Email("alice@example.com".to_owned())),

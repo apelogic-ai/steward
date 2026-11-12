@@ -70,6 +70,37 @@ spec:
                 x-kubernetes-validations:
                 - message: canonical acting user must equal the accountable owner in v1
                   rule: "!has(self.actingUserId) || self.actingUserId == self.ownerUserId"
+              egress:
+                description: |-
+                  Public hosts the selected Envelope grants, within the deployment capability catalog; the
+                  sandbox may reach only these. Omitted when absent so existing runtime-spec digests do not
+                  change.
+                nullable: true
+                properties:
+                  hosts:
+                    items:
+                      description: |-
+                        A public host a Task sandbox may reach over HTTPS, with any method: an exact DNS name and
+                        port. Hosts are granted only through an Envelope, within the deployment capability catalog.
+                      properties:
+                        host:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$
+                          type: string
+                        port:
+                          default: 443
+                          format: uint16
+                          maximum: 65535.0
+                          minimum: 1.0
+                          type: integer
+                      required:
+                      - host
+                      type: object
+                    type: array
+                required:
+                - hosts
+                type: object
               llms:
                 items:
                   properties:

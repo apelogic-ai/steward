@@ -5,6 +5,6 @@ const source = readFileSync(new URL("./admin-envelope-provision-view.tsx", impor
 
 describe("administrator envelope provisioning", () => {
   test("summarizes the template's public egress hosts before provisioning", () => {
-    expect(source).toContain('["Public egress (read-only)", template.envelope.spec.egress?.hosts');
+    expect(source).toContain('["Public egress", template.envelope.spec.egress?.hosts');
   });
 });

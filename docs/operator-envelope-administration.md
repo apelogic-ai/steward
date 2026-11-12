@@ -43,7 +43,7 @@ but ignored for one release and emits one startup warning when set.
 
 ## Public egress grants
 
-An Envelope may grant read-only access to named public hosts with
+An Envelope may grant HTTPS access to named public hosts with
 `spec.egress.hosts`, a list of `{"host": "<exact DNS name>", "port": <1-65535>}`
 entries (the port defaults to 443). The grant follows the same rules as models
 and tools:
@@ -71,8 +71,45 @@ repeated entries are refused. Hosts are stored sorted with the port written, so
 the same host set always gives the same Envelope digest, and an Envelope without
 `egress` serializes exactly as before.
 
-This release records and admits egress grants. Task sandboxes don't use them yet;
-sandbox enforcement is added separately.
+A Task's sandbox can reach exactly the hosts its Envelope grants:
+
+- when a Task is admitted, its runtime records the Envelope's `egress` hosts
+  that the capability catalog still lists; admission refuses a runtime that
+  names a host its Envelope doesn't grant;
+- a sandbox with an egress grant is created with a Steward policy: OpenShell's
+  restrictive default filesystem and landlock settings, the `sandbox` user and
+  group, and one network rule, `steward-egress`, that allows each granted host
+  on its port over HTTPS, every HTTP method, from any binary in the sandbox;
+- every other public host is refused by OpenShell's proxy (`CONNECT` returns
+  403).
+
+The policy is set when the sandbox is created and never changed. Like its models
+and tools, a Task keeps the egress it was admitted with until it ends. Revoking a
+host on the Envelope, or removing it from the catalog, applies to new Tasks, not
+to Tasks already running.
+
+**Granting egress replaces the image's own sandbox policy for that sandbox,
+including the image's network rules.** Without a grant, OpenShell uses the policy
+the image ships at `/etc/openshell/policy.yaml`. The reference images' policy
+allows, for specific binaries:
+
+- Claude Code: api.anthropic.com, statsig.anthropic.com, sentry.io,
+  raw.githubusercontent.com and platform.claude.com;
+- git over HTTPS to github.com, and the GitHub REST API (api.github.com);
+- NVIDIA inference (integrate.api.nvidia.com);
+- GitHub Copilot, PyPI, VS Code, Cursor, opencode and npm hosts;
+- OpenAI and ChatGPT (api.openai.com, auth.openai.com and chatgpt.com).
+
+A sandbox with an egress grant can reach none of these unless its Envelope grants
+them. Models and tools still work: they reach the gateways through provider
+profiles, which OpenShell adds on top of either policy. Sandboxes without an
+egress grant keep the image's policy exactly as before.
+
+When OpenShell refuses an egress sandbox's policy, the `AgentRuntime` status gets
+a `SandboxEgress` condition with OpenShell's reason, and the person who started
+the Task sees "This run could not start because its sandbox could not be given
+the public hosts its Envelope grants." Under a global OpenShell policy, OpenShell
+runs the global policy instead, so granted hosts are not reachable.
 
 ## Multiple active Envelopes and Task selection
 

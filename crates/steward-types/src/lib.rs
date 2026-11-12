@@ -207,6 +207,23 @@ pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     }
 }
 
+/// The Kubernetes condition type used in `AgentRuntimeStatus.conditions`.
+pub type RuntimeCondition = Condition;
+
+/// Runtime condition recording why a sandbox could not be given its granted egress.
+pub const SANDBOX_EGRESS_CONDITION: &str = "SandboxEgress";
+
+pub fn sandbox_egress_condition(observed_generation: i64, message: &str) -> Condition {
+    Condition {
+        type_: SANDBOX_EGRESS_CONDITION.to_owned(),
+        status: "False".to_owned(),
+        observed_generation: Some(observed_generation),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        reason: "EgressRuleUnavailable".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
 pub const RUNTIME_TERMINATION_STARTED_CONDITION: &str = "TerminationStarted";
 
 pub fn runtime_termination_started_condition(observed_generation: i64) -> Condition {
@@ -1270,7 +1287,7 @@ pub struct ToolGrant {
     pub action: String,
 }
 
-/// A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and
+/// A public host a Task sandbox may reach over HTTPS, with any method: an exact DNS name and
 /// port. Hosts are granted only through an Envelope, within the deployment capability catalog.
 #[derive(
     Clone,
@@ -1292,9 +1309,16 @@ pub struct EgressHost {
         max_length = 253,
         pattern = r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
     )]
+    #[schemars(
+        regex(
+            pattern = r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        ),
+        length(min = 1, max = 253)
+    )]
     pub host: String,
     #[serde(default = "default_egress_port")]
     #[schema(minimum = 1, maximum = 65535, default = 443)]
+    #[schemars(range(min = 1, max = 65535))]
     pub port: u16,
 }
 
@@ -1302,7 +1326,7 @@ const fn default_egress_port() -> u16 {
     443
 }
 
-/// Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,
+/// Public egress an Envelope grants: only the listed hosts. Hosts are stored sorted,
 /// with the port always written, so the same host set always serializes to the same Envelope
 /// digest.
 #[derive(
@@ -1474,6 +1498,11 @@ pub struct AgentRuntimeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Vec<BindingRef>>,
+    /// Public hosts the selected Envelope grants, within the deployment capability catalog; the
+    /// sandbox may reach only these. Omitted when absent so existing runtime-spec digests do not
+    /// change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressAuthority>,
 }
 
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1632,6 +1661,7 @@ mod tests {
     #[test]
     fn agent_runtime_spec_cannot_carry_remote_shell_targets() -> Result<(), String> {
         let spec = AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email::parse("alice@example.com")?,
             },
@@ -1803,6 +1833,60 @@ mod tests {
                 "accepted malformed or unbounded OCI image reference {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn egress_host_schema_refuses_wildcards_and_port_zero() -> Result<(), String> {
+        let schema = serde_json::to_value(schemars::schema_for!(super::EgressHost))
+            .map_err(|error| error.to_string())?;
+        let pattern = schema
+            .pointer("/properties/host/pattern")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("the host schema needs a pattern: {schema}"))?;
+        assert!(pattern.starts_with('^') && pattern.ends_with('$') && !pattern.contains('*'));
+        assert_eq!(
+            schema.pointer("/properties/host/maxLength"),
+            Some(&serde_json::json!(253))
+        );
+        assert_eq!(
+            schema.pointer("/properties/port/minimum"),
+            Some(&serde_json::json!(1)),
+            "port 0 must be refused by the CRD"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_runtime_spec_omits_absent_egress() -> Result<(), String> {
+        let spec: super::AgentRuntimeSpec = serde_json::from_value(serde_json::json!({
+            "principal": {"kind": "user", "actingUser": "alice@example.com"},
+            "owner": "alice@example.com",
+            "agentType": {"name": "example-agent@1.0.0"},
+            "llms": [],
+            "tools": [],
+            "budget": {"monthlyLimit": "1.00", "currency": "USD"},
+            "ttl": "1h"
+        }))
+        .map_err(|error| error.to_string())?;
+        assert_eq!(spec.egress, None);
+        let written = serde_json::to_value(&spec).map_err(|error| error.to_string())?;
+        assert!(
+            written.get("egress").is_none(),
+            "a runtime spec without egress keeps its spec digest: {written}"
+        );
+        let mut granted = spec;
+        granted.egress = Some(super::EgressAuthority {
+            hosts: vec![super::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let written = serde_json::to_value(&granted).map_err(|error| error.to_string())?;
+        assert_eq!(
+            written["egress"],
+            serde_json::json!({"hosts": [{"host": "advisories.example.com", "port": 443}]})
+        );
+        Ok(())
     }
 
     #[test]

@@ -270,7 +270,7 @@ pub struct EnvelopeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceAuthority>,
-    /// Public hosts the Envelope grants read-only. Absent means no public egress; it is omitted
+    /// Public hosts the Envelope grants. Absent means no public egress; it is omitted
     /// when absent so existing Envelope digests do not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressAuthority>,
@@ -686,7 +686,7 @@ pub fn evaluate(
     }
     evaluate_envelope_spec(
         &EnvelopeSpec {
-            egress: None,
+            egress: request.egress.clone(),
             llms: request.llms.clone(),
             tools: request.tools.clone(),
             budget: request.budget.clone(),
@@ -1524,6 +1524,7 @@ mod tests {
 
     fn request_with_budget(monthly_limit: &str) -> AgentRuntimeSpec {
         AgentRuntimeSpec {
+            egress: None,
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },
@@ -1652,6 +1653,36 @@ mod tests {
                 .map_err(|error| format!("evaluate no egress request: {error:?}"))?,
             AdmissionDecision::Admit,
             "requesting no egress is always within the ceiling"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_egress_outside_the_envelope_grant_is_rejected() -> Result<(), String> {
+        let mut envelope = envelope_with_budget("100.00");
+        envelope.spec.egress = Some(egress(&[("advisories.example.com", 443)]));
+        let mut granted = request_with_budget("100.00");
+        granted.egress = Some(egress(&[("advisories.example.com", 443)]));
+        assert_eq!(
+            evaluate(&granted, &envelope)
+                .map_err(|error| format!("evaluate granted runtime egress: {error:?}"))?,
+            AdmissionDecision::Admit
+        );
+        let mut widened = request_with_budget("100.00");
+        widened.egress = Some(egress(&[
+            ("advisories.example.com", 443),
+            ("other.example.net", 443),
+        ]));
+        assert_eq!(
+            evaluate(&widened, &envelope)
+                .map_err(|error| format!("evaluate widened runtime egress: {error:?}"))?,
+            AdmissionDecision::Reject {
+                deltas: vec![AdmissionDelta::EgressHosts {
+                    requested: egress(&[("other.example.net", 443)]).hosts,
+                    ceiling: egress(&[("advisories.example.com", 443)]).hosts,
+                }],
+            },
+            "a runtime must not reach a host its Envelope does not grant"
         );
         Ok(())
     }

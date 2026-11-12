@@ -30,9 +30,10 @@ use steward_admission::{
 use steward_ports::{
     DecisionChannel, DecisionRequest, INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities,
     InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
-    MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
-    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    TASK_AGENT_START_FAILURE, TaskAttemptId,
+    MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SANDBOX_EGRESS_REJECTION_PREFIX,
+    SANDBOX_EGRESS_UNAVAILABLE_FAILURE, SandboxExecutionClass, SandboxTaskObservation,
+    SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime, TASK_AGENT_START_FAILURE,
+    TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -52,8 +53,9 @@ use steward_types::task_output_archive::{
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Budget, DisposableExecutionBinding,
     Duration, PENDING_APPROVAL_ANNOTATION, Phase, RUNTIME_TERMINATION_STARTED_CONDITION, RuntimeId,
-    RuntimeRefs, TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase,
-    runtime_activated_condition, runtime_termination_started_condition,
+    RuntimeRefs, SANDBOX_EGRESS_CONDITION, TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding,
+    TaskPhase, runtime_activated_condition, runtime_termination_started_condition,
+    sandbox_egress_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -726,6 +728,12 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         agent_type: runtime.spec.agent_type.clone(),
         models: runtime.spec.llms.clone(),
         tools: runtime.spec.tools.clone(),
+        egress: runtime
+            .spec
+            .egress
+            .as_ref()
+            .map(|egress| egress.hosts.clone())
+            .unwrap_or_default(),
         refs: runtime
             .status
             .as_ref()
@@ -1716,7 +1724,7 @@ async fn reconcile_shared_runtime_observation(
             .enter_task_cleanup(
                 work.task.task_uid,
                 work.operation.generation,
-                failed_task_runtime_cleanup_cause(&work.task),
+                failed_task_runtime_cleanup_cause(&work.task, &runtime),
                 TASK_ORCHESTRATOR_ACTOR,
             )
             .await
@@ -1807,7 +1815,14 @@ fn task_runtime_observation_is_failed(runtime: &AgentRuntime) -> Result<bool, Ta
     }))
 }
 
-fn failed_task_runtime_cleanup_cause(task: &TaskRecord) -> TaskCleanupCause<'static> {
+fn failed_task_runtime_cleanup_cause(
+    task: &TaskRecord,
+    runtime: &AgentRuntime,
+) -> TaskCleanupCause<'static> {
+    // The sandbox never ran the Task, so there is no spend to settle first.
+    if runtime_failed_on_egress(runtime) {
+        return TaskCleanupCause::Failed(SANDBOX_EGRESS_UNAVAILABLE_FAILURE);
+    }
     if sandbox_execution_class(&task.runtime_spec) == SandboxExecutionClass::Agent
         && task.runtime_spec.budget.single_run_limit.is_some()
     {
@@ -2064,7 +2079,7 @@ async fn reconcile_runtime_activation(
                 .enter_task_cleanup(
                     work.task.task_uid,
                     work.operation.generation,
-                    failed_task_runtime_cleanup_cause(&work.task),
+                    failed_task_runtime_cleanup_cause(&work.task, &observed),
                     TASK_ORCHESTRATOR_ACTOR,
                 )
                 .await
@@ -2188,7 +2203,7 @@ async fn reconcile_runtime_activation(
             .enter_task_cleanup(
                 work.task.task_uid,
                 work.operation.generation,
-                failed_task_runtime_cleanup_cause(&work.task),
+                failed_task_runtime_cleanup_cause(&work.task, &observed),
                 TASK_ORCHESTRATOR_ACTOR,
             )
             .await
@@ -5120,7 +5135,24 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 {
                     Ok(decision) => decision,
                     Err(error) if runtime_start_failed(&error) => {
-                        ReconcileDecision::Status(failed_runtime_status(&runtime)?)
+                        eprintln!(
+                            "runtime start failed: runtime={} reason={error}",
+                            runtime.name_any()
+                        );
+                        let mut status = failed_runtime_status(&runtime)?;
+                        if let Some(condition) =
+                            start_failure_condition(&error, status.observed_generation)
+                            && !status.conditions.iter().any(|existing| {
+                                existing.type_ == condition.type_
+                                    && existing.message == condition.message
+                            })
+                        {
+                            status
+                                .conditions
+                                .retain(|existing| existing.type_ != condition.type_);
+                            status.conditions.push(condition);
+                        }
+                        ReconcileDecision::Status(status)
                     }
                     Err(error) => return Err(ControllerError::Reconcile(error)),
                 };
@@ -5784,6 +5816,30 @@ fn failed_runtime_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, C
     };
     reset_termination_started_condition_for_phase(runtime, &mut status);
     Ok(status)
+}
+
+/// The runtime condition for a start failure the user should be told about: today, a sandbox
+/// that could not be given its granted egress.
+fn start_failure_condition(
+    error: &ReconcileError,
+    observed_generation: i64,
+) -> Option<steward_types::RuntimeCondition> {
+    let ReconcileError::Runtime(PortError::Rejected { reason }) = error else {
+        return None;
+    };
+    reason
+        .starts_with(SANDBOX_EGRESS_REJECTION_PREFIX)
+        .then(|| sandbox_egress_condition(observed_generation, reason))
+}
+
+fn runtime_failed_on_egress(runtime: &AgentRuntime) -> bool {
+    runtime.status.as_ref().is_some_and(|status| {
+        status.phase == Phase::Failed
+            && status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == SANDBOX_EGRESS_CONDITION)
+    })
 }
 
 fn runtime_start_failed(error: &ReconcileError) -> bool {
@@ -7093,6 +7149,7 @@ mod tests {
     #[tokio::test]
     async fn core_only_runtime_rejects_sandbox_creation_and_deletion() {
         let request = SandboxRequest {
+            egress: Vec::new(),
             runtime: RuntimeId("core-only-test".to_owned()),
             workspace_key: "core-only-test".to_owned(),
             execution_class: SandboxExecutionClass::Agent,
@@ -7958,6 +8015,45 @@ mod tests {
             TaskRuntimeAction::CreateRuntime,
             "a server-authored provisioned task with no bound runtime must drive controller creation rather than wait forever"
         );
+    }
+
+    #[test]
+    fn egress_start_failure_is_recorded_on_the_runtime_and_names_the_task_cause()
+    -> Result<(), String> {
+        let egress_refusal = super::ReconcileError::Runtime(PortError::Rejected {
+            reason: format!(
+                "{}OpenShell refused the rule: a global OpenShell policy is set",
+                steward_ports::SANDBOX_EGRESS_REJECTION_PREFIX
+            ),
+        });
+        let condition = super::start_failure_condition(&egress_refusal, 3)
+            .ok_or_else(|| "an egress refusal must be recorded on the runtime".to_owned())?;
+        assert_eq!(condition.type_, steward_types::SANDBOX_EGRESS_CONDITION);
+        assert_eq!(condition.status, "False");
+        assert!(condition.message.contains("global OpenShell policy"));
+        assert!(
+            super::start_failure_condition(
+                &super::ReconcileError::Runtime(PortError::Rejected {
+                    reason: "the image digest does not match".to_owned(),
+                }),
+                3,
+            )
+            .is_none(),
+            "only egress refusals get the egress condition"
+        );
+
+        let mut failed = fixture();
+        failed.status = Some(steward_types::AgentRuntimeStatus {
+            phase: Phase::Failed,
+            observed_generation: 3,
+            spec_digest: String::new(),
+            refs: RuntimeRefs::default(),
+            conditions: vec![condition],
+            spend: None,
+        });
+        assert!(super::runtime_failed_on_egress(&failed));
+        assert!(!super::runtime_failed_on_egress(&fixture()));
+        Ok(())
     }
 
     #[test]
@@ -9761,6 +9857,7 @@ mod tests {
         let mut runtime = AgentRuntime::new(
             "runtime-a",
             AgentRuntimeSpec {
+                egress: None,
                 principal: Principal::User {
                     acting_user: Email("alice@example.com".to_owned()),
                 },
@@ -10151,6 +10248,49 @@ mod tests {
             ),
             "periodic reconciliation must suspend an ordinary runtime after envelope narrowing"
         );
+        Ok(())
+    }
+
+    struct EgressRecordingRuntime(Mutex<Vec<Vec<steward_types::EgressHost>>>);
+
+    impl SandboxRuntime for EgressRecordingRuntime {
+        async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            self.0
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "egress recording lock was poisoned".to_owned(),
+                })?
+                .push(request.egress.clone());
+            Ok(SandboxObservation::Absent)
+        }
+
+        async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Ok(SandboxObservation::Absent)
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_carries_only_the_runtime_egress_grant() -> Result<(), String> {
+        let host = steward_types::EgressHost {
+            host: "advisories.example.com".to_owned(),
+            port: 443,
+        };
+        let mut granted = fixture();
+        granted.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![host.clone()],
+        });
+        let recorder = EgressRecordingRuntime(Mutex::new(Vec::new()));
+        for runtime in [&granted, &fixture()] {
+            reconcile_once(runtime, ReconcileIntent::Ensure, &recorder)
+                .await
+                .map_err(|error| format!("ensure reconcile failed: {error:?}"))?;
+        }
+        let recorded = recorder
+            .0
+            .lock()
+            .map_err(|_| "egress recording lock was poisoned".to_owned())?
+            .clone();
+        assert_eq!(recorded, vec![vec![host], Vec::new()]);
         Ok(())
     }
 

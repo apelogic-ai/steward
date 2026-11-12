@@ -1957,6 +1957,7 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
         })
         .await?;
     let spec = AgentRuntimeSpec {
+        egress: None,
         principal: Principal::User {
             acting_user: identity.display_email.clone(),
         },
@@ -3275,6 +3276,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await?;
     let service = format!("escalation-{suffix}");
     let spec = AgentRuntimeSpec {
+        egress: None,
         principal: Principal::Service {
             name: service.clone(),
             acting_user: Some(email.clone()),
@@ -4228,6 +4230,12 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
 #[tokio::test]
 async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
 -> Result<(), Box<dyn Error>> {
+    // The scenario's future is several MiB in debug builds; keep it on the heap, not the test
+    // thread's stack.
+    Box::pin(two_reconcilers_scenario()).await
+}
+
+async fn two_reconcilers_scenario() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for orchestration fault injection")
@@ -4366,6 +4374,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         )
         .await?;
     let spec = AgentRuntimeSpec {
+        egress: None,
         principal: Principal::Service {
             name: service.clone(),
             acting_user: Some(Email("alice@example.com".to_owned())),
@@ -6951,6 +6960,7 @@ async fn inference_budget_failures_persist_plain_reasons_without_retrying_reject
         })
         .await?;
     let spec = AgentRuntimeSpec {
+        egress: None,
         principal: Principal::Service {
             name: service.clone(),
             acting_user: Some(Email("alice@example.com".to_owned())),

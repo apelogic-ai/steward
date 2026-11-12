@@ -227,7 +227,13 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     };
     let task_api_config = task_api_config
         .with_task_orchestration_mode(task_orchestration_mode)
-        .with_inference_mode(inference_mode);
+        .with_inference_mode(inference_mode)
+        .with_egress_ceiling(
+            capability_catalog
+                .as_ref()
+                .map(|catalog| catalog.egress_hosts.clone())
+                .unwrap_or_default(),
+        );
     let task_api_config = match managed_inference_cipher.clone() {
         Some(cipher) => task_api_config.with_managed_inference_cipher(cipher),
         None => task_api_config,

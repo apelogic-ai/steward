@@ -26,9 +26,10 @@ use steward_types::task_output_archive::{
     TaskOutputArchiveCompatibility, task_output_archive_entries,
 };
 use steward_types::{
-    AgentType, DisposableExecutionBinding, ExecutionModelCompatibility, ExecutionProviderProfile,
-    ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
-    TASK_EXECUTION_BINDING_DIGEST_DOMAIN, TASK_EXECUTION_BINDING_SCHEMA_VERSION,
+    AgentType, DisposableExecutionBinding, EgressHost, ExecutionModelCompatibility,
+    ExecutionProviderProfile, ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef,
+    RuntimeId, RuntimeRefs, TASK_EXECUTION_BINDING_DIGEST_DOMAIN,
+    TASK_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 use tokio::time::sleep;
 
@@ -708,6 +709,7 @@ async fn verify_bound_agent_declared_output_contract(
 ) -> Result<(), String> {
     let binding = bound_agent_execution_binding(image)?;
     let mut sandbox = SandboxRequest {
+        egress: Vec::new(),
         runtime: RuntimeId("runtime-bound-empty-result".to_owned()),
         workspace_key: "team-a".to_owned(),
         execution_class: SandboxExecutionClass::Agent,
@@ -807,6 +809,196 @@ async fn verify_bound_agent_declared_output_contract(
     .await;
     let cleanup = delete_sandbox(runtime, &sandbox).await;
     verification?;
+    cleanup
+}
+
+/// The probe below checks this host as granted and `example.org` as ungranted.
+const EGRESS_GRANTED_HOST: &str = "example.com";
+
+/// The probe reports one `name=value` line per check. `connect` is the proxy's CONNECT status
+/// (403 when the proxy refuses the host) and `code` the upstream HTTP status.
+const EGRESS_PROBE: &str = r#"probe() {
+  name="$1"; shift
+  result="$(curl -sS -o /dev/null --max-time 20 -w '%{http_connect}/%{http_code}' "$@" 2>/dev/null)"
+  printf '%s=%s\n' "$name" "${result:-error}"
+}
+probe granted_get "https://example.com/"
+probe granted_post -X POST --data probe=1 "https://example.com/"
+probe ungranted_get "https://example.org/"
+if command -v git >/dev/null 2>&1; then
+  if git ls-remote https://github.com/octocat/Hello-World HEAD >/dev/null 2>&1; then
+    echo image_git=reached
+  else
+    echo image_git=refused
+  fi
+else
+  echo image_git=missing
+fi
+if command -v python3 >/dev/null 2>&1; then
+  printf 'python_get=%s\n' "$(python3 -c 'import urllib.request; print(urllib.request.urlopen("https://example.com/", timeout=20).status)' 2>/dev/null || echo error)"
+else
+  echo python_get=missing
+fi
+mkdir -p "$STEWARD_OUTPUT_DIR/out"
+printf probed > "$STEWARD_OUTPUT_DIR/out/result.txt"
+"#;
+
+async fn run_egress_probe(
+    runtime: &OpenShellRuntime,
+    sandbox: &SandboxRequest,
+    caller_archive: &[u8],
+    attempt: &str,
+) -> Result<String, String> {
+    let task = SandboxTaskRequest {
+        runtime: sandbox.runtime.clone(),
+        refs: sandbox.refs.clone(),
+        execution_class: SandboxExecutionClass::Agent,
+        agent_type: sandbox.agent_type.clone(),
+        models: Vec::new(),
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            EGRESS_PROBE.to_owned(),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Full,
+        },
+        workspace: None,
+        execution_binding: sandbox.execution_binding.clone(),
+    };
+    let attempt = TaskAttemptId(attempt.to_owned());
+    let mut observation = runtime
+        .start_task(&attempt, &task, caller_archive)
+        .await
+        .map_err(|error| format!("egress probe could not start: {error:?}"))?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        match observation {
+            SandboxTaskObservation::SucceededWithTranscript { transcript, .. } => {
+                return String::from_utf8(transcript.stdout)
+                    .map_err(|_| "egress probe output was not UTF-8".to_owned());
+            }
+            SandboxTaskObservation::Accepted { .. }
+            | SandboxTaskObservation::Running { .. }
+            | SandboxTaskObservation::RunningWithTranscript { .. } => {}
+            other => return Err(format!("egress probe did not succeed: {other:?}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("egress probe did not finish within 180 seconds".to_owned());
+        }
+        sleep(Duration::from_secs(1)).await;
+        observation = runtime
+            .observe_task(&attempt, &task)
+            .await
+            .map_err(|error| format!("egress probe observation failed: {error:?}"))?;
+    }
+}
+
+fn probe_value<'a>(output: &'a str, name: &str) -> Option<&'a str> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// Egress enforcement through the real OpenShell proxy. A granted sandbox gets Steward's
+/// create-time policy: the granted host answers any method from any binary, an ungranted host is
+/// refused at CONNECT, and the image's own network rules are gone. A sandbox without a grant keeps
+/// the image's policy untouched.
+async fn verify_egress_enforcement(
+    runtime: &OpenShellRuntime,
+    caller_archive: &[u8],
+    image: String,
+) -> Result<(), String> {
+    let granted_host = EgressHost {
+        host: EGRESS_GRANTED_HOST.to_owned(),
+        port: 443,
+    };
+    let binding = bound_agent_execution_binding(image)?;
+    let sandbox_request = |runtime_id: &str, egress: Vec<EgressHost>| SandboxRequest {
+        runtime: RuntimeId(runtime_id.to_owned()),
+        workspace_key: "team-egress".to_owned(),
+        execution_class: SandboxExecutionClass::Agent,
+        agent_type: AgentType {
+            name: binding.agent_ref.clone(),
+        },
+        models: Vec::new(),
+        tools: Vec::new(),
+        egress,
+        refs: RuntimeRefs::default(),
+        execution_binding: Some(binding.clone()),
+    };
+
+    let mut sandbox = sandbox_request("runtime-egress-granted", vec![granted_host]);
+    let granted = async {
+        sandbox.refs = wait_running(runtime, &sandbox).await?;
+        let reached = |output: &str, name: &str| {
+            probe_value(output, name).is_some_and(|value| {
+                value.split_once('/').is_some_and(|(connect, code)| {
+                    connect != "403" && code != "000" && code != "403"
+                })
+            })
+        };
+        let output = run_egress_probe(
+            runtime,
+            &sandbox,
+            caller_archive,
+            "00000000-0000-4000-8000-000000010000",
+        )
+        .await?;
+        if !(reached(&output, "granted_get")
+            && reached(&output, "granted_post")
+            && probe_value(&output, "python_get") == Some("200"))
+        {
+            return Err(format!(
+                "a granted host must answer GET and POST from curl and Python:\n{output}"
+            ));
+        }
+        if probe_value(&output, "ungranted_get")
+            .and_then(|value| value.split_once('/'))
+            .map(|(connect, _)| connect)
+            != Some("403")
+        {
+            return Err(format!(
+                "an ungranted host must be refused at CONNECT with 403:\n{output}"
+            ));
+        }
+        if probe_value(&output, "image_git") != Some("refused") {
+            return Err(format!(
+                "a granted sandbox runs Steward's policy, so the image's own rules must be gone:\n{output}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup = delete_sandbox(runtime, &sandbox).await;
+    granted?;
+    cleanup?;
+
+    let mut ungranted = sandbox_request("runtime-egress-none", Vec::new());
+    let ungranted_result = async {
+        ungranted.refs = wait_running(runtime, &ungranted).await?;
+        let output = run_egress_probe(
+            runtime,
+            &ungranted,
+            caller_archive,
+            "00000000-0000-4000-8000-000000030000",
+        )
+        .await?;
+        if !probe_value(&output, "granted_get").is_some_and(|value| value.starts_with("403/")) {
+            return Err(format!(
+                "a runtime without an egress grant must not reach the host:\n{output}"
+            ));
+        }
+        if probe_value(&output, "image_git") != Some("reached") {
+            return Err(format!(
+                "a sandbox without a grant keeps the image's own policy untouched:\n{output}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup = delete_sandbox(runtime, &ungranted).await;
+    ungranted_result?;
     cleanup
 }
 
@@ -1168,6 +1360,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         .await
         .map_err(|error| format!("authenticated OpenShell connection failed: {error:?}"))?;
     let mut request = SandboxRequest {
+        egress: Vec::new(),
         runtime: RuntimeId("runtime-adapter-v0098".to_owned()),
         workspace_key: "team-a".to_owned(),
         execution_class: SandboxExecutionClass::Agent,
@@ -1282,8 +1475,13 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
     let actual_payload = task_result?;
     failure_semantics?;
     cleanup_result?;
-    verify_bound_agent_declared_output_contract(&runtime, &caller_archive, bound_agent_image)
-        .await?;
+    verify_bound_agent_declared_output_contract(
+        &runtime,
+        &caller_archive,
+        bound_agent_image.clone(),
+    )
+    .await?;
+    verify_egress_enforcement(&runtime, &caller_archive, bound_agent_image).await?;
     assert_eq!(
         Sha256::digest(&actual_payload),
         Sha256::digest(&expected_payload),

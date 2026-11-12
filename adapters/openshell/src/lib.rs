@@ -24,10 +24,16 @@ use kube::discovery::Discovery;
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
+use openshell_sdk::raw::proto::sandbox::v1::{
+    FilesystemPolicy, LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
+    ProcessPolicy, SandboxPolicy,
+};
+#[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
-    AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxRequest,
-    ListSandboxProvidersRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
+    AttachSandboxProviderRequest, CreateProviderRequest, CreateSandboxRequest,
+    DetachSandboxProviderRequest, ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest,
+    GetSandboxRequest, ListSandboxProvidersRequest, Sandbox as RawSandbox,
+    SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec, SandboxTemplate,
     exec_sandbox_event,
 };
 #[cfg(feature = "runtime")]
@@ -46,11 +52,11 @@ use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
     MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProviderControlExecutionBindings,
-    REQUIRED_OUTPUT_MISSING_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
-    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
-    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE, TaskAttemptId,
-    WORKSPACE_PREPARATION_FAILURE,
+    REQUIRED_OUTPUT_MISSING_FAILURE, SANDBOX_EGRESS_REJECTION_PREFIX,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass, SandboxObservation,
+    SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime, SandboxTaskTranscript, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE,
+    TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -61,7 +67,7 @@ use steward_types::direct_package::{
 #[cfg(feature = "runtime")]
 use steward_types::task_input_archive::split_task_input_archive;
 #[cfg(feature = "runtime")]
-use steward_types::{AgentType, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
+use steward_types::{AgentType, EgressHost, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
 #[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use tokio::sync::Mutex;
 #[cfg(feature = "runtime")]
@@ -101,6 +107,10 @@ pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
 const INFERENCE_PROVIDER: &str = "steward-litellm";
+/// The one sandbox network rule Steward owns. It lists the hosts the runtime's Envelope grants;
+/// every other rule in the sandbox policy belongs to someone else and is never changed.
+#[cfg(feature = "runtime")]
+const EGRESS_POLICY_RULE: &str = "steward-egress";
 #[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
@@ -330,6 +340,8 @@ struct OpenShellProjection {
     runtime_uid: String,
     image: Option<String>,
     execution_binding_digest: Option<String>,
+    /// Steward's create-time policy, only for a sandbox with an egress grant.
+    create_policy: Option<SandboxPolicy>,
 }
 
 #[cfg(feature = "runtime")]
@@ -1001,12 +1013,108 @@ fn tar_string(field: &[u8]) -> Option<&str> {
     std::str::from_utf8(&field[..nul]).ok()
 }
 
+/// The Steward egress rule for granted hosts: each host on its exact port over HTTPS, every
+/// HTTP method, from any binary in the sandbox. TLS is terminated automatically.
+#[cfg(feature = "runtime")]
+fn egress_policy_rule(hosts: &[EgressHost]) -> NetworkPolicyRule {
+    NetworkPolicyRule {
+        name: EGRESS_POLICY_RULE.to_owned(),
+        endpoints: hosts
+            .iter()
+            .map(|host| NetworkEndpoint {
+                host: host.host.clone(),
+                port: u32::from(host.port),
+                protocol: "rest".to_owned(),
+                enforcement: "enforce".to_owned(),
+                access: "full".to_owned(),
+                ..NetworkEndpoint::default()
+            })
+            .collect(),
+        binaries: vec![NetworkBinary {
+            path: "/**".to_owned(),
+            ..NetworkBinary::default()
+        }],
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn egress_rejection(reason: impl std::fmt::Display) -> PortError {
+    PortError::Rejected {
+        reason: format!("{SANDBOX_EGRESS_REJECTION_PREFIX}{reason}"),
+    }
+}
+
+/// The create-time policy for a sandbox with an egress grant: OpenShell's restrictive default
+/// (filesystem, landlock) and the `sandbox` process identity, plus exactly the Steward egress
+/// rule. It replaces the image's own policy for that sandbox, including the image's network
+/// rules. A sandbox without a grant gets `None` and keeps the image's policy. The policy is never
+/// changed after creation: a runtime's egress is fixed for its life.
+#[cfg(feature = "runtime")]
+fn egress_sandbox_policy(hosts: &[EgressHost]) -> Option<SandboxPolicy> {
+    if hosts.is_empty() {
+        return None;
+    }
+    let paths = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+    Some(SandboxPolicy {
+        version: 1,
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: paths(&[
+                "/usr",
+                "/lib",
+                "/proc",
+                "/dev/urandom",
+                "/app",
+                "/etc",
+                "/var/log",
+            ]),
+            read_write: paths(&["/sandbox", "/tmp", "/dev/null"]),
+        }),
+        landlock: Some(LandlockPolicy {
+            compatibility: "best_effort".to_owned(),
+        }),
+        process: Some(ProcessPolicy {
+            run_as_user: "sandbox".to_owned(),
+            run_as_group: "sandbox".to_owned(),
+        }),
+        network_policies: [(EGRESS_POLICY_RULE.to_owned(), egress_policy_rule(hosts))]
+            .into_iter()
+            .collect(),
+        ..SandboxPolicy::default()
+    })
+}
+
+/// Classifies a refused creation of a sandbox with an egress policy. OpenShell's refusals of the
+/// policy can't be fixed by retrying, so they are terminal and keep OpenShell's message.
+#[cfg(feature = "runtime")]
+fn egress_create_failure(status: &tonic::Status) -> PortError {
+    match status.code() {
+        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+            egress_rejection(format_args!(
+                "OpenShell refused the sandbox egress policy: {}",
+                status.message()
+            ))
+        }
+        _ => raw_port_failure(status),
+    }
+}
+
 #[cfg(feature = "runtime")]
 fn project_request(
     request: &SandboxRequest,
     stable_bridge_image: Option<&str>,
     connections_bridge_image: Option<&str>,
 ) -> Result<OpenShellProjection, PortError> {
+    let mut granted = BTreeSet::new();
+    for host in &request.egress {
+        host.validate().map_err(egress_rejection)?;
+        if !granted.insert((host.host.as_str(), host.port)) {
+            return Err(egress_rejection(format_args!(
+                "egress host {}:{} is listed more than once",
+                host.host, host.port
+            )));
+        }
+    }
     let image = bridge_image_for_execution(
         &request.agent_type,
         request.execution_class,
@@ -1071,6 +1179,7 @@ fn project_request(
             .execution_binding
             .as_ref()
             .map(|binding| binding.binding_digest.clone()),
+        create_policy: egress_sandbox_policy(&request.egress),
     })
 }
 
@@ -2443,6 +2552,41 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
+    /// Creates a sandbox with Steward's create-time policy. The SDK's sandbox spec has no policy
+    /// field, so this uses the raw request with the same fields the SDK sends.
+    async fn create_sandbox_with_policy(
+        &self,
+        projection: &OpenShellProjection,
+    ) -> Result<(), PortError> {
+        let spec = sandbox_spec(projection);
+        let request = CreateSandboxRequest {
+            spec: Some(RawSandboxSpec {
+                template: spec.image.map(|image| SandboxTemplate {
+                    image,
+                    ..SandboxTemplate::default()
+                }),
+                providers: spec.providers,
+                policy: projection.create_policy.clone(),
+                ..RawSandboxSpec::default()
+            }),
+            name: projection.sandbox.clone(),
+            labels: spec.labels,
+            annotations: HashMap::new(),
+            workspace: projection.workspace.clone(),
+        };
+        match self
+            .authenticated_client()
+            .await?
+            .raw_grpc()
+            .create_sandbox(request)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == tonic::Code::AlreadyExists => Ok(()),
+            Err(status) => Err(egress_create_failure(&status)),
+        }
+    }
+
     async fn attached_providers(
         &self,
         workspace: &str,
@@ -2678,6 +2822,15 @@ impl SandboxRuntime for OpenShellRuntime {
             .await
         {
             Ok(snapshot) => snapshot,
+            Err(SdkError::NotFound { .. }) if projection.create_policy.is_some() => {
+                self.create_sandbox_with_policy(&projection).await?;
+                self.authenticated_client()
+                    .await?
+                    .workspace(&projection.workspace)
+                    .get_sandbox(&projection.sandbox)
+                    .await
+                    .map_err(port_failure)?
+            }
             Err(SdkError::NotFound { .. }) => {
                 match self
                     .authenticated_client()
@@ -3754,9 +3907,9 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     use steward_ports::{
-        PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
-        SandboxTaskOutput, SandboxTaskRequest, SandboxTaskTranscript, TASK_TOOL_FAILURE,
-        TaskAttemptId,
+        PortError, SANDBOX_EGRESS_REJECTION_PREFIX, SandboxExecutionClass, SandboxRequest,
+        SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskTranscript,
+        TASK_TOOL_FAILURE, TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::{
@@ -3767,8 +3920,8 @@ mod tests {
     };
     #[cfg(feature = "runtime")]
     use steward_types::{
-        AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
-        ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
+        AgentType, DisposableExecutionBinding, EgressHost, ExecutionProviderProfile,
+        ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
         TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
     };
 
@@ -3776,19 +3929,20 @@ mod tests {
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpaqueToken, OpenShellConnectionConfig,
-        OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
-        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
-        TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, EGRESS_POLICY_RULE, INFERENCE_PROVIDER, OpaqueToken,
+        OpenShellConnectionConfig, OpenShellTaskLogMode, ProviderReconciliation,
+        STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream,
+        TaskProcessLaunchMode, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
         WorkloadExchangeTokenProvider, WorkloadSourceCredential,
         attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
-        deletion_names, failed_output_archive_command, load_source_credential,
-        output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
-        request_model_providers, required_output_failure_reason, sandbox_spec,
-        sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
-        staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_attempt_cancel_command, task_attempt_detached_launch_command, task_attempt_directory,
+        deletion_names, egress_create_failure, egress_sandbox_policy,
+        failed_output_archive_command, load_source_credential, output_archive_command,
+        project_request, provider_reconciliation, provider_reconciliation_plan,
+        provider_reconciliation_targets, repository_prompt_context, request_model_providers,
+        required_output_failure_reason, sandbox_spec, sanitized_provider_control_transcript,
+        staging_append_command, staging_archive_chunks, staging_extract_command,
+        staging_prepare_command, task_agent_failure_category, task_attempt_cancel_command,
+        task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_failed_output_command,
         task_attempt_observation_command, task_attempt_transcript_stream_command,
         task_failure_category, task_process_launch_mode, task_process_log_record,
@@ -5262,6 +5416,7 @@ mod tests {
     fn runtime_projection_is_stable_and_uid_bound() -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -5293,6 +5448,7 @@ mod tests {
     #[test]
     fn unbound_versioned_agents_fail_closed() {
         let request = |agent_type: &str| SandboxRequest {
+            egress: Vec::new(),
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
             execution_class: SandboxExecutionClass::Agent,
@@ -5347,6 +5503,7 @@ mod tests {
         seal_binding(&mut binding)?;
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -5407,6 +5564,7 @@ mod tests {
         assert!(
             project_request(
                 &SandboxRequest {
+                    egress: Vec::new(),
                     runtime: RuntimeId("runtime-uid-b".to_owned()),
                     workspace_key: "team-a".to_owned(),
                     execution_class: SandboxExecutionClass::Agent,
@@ -5438,6 +5596,7 @@ mod tests {
             matches!(
                 project_request(
                     &SandboxRequest {
+                        egress: Vec::new(),
                         runtime: RuntimeId("runtime-uid-c".to_owned()),
                         workspace_key: "team-a".to_owned(),
                         execution_class: SandboxExecutionClass::Agent,
@@ -5463,6 +5622,7 @@ mod tests {
         assert!(
             project_request(
                 &SandboxRequest {
+                    egress: Vec::new(),
                     runtime: RuntimeId("runtime-uid-d".to_owned()),
                     workspace_key: "team-a".to_owned(),
                     execution_class: SandboxExecutionClass::Agent,
@@ -5519,6 +5679,7 @@ mod tests {
         seal_binding(&mut binding)?;
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -5754,6 +5915,7 @@ mod tests {
     #[test]
     fn connections_bridge_requires_a_digest_pinned_verified_image() -> Result<(), String> {
         let request = SandboxRequest {
+            egress: Vec::new(),
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
             execution_class: SandboxExecutionClass::ProviderControl,
@@ -5996,6 +6158,7 @@ mod tests {
     #[test]
     fn teardown_uses_the_external_objects_recorded_in_status() {
         let request = SandboxRequest {
+            egress: Vec::new(),
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
             execution_class: SandboxExecutionClass::Agent,
@@ -6027,6 +6190,7 @@ mod tests {
     fn tool_authority_attaches_only_the_steward_gateway_provider() -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -6060,6 +6224,7 @@ mod tests {
     fn inference_authority_attaches_only_the_runtime_key_provider() -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -6524,9 +6689,185 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
+    fn egress_grant_gets_a_steward_create_time_policy_and_no_grant_keeps_the_image_policy()
+    -> Result<(), String> {
+        assert!(
+            egress_sandbox_policy(&[]).is_none(),
+            "a sandbox without an egress grant keeps the image's own policy"
+        );
+        let hosts = [
+            EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            },
+            EgressHost {
+                host: "feeds.example.org".to_owned(),
+                port: 8443,
+            },
+        ];
+        let policy = egress_sandbox_policy(&hosts)
+            .ok_or_else(|| "a granted sandbox must get a create-time policy".to_owned())?;
+        let filesystem = policy.filesystem.clone().unwrap_or_default();
+        assert!(filesystem.include_workdir);
+        assert_eq!(
+            filesystem.read_write,
+            ["/sandbox", "/tmp", "/dev/null"],
+            "the baseline keeps OpenShell's restrictive default filesystem"
+        );
+        assert_eq!(
+            policy
+                .landlock
+                .as_ref()
+                .map(|landlock| landlock.compatibility.as_str()),
+            Some("best_effort")
+        );
+        assert_eq!(
+            policy
+                .process
+                .as_ref()
+                .map(|process| (process.run_as_user.as_str(), process.run_as_group.as_str())),
+            Some(("sandbox", "sandbox"))
+        );
+        assert_eq!(
+            policy.network_policies.keys().collect::<Vec<_>>(),
+            [EGRESS_POLICY_RULE],
+            "the only network rule is Steward's; the image's rules are not carried over"
+        );
+        let rule = &policy.network_policies[EGRESS_POLICY_RULE];
+        assert_eq!(
+            rule.endpoints
+                .iter()
+                .map(|endpoint| (
+                    endpoint.host.as_str(),
+                    endpoint.port,
+                    endpoint.protocol.as_str(),
+                    endpoint.access.as_str(),
+                    endpoint.enforcement.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("advisories.example.com", 443, "rest", "full", "enforce"),
+                ("feeds.example.org", 8443, "rest", "full", "enforce"),
+            ]
+        );
+        assert_eq!(
+            rule.binaries
+                .iter()
+                .map(|binary| binary.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/**"]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn projection_carries_the_create_time_egress_policy() -> Result<(), String> {
+        let request = |egress: Vec<EgressHost>| SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: AgentType {
+                name: "base".to_owned(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            egress,
+            refs: RuntimeRefs::default(),
+            execution_binding: None,
+        };
+        let without = project_request(&request(Vec::new()), None, None)
+            .map_err(|error| format!("project without egress: {error:?}"))?;
+        assert!(without.create_policy.is_none());
+        let host = EgressHost {
+            host: "advisories.example.com".to_owned(),
+            port: 443,
+        };
+        let with = project_request(&request(vec![host.clone()]), None, None)
+            .map_err(|error| format!("project with egress: {error:?}"))?;
+        assert_eq!(with.create_policy, egress_sandbox_policy(&[host]));
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn refused_egress_sandbox_creation_is_terminal_and_named() {
+        for status in [
+            tonic::Status::invalid_argument("policy contains unsafe content: root user"),
+            tonic::Status::failed_precondition("middleware selector is invalid"),
+        ] {
+            assert!(
+                matches!(
+                    egress_create_failure(&status),
+                    PortError::Rejected { reason }
+                        if reason.starts_with(SANDBOX_EGRESS_REJECTION_PREFIX)
+                            && reason.contains(status.message())
+                ),
+                "{status:?} must fail the Task with a named reason"
+            );
+        }
+        assert!(matches!(
+            egress_create_failure(&tonic::Status::unavailable("gateway restarting")),
+            PortError::Failed { .. }
+        ));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn invalid_egress_hosts_never_reach_openshell() {
+        for host in [
+            EgressHost {
+                host: "**.com".to_owned(),
+                port: 443,
+            },
+            EgressHost {
+                host: "*.example.com".to_owned(),
+                port: 443,
+            },
+            EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 0,
+            },
+        ]
+        .into_iter()
+        .map(|host| vec![host])
+        .chain([vec![
+            EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            };
+            2
+        ]]) {
+            let result = project_request(
+                &SandboxRequest {
+                    runtime: RuntimeId("runtime-uid-a".to_owned()),
+                    workspace_key: "team-a".to_owned(),
+                    execution_class: SandboxExecutionClass::Agent,
+                    agent_type: AgentType {
+                        name: "base".to_owned(),
+                    },
+                    models: Vec::new(),
+                    tools: Vec::new(),
+                    egress: host.clone(),
+                    refs: RuntimeRefs::default(),
+                    execution_binding: None,
+                },
+                None,
+                None,
+            );
+            assert!(
+                matches!(result, Err(PortError::Rejected { .. })),
+                "egress hosts {host:?} must be refused before any OpenShell call"
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
     fn removing_tool_authority_plans_provider_detach() -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -6559,6 +6900,7 @@ mod tests {
     -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
@@ -6604,6 +6946,7 @@ mod tests {
     -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
+                egress: Vec::new(),
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
                 execution_class: SandboxExecutionClass::Agent,
