@@ -861,7 +861,7 @@ fn evaluate_envelope_spec(
             .spec
             .egress
             .as_ref()
-            .map_or_else(Vec::new, |egress| egress.hosts.clone());
+            .map_or(&[][..], |egress| egress.hosts.as_slice());
         let outside = requested
             .hosts
             .iter()
@@ -871,7 +871,7 @@ fn evaluate_envelope_spec(
         if !outside.is_empty() {
             deltas.push(AdmissionDelta::EgressHosts {
                 requested: outside,
-                ceiling,
+                ceiling: ceiling.to_vec(),
             });
         }
     }

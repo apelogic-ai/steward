@@ -12,11 +12,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Envelopes, Envelope templates and Envelope requests accept an optional `egress.hosts` grant of
   public hosts (exact DNS names, port 443 by default). It follows the rules for models and tools:
   the capability catalog's new optional `egressHosts` is the deployment ceiling, templates may
-  grant only catalog hosts, and a request is provisioned automatically within its template, waits
-  for an administrator above it, and is refused with `422 capability_not_available` for a host
-  the catalog doesn't list. An Envelope without `egress` serializes exactly as before, so
-  existing digests don't change. The web Envelope views show granted hosts read-only. Task
-  sandboxes don't use the grant yet.
+  grant only catalog hosts (browser authoring and the operator API), and a request is provisioned
+  automatically within its template, waits for an administrator above it, and is refused with
+  `422 capability_not_available` for a host the catalog doesn't list on every path. Hosts are
+  stored sorted, so the same set keeps one digest, and an Envelope without `egress` serializes
+  exactly as before. The platform preflight accepts and validates `egressHosts`. The web
+  Envelope views and template editor show granted hosts read-only. Task sandboxes don't use the
+  grant yet.
 
 ## [0.3.31] - 2026-11-11
 

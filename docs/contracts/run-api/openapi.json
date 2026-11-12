@@ -11326,7 +11326,7 @@
       },
       "EgressAuthority": {
         "type": "object",
-        "description": "Public egress an Envelope grants: only the listed hosts, read-only.",
+        "description": "Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,\nwith the port always written, so the same host set always serializes to the same Envelope\ndigest.",
         "required": [
           "hosts"
         ],

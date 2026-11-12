@@ -942,6 +942,26 @@ pub(crate) fn capability_catalog_violation_fields(
     fields
 }
 
+/// The deployment's public egress ceiling (the capability catalog's `egressHosts`) for paths that
+/// do not read the capability catalog themselves. When it is absent no host is available.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeploymentEgressCeiling(pub Vec<steward_types::EgressHost>);
+
+impl DeploymentEgressCeiling {
+    /// True when every host the egress grant names is in the ceiling.
+    pub fn allows(&self, egress: Option<&steward_types::EgressAuthority>) -> bool {
+        egress.is_none_or(|egress| egress.hosts.iter().all(|host| self.0.contains(host)))
+    }
+}
+
+/// Checks an egress grant on a path without its own catalog; a missing ceiling allows no host.
+pub(crate) fn egress_within_deployment(
+    ceiling: Option<&DeploymentEgressCeiling>,
+    egress: Option<&steward_types::EgressAuthority>,
+) -> bool {
+    ceiling.map_or_else(|| egress.is_none(), |ceiling| ceiling.allows(egress))
+}
+
 /// True when the Envelope grants a public egress host the deployment catalog does not list.
 pub(crate) fn egress_hosts_unavailable(
     capabilities: &CapabilityCatalog,
@@ -1573,6 +1593,21 @@ where
     } else {
         false
     };
+    // Unlike stale model and tool entries, a public egress host outside the deployment catalog
+    // is never provisioned, even within a template.
+    if auto_provision
+        && state
+            .broker
+            .envelope_capability_violation_fields(&requested_envelope)
+            .contains(&EnvelopeRequestField::EgressHosts)
+    {
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "capability_not_available",
+            "This deployment does not provide the requested egress hosts.",
+            vec![EnvelopeRequestField::EgressHosts],
+        );
+    }
     if !auto_provision && let Some(existing) = replayed_request {
         return (
             StatusCode::CREATED,
@@ -2909,9 +2944,12 @@ mod tests {
             capability_violation_fields: vec![EnvelopeRequestField::EgressHosts],
             ..TestBroker::default()
         };
-        let (status, value) =
-            post_egress_request(broker.clone(), &["advisories.example.com"], "within-not-catalog")
-                .await?;
+        let (status, value) = post_egress_request(
+            broker.clone(),
+            &["advisories.example.com"],
+            "within-not-catalog",
+        )
+        .await?;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(value["error"], "capability_not_available");
         assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));

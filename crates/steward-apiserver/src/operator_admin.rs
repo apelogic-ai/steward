@@ -278,6 +278,9 @@ struct ErrorResponse {
     error: &'static str,
 }
 
+const EGRESS_HOST_NOT_AVAILABLE: &str =
+    "an egress host is not in this deployment's capability catalog egressHosts";
+
 pub fn router<L, A>(ledger: L, authenticator: A) -> Router
 where
     L: OperatorLedger,
@@ -549,6 +552,7 @@ pub(crate) async fn latest_template<L: OperatorLedger>(
 pub(crate) async fn apply_template<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
+    egress_ceiling: Option<Extension<crate::user_envelopes::DeploymentEgressCeiling>>,
     Path((template_id, revision)): Path<(String, i64)>,
     Json(mut request): Json<OperatorTemplateApplyRequest>,
 ) -> Response {
@@ -557,6 +561,12 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
             StatusCode::UNPROCESSABLE_ENTITY,
             steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
         );
+    }
+    if !crate::user_envelopes::egress_within_deployment(
+        egress_ceiling.as_ref().map(|Extension(ceiling)| ceiling),
+        request.ceiling.spec.egress.as_ref(),
+    ) {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, EGRESS_HOST_NOT_AVAILABLE);
     }
     if !crate::browser_admin::valid_template_identifier(&template_id)
         || revision <= 0
@@ -639,8 +649,15 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
 pub(crate) async fn provision<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
+    egress_ceiling: Option<Extension<crate::user_envelopes::DeploymentEgressCeiling>>,
     Json(request): Json<OperatorProvisionRequest>,
 ) -> Response {
+    if !crate::user_envelopes::egress_within_deployment(
+        egress_ceiling.as_ref().map(|Extension(ceiling)| ceiling),
+        request.requested_envelope.spec.egress.as_ref(),
+    ) {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, EGRESS_HOST_NOT_AVAILABLE);
+    }
     let owner_user_id = match CanonicalUserId::parse(request.owner_user_id) {
         Ok(user_id) => user_id,
         Err(_) => {
@@ -1021,24 +1038,50 @@ mod tests {
                 FakeAuthenticator { is_admin: true },
             )
         };
-        let unlisted = apply(app().layer(ceiling(&["feeds.example.org"])), "advisories.example.com")
-            .await?;
-        assert_eq!(unlisted.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let no_ceiling = apply(app(), "advisories.example.com").await?;
-        assert_eq!(
-            no_ceiling.status(),
+        async fn error_of(response: Response) -> Result<(StatusCode, String), String> {
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read operator response: {error}"))?;
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("parse operator response: {error}"))?;
+            Ok((
+                status,
+                value["error"].as_str().unwrap_or_default().to_owned(),
+            ))
+        }
+        let refused = (
             StatusCode::UNPROCESSABLE_ENTITY,
+            EGRESS_HOST_NOT_AVAILABLE.to_owned(),
+        );
+        assert_eq!(
+            error_of(
+                apply(
+                    app().layer(ceiling(&["feeds.example.org"])),
+                    "advisories.example.com"
+                )
+                .await?
+            )
+            .await?,
+            refused,
+            "a host outside the ceiling is refused"
+        );
+        assert_eq!(
+            error_of(apply(app(), "advisories.example.com").await?).await?,
+            refused,
             "without a configured ceiling no egress host is available"
         );
-        let listed = apply(
-            app().layer(ceiling(&["advisories.example.com"])),
-            "advisories.example.com",
+        let (_, listed_error) = error_of(
+            apply(
+                app().layer(ceiling(&["advisories.example.com"])),
+                "advisories.example.com",
+            )
+            .await?,
         )
         .await?;
-        assert!(
-            listed.status().is_success(),
-            "a listed host may be applied: {}",
-            listed.status()
+        assert_ne!(
+            listed_error, EGRESS_HOST_NOT_AVAILABLE,
+            "a listed host passes the egress check and reaches the ledger"
         );
 
         let provision = app()
@@ -1063,7 +1106,7 @@ mod tests {
             )
             .await
             .map_err(|error| format!("execute egress provision: {error}"))?;
-        assert_eq!(provision.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_of(provision).await?, refused);
         Ok(())
     }
 

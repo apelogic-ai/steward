@@ -2683,6 +2683,7 @@ where
 async fn author_envelope_handler<R, L, D>(
     State(state): State<AppState<R, L, D>>,
     Extension(admin): Extension<AdminContext>,
+    egress_ceiling: Option<Extension<user_envelopes::DeploymentEgressCeiling>>,
     Path(member_role): Path<String>,
     Json(envelope): Json<Envelope>,
 ) -> Response
@@ -2691,6 +2692,18 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
+    if !user_envelopes::egress_within_deployment(
+        egress_ceiling.as_ref().map(|Extension(ceiling)| ceiling),
+        envelope.spec.egress.as_ref(),
+    ) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "an egress host is not in this deployment's capability catalog egressHosts",
+            })),
+        )
+            .into_response();
+    }
     if member_role.is_empty() || envelope.revision <= 0 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -7282,12 +7295,12 @@ mod tests {
                 FakeAuthenticator,
                 FakeDecisionChannel::default(),
             )
-            .layer(axum::Extension(user_envelopes::DeploymentEgressCeiling(vec![
-                steward_types::EgressHost {
+            .layer(axum::Extension(
+                crate::user_envelopes::DeploymentEgressCeiling(vec![steward_types::EgressHost {
                     host: "advisories.example.com".to_owned(),
                     port: 443,
-                },
-            ]))),
+                }]),
+            )),
             body,
         )
         .await?;

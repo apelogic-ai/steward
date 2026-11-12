@@ -44,6 +44,9 @@ struct DeploymentCapabilityCatalog {
     #[serde(rename = "tools")]
     _tools: Vec<serde_json::Value>,
     catalogs: Vec<DeploymentProviderCatalog>,
+    /// Validated by the apiserver; Mint only needs to accept it.
+    #[serde(default, rename = "egressHosts")]
+    _egress_hosts: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

@@ -1296,13 +1296,38 @@ const fn default_egress_port() -> u16 {
     443
 }
 
-/// Public egress an Envelope grants: only the listed hosts, read-only.
+/// Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,
+/// with the port always written, so the same host set always serializes to the same Envelope
+/// digest.
 #[derive(
     Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressAuthority {
+    #[serde(
+        serialize_with = "serialize_sorted_egress_hosts",
+        deserialize_with = "deserialize_sorted_egress_hosts"
+    )]
+    #[schemars(with = "Vec<EgressHost>")]
     pub hosts: Vec<EgressHost>,
+}
+
+fn serialize_sorted_egress_hosts<S>(hosts: &[EgressHost], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut sorted = hosts.iter().collect::<Vec<_>>();
+    sorted.sort();
+    sorted.serialize(serializer)
+}
+
+fn deserialize_sorted_egress_hosts<'de, D>(deserializer: D) -> Result<Vec<EgressHost>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut hosts = Vec::<EgressHost>::deserialize(deserializer)?;
+    hosts.sort();
+    Ok(hosts)
 }
 
 impl EgressHost {
@@ -1338,11 +1363,11 @@ impl EgressHost {
                 );
             }
         }
-        if labels
+        if !labels
             .last()
-            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+            .is_some_and(|label| label.starts_with(|first: char| first.is_ascii_lowercase()))
         {
-            return refuse("must be a DNS name, not an IP address");
+            return refuse("must end in a top-level domain that starts with a letter");
         }
         if labels.last() == Some(&"localhost") {
             return refuse("must be a public DNS name");

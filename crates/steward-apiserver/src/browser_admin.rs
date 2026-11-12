@@ -2211,28 +2211,15 @@ where
         Ok(_) => {}
         Err(error) => return ApiError::Store(error).into_response(),
     }
-    let mut unavailable_fields = Vec::new();
-    if state.capabilities.models.is_empty()
-        || envelope
-            .spec
-            .llms
-            .iter()
-            .any(|model| !state.capabilities.models.contains(model))
-    {
-        unavailable_fields.push(BrowserEnvelopeTemplateField::Models);
-    }
-    if envelope.spec.tools.iter().any(|tool| {
-        !state
-            .capabilities
-            .tools
-            .iter()
-            .any(|available| available.grants(tool))
-    }) {
-        unavailable_fields.push(BrowserEnvelopeTemplateField::Tools);
-    }
-    if crate::user_envelopes::egress_hosts_unavailable(&state.capabilities, &envelope) {
-        unavailable_fields.push(BrowserEnvelopeTemplateField::EgressHosts);
-    }
+    let unavailable_fields = capability_catalog_violation_fields(&state.capabilities, &envelope)
+        .into_iter()
+        .filter_map(|field| match field {
+            EnvelopeRequestField::Llms => Some(BrowserEnvelopeTemplateField::Models),
+            EnvelopeRequestField::Tools => Some(BrowserEnvelopeTemplateField::Tools),
+            EnvelopeRequestField::EgressHosts => Some(BrowserEnvelopeTemplateField::EgressHosts),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     if !unavailable_fields.is_empty() {
         return envelope_template_error_response(
             "capability_not_available",

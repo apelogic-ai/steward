@@ -235,14 +235,47 @@ def https_host_and_port(value: str, path: str) -> tuple[str, int]:
     return parsed.hostname, port
 
 
+EGRESS_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def validate_capability_egress_hosts(hosts: Any) -> None:
+    """Hostname format only, matching the apiserver: exact lowercase DNS names, no limits."""
+    if not isinstance(hosts, list):
+        raise ValidationError("capabilityCatalog.egressHosts must be an array")
+    seen: set[tuple[str, int]] = set()
+    for index, entry in enumerate(hosts):
+        path = f"capabilityCatalog.egressHosts[{index}]"
+        if not isinstance(entry, dict):
+            raise ValidationError(f"{path} must be an object")
+        require_exact_keys(entry, {"host", "port"}, path)
+        host = entry.get("host")
+        labels = host.split(".") if isinstance(host, str) else []
+        if (
+            not isinstance(host, str)
+            or not 1 <= len(host) <= 253
+            or len(labels) < 2
+            or not all(EGRESS_HOST_LABEL.fullmatch(label) for label in labels)
+            or not labels[-1][0].isalpha()
+            or labels[-1] == "localhost"
+        ):
+            raise ValidationError(f"{path}.host must be an exact lowercase public DNS name")
+        port = entry.get("port", 443)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValidationError(f"{path}.port must be an integer from 1 to 65535")
+        if (host, port) in seen:
+            raise ValidationError(f"{path} repeats {host}:{port}")
+        seen.add((host, port))
+
+
 def validate_capability_catalog(
     catalog: dict[str, Any], requires_inference: bool, requires_tools: bool
 ) -> None:
     require_exact_keys(
         catalog,
-        {"schemaVersion", "models", "tools", "catalogs"},
+        {"schemaVersion", "models", "tools", "catalogs", "egressHosts"},
         "capabilityCatalog",
     )
+    validate_capability_egress_hosts(catalog.get("egressHosts", []))
     if catalog.get("schemaVersion") != "steward.capability-catalog/v2":
         raise ValidationError("capabilityCatalog.schemaVersion must equal steward.capability-catalog/v2")
     models = catalog.get("models")

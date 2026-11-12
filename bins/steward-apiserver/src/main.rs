@@ -258,7 +258,8 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     )
     .merge(operator_admin::router(store.clone(), authenticator))
     .merge(task_auth_discovery_router(task_auth_discovery))
-    .merge(task_router(store.clone(), task_identities, task_api_config));
+    .merge(task_router(store.clone(), task_identities, task_api_config))
+    .layer(axum::Extension(deployment_egress_ceiling()?));
     let app = match browser {
         Some(browser) => app.merge(browser),
         None => app,
@@ -454,6 +455,26 @@ fn configured_source_repository_bindings_json() -> Result<Option<String>, io::Er
         MAX_SOURCE_REPOSITORY_BINDINGS_BYTES,
         "source repository binding catalog",
     )
+}
+
+/// The public egress ceiling from the capability catalog, for the operator and legacy authoring
+/// paths. Without a configured catalog no egress host is available.
+fn deployment_egress_ceiling()
+-> Result<steward_apiserver::user_envelopes::DeploymentEgressCeiling, Box<dyn Error>> {
+    let Some(catalog_json) = configured_bounded_json(
+        "STEWARD_CAPABILITY_CATALOG_JSON",
+        "STEWARD_CAPABILITY_CATALOG_FILE",
+        browser_admin::MAX_CAPABILITY_CATALOG_BYTES,
+        "capability catalog",
+    )?
+    else {
+        return Ok(steward_apiserver::user_envelopes::DeploymentEgressCeiling::default());
+    };
+    let catalog =
+        browser_admin::CapabilityCatalog::from_json(&catalog_json).map_err(io::Error::other)?;
+    Ok(steward_apiserver::user_envelopes::DeploymentEgressCeiling(
+        catalog.egress_hosts,
+    ))
 }
 
 fn configured_bounded_json(

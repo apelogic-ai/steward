@@ -1124,7 +1124,9 @@ export type DispatchTaskResponse = {
 export type Duration = string;
 
 /**
- * Public egress an Envelope grants: only the listed hosts, read-only.
+ * Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,
+ * with the port always written, so the same host set always serializes to the same Envelope
+ * digest.
  */
 export type EgressAuthority = {
     hosts: Array<EgressHost>;
