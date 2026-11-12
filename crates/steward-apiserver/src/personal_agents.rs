@@ -1467,6 +1467,7 @@ mod tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![
                     ModelRef {
                         provider: "future-provider".to_owned(),

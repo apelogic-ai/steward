@@ -657,7 +657,9 @@ preserve the same immutable coordinates and cross-component relationships.
    The complete preflight input makes the ownership boundaries explicit:
 
    - the capability catalog is the bounded set of models and tools administrators
-     may select in templates;
+     may select in templates, plus optional `egressHosts`, the public hosts
+     Envelopes may grant for read-only egress, each with an explicit `port` in
+     Helm values (see the Envelope administration guide);
    - the execution binding selects the immutable agent image that may execute;
    - provider profiles supply the immutable, deployment-owned inference and tool
      connectivity rendered into that binding; and

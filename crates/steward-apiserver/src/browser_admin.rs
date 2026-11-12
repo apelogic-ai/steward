@@ -228,6 +228,10 @@ pub struct CapabilityCatalog {
     pub models: Vec<ModelRef>,
     pub tools: Vec<CapabilityTool>,
     pub catalogs: Vec<CapabilityProviderCatalog>,
+    /// Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means
+    /// no public egress is available; omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_hosts: Vec<steward_types::EgressHost>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -251,6 +255,8 @@ impl CapabilityCatalog {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        steward_types::validate_egress_hosts(&self.egress_hosts)
+            .map_err(|reason| format!("capability catalog {reason}"))?;
         if self.schema_version != "steward.capability-catalog/v2" {
             return Err(
                 "capability catalog schemaVersion must be steward.capability-catalog/v2".to_owned(),
@@ -336,7 +342,7 @@ mod capability_catalog_tests {
         MAX_CAPABILITY_MODELS, MAX_CAPABILITY_TOOLS, MAX_TOOLSET_NAME_CHARS, MAX_TOOLSETS_PER_TOOL,
         ToolAccessClass,
     };
-    use steward_types::ModelRef;
+    use steward_types::{EgressHost, ModelRef};
 
     fn catalog() -> CapabilityCatalog {
         CapabilityCatalog {
@@ -359,7 +365,53 @@ mod capability_catalog_tests {
                 version: "1.6.0".to_owned(),
                 available: true,
             }],
+            egress_hosts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn egress_hosts_default_to_port_443_and_malformed_hosts_are_refused() -> Result<(), String> {
+        let plain = serde_json::to_value(catalog()).map_err(|error| error.to_string())?;
+        assert!(
+            plain.get("egressHosts").is_none(),
+            "a catalog without egress hosts serializes exactly as before: {plain}"
+        );
+        let mut value = plain;
+        value["egressHosts"] = serde_json::json!([
+            {"host": "advisories.example.com"},
+            {"host": "feeds.example.org", "port": 8443}
+        ]);
+        let parsed = CapabilityCatalog::from_json(&value.to_string())?;
+        assert_eq!(
+            parsed.egress_hosts,
+            vec![
+                EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                },
+                EgressHost {
+                    host: "feeds.example.org".to_owned(),
+                    port: 8443,
+                },
+            ]
+        );
+        for refused in [
+            serde_json::json!([{"host": "*.example.com"}]),
+            serde_json::json!([{"host": "203.0.113.7"}]),
+            serde_json::json!([{"host": "localhost"}]),
+            serde_json::json!([{"host": "advisories.example.com", "port": 0}]),
+            serde_json::json!([
+                {"host": "advisories.example.com"},
+                {"host": "advisories.example.com", "port": 443}
+            ]),
+        ] {
+            value["egressHosts"] = refused.clone();
+            assert!(
+                CapabilityCatalog::from_json(&value.to_string()).is_err(),
+                "catalog egress hosts {refused} must be refused"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -619,6 +671,7 @@ pub(crate) enum BrowserEnvelopeTemplateField {
     Compute,
     Storage,
     Workspace,
+    EgressHosts,
     AutoProvisionThreshold,
 }
 
@@ -1195,6 +1248,11 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     }
     let requested_envelope: Envelope = body.requested_envelope.into();
+    if let Some(response) =
+        crate::user_envelopes::egress_unavailable_response(&state.capabilities, &requested_envelope)
+    {
+        return response;
+    }
     let actor = authority.principal().canonical_user_id.as_str();
     match state
         .ledger
@@ -2158,25 +2216,15 @@ where
         Ok(_) => {}
         Err(error) => return ApiError::Store(error).into_response(),
     }
-    let mut unavailable_fields = Vec::new();
-    if state.capabilities.models.is_empty()
-        || envelope
-            .spec
-            .llms
-            .iter()
-            .any(|model| !state.capabilities.models.contains(model))
-    {
-        unavailable_fields.push(BrowserEnvelopeTemplateField::Models);
-    }
-    if envelope.spec.tools.iter().any(|tool| {
-        !state
-            .capabilities
-            .tools
-            .iter()
-            .any(|available| available.grants(tool))
-    }) {
-        unavailable_fields.push(BrowserEnvelopeTemplateField::Tools);
-    }
+    let unavailable_fields = capability_catalog_violation_fields(&state.capabilities, &envelope)
+        .into_iter()
+        .filter_map(|field| match field {
+            EnvelopeRequestField::Llms => Some(BrowserEnvelopeTemplateField::Models),
+            EnvelopeRequestField::Tools => Some(BrowserEnvelopeTemplateField::Tools),
+            EnvelopeRequestField::EgressHosts => Some(BrowserEnvelopeTemplateField::EgressHosts),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     if !unavailable_fields.is_empty() {
         return envelope_template_error_response(
             "capability_not_available",
@@ -2357,6 +2405,9 @@ fn envelope_validation_fields(
         }
         AdmissionError::InvalidWorkspaceAuthority { .. } => {
             vec![BrowserEnvelopeTemplateField::Workspace]
+        }
+        AdmissionError::InvalidEgressAuthority { .. } => {
+            vec![BrowserEnvelopeTemplateField::EgressHosts]
         }
         AdmissionError::UnsupportedBindings => Vec::new(),
     }
@@ -2548,6 +2599,7 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
     let requested = BrowserEnvelope {
         revision: record.envelope_revision,
         spec: BrowserEnvelopeSpec {
+            egress: None,
             llms: record.proposed_spec.llms,
             tools: record.proposed_spec.tools,
             budget: record.proposed_spec.budget,
@@ -3190,6 +3242,7 @@ mod request_projection_tests {
         let pinned_template = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: Vec::new(),
                 tools: Vec::new(),
                 budget: Budget {
@@ -3292,6 +3345,7 @@ mod request_projection_tests {
             template_envelope: Envelope {
                 revision: 1,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: Vec::new(),
                     tools: Vec::new(),
                     budget,

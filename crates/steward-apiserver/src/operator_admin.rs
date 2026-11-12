@@ -278,6 +278,23 @@ struct ErrorResponse {
     error: &'static str,
 }
 
+/// Refuses malformed egress hosts first, then hosts the deployment catalog doesn't list. Without
+/// a configured catalog no egress host is available.
+fn egress_refusal(
+    capabilities: Option<&Extension<crate::browser_admin::CapabilityCatalog>>,
+    envelope: Envelope,
+) -> Option<Response> {
+    if !crate::user_envelopes::egress_format_is_valid(envelope.spec.egress.as_ref()) {
+        return Some(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid egress hosts",
+        ));
+    }
+    let empty = crate::browser_admin::CapabilityCatalog::default();
+    let catalog = capabilities.map_or(&empty, |Extension(catalog)| catalog);
+    crate::user_envelopes::egress_unavailable_response(catalog, &envelope)
+}
+
 pub fn router<L, A>(ledger: L, authenticator: A) -> Router
 where
     L: OperatorLedger,
@@ -549,6 +566,7 @@ pub(crate) async fn latest_template<L: OperatorLedger>(
 pub(crate) async fn apply_template<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
+    capabilities: Option<Extension<crate::browser_admin::CapabilityCatalog>>,
     Path((template_id, revision)): Path<(String, i64)>,
     Json(mut request): Json<OperatorTemplateApplyRequest>,
 ) -> Response {
@@ -557,6 +575,9 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
             StatusCode::UNPROCESSABLE_ENTITY,
             steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
         );
+    }
+    if let Some(response) = egress_refusal(capabilities.as_ref(), request.ceiling.clone().into()) {
+        return response;
     }
     if !crate::browser_admin::valid_template_identifier(&template_id)
         || revision <= 0
@@ -639,8 +660,15 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
 pub(crate) async fn provision<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
+    capabilities: Option<Extension<crate::browser_admin::CapabilityCatalog>>,
     Json(request): Json<OperatorProvisionRequest>,
 ) -> Response {
+    if let Some(response) = egress_refusal(
+        capabilities.as_ref(),
+        request.requested_envelope.clone().into(),
+    ) {
+        return response;
+    }
     let owner_user_id = match CanonicalUserId::parse(request.owner_user_id) {
         Ok(user_id) => user_id,
         Err(_) => {
@@ -965,6 +993,135 @@ mod tests {
         Ok(())
     }
 
+    fn egress_envelope(host: &str) -> serde_json::Value {
+        serde_json::json!({
+            "revision": 1,
+            "spec": {
+                "llms": [{"provider": "provider-a", "model": "model-a"}],
+                "tools": [],
+                "budget": {"monthlyLimit": "50.00", "currency": "USD"},
+                "ttl": "24h",
+                "runner": {},
+                "egress": {"hosts": [{"host": host}]}
+            }
+        })
+    }
+
+    fn ceiling(hosts: &[&str]) -> axum::Extension<crate::browser_admin::CapabilityCatalog> {
+        axum::Extension(crate::browser_admin::CapabilityCatalog {
+            egress_hosts: hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+            ..crate::browser_admin::CapabilityCatalog::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn operator_template_apply_and_provision_check_egress_against_the_deployment_ceiling()
+    -> Result<(), String> {
+        let apply = |app: Router, host: &str| {
+            let body = serde_json::json!({
+                "displayName": "Default",
+                "memberRoles": ["engineer"],
+                "ceiling": egress_envelope(host),
+            })
+            .to_string();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/admin/operator/v1/templates/default/revisions/1")
+                        .header(header::AUTHORIZATION, "Bearer operator-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .map_err(|error| format!("build egress template apply: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute egress template apply: {error}"))
+            }
+        };
+        let app = || {
+            router(
+                FakeOperatorLedger::default(),
+                FakeAuthenticator { is_admin: true },
+            )
+        };
+        async fn error_of(response: Response) -> Result<(StatusCode, String), String> {
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read operator response: {error}"))?;
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("parse operator response: {error}"))?;
+            Ok((
+                status,
+                value["error"].as_str().unwrap_or_default().to_owned(),
+            ))
+        }
+        let refused = (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "capability_not_available".to_owned(),
+        );
+        assert_eq!(
+            error_of(
+                apply(
+                    app().layer(ceiling(&["feeds.example.org"])),
+                    "advisories.example.com"
+                )
+                .await?
+            )
+            .await?,
+            refused,
+            "a host outside the ceiling is refused"
+        );
+        assert_eq!(
+            error_of(apply(app(), "advisories.example.com").await?).await?,
+            refused,
+            "without a configured ceiling no egress host is available"
+        );
+        let (_, listed_error) = error_of(
+            apply(
+                app().layer(ceiling(&["advisories.example.com"])),
+                "advisories.example.com",
+            )
+            .await?,
+        )
+        .await?;
+        assert_ne!(
+            listed_error, "capability_not_available",
+            "a listed host passes the egress check and reaches the ledger"
+        );
+
+        let provision = app()
+            .layer(ceiling(&["feeds.example.org"]))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/operator/v1/envelopes/provision")
+                    .header(header::AUTHORIZATION, "Bearer operator-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+                            "templateId": "default",
+                            "templateRevision": 1,
+                            "requestedEnvelope": egress_envelope("advisories.example.com"),
+                            "idempotencyKey": "egress-provision",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build egress provision: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute egress provision: {error}"))?;
+        assert_eq!(error_of(provision).await?, refused);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn template_writes_reject_the_retired_auto_provision_threshold() -> Result<(), String> {
         let envelope = serde_json::json!({
@@ -1081,6 +1238,7 @@ mod tests {
         let ceiling: Envelope = BrowserEnvelope {
             revision: 1,
             spec: crate::user_envelopes::BrowserEnvelopeSpec {
+                egress: None,
                 llms: vec![steward_types::ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),

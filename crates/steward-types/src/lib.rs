@@ -1270,6 +1270,133 @@ pub struct ToolGrant {
     pub action: String,
 }
 
+/// A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and
+/// port. Hosts are granted only through an Envelope, within the deployment capability catalog.
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EgressHost {
+    #[schema(
+        min_length = 1,
+        max_length = 253,
+        pattern = r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    )]
+    pub host: String,
+    #[serde(default = "default_egress_port")]
+    #[schema(minimum = 1, maximum = 65535, default = 443)]
+    pub port: u16,
+}
+
+const fn default_egress_port() -> u16 {
+    443
+}
+
+/// Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,
+/// with the port always written, so the same host set always serializes to the same Envelope
+/// digest.
+#[derive(
+    Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EgressAuthority {
+    #[serde(
+        serialize_with = "serialize_sorted_egress_hosts",
+        deserialize_with = "deserialize_sorted_egress_hosts"
+    )]
+    #[schemars(with = "Vec<EgressHost>")]
+    pub hosts: Vec<EgressHost>,
+}
+
+fn serialize_sorted_egress_hosts<S>(hosts: &[EgressHost], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut sorted = hosts.iter().collect::<Vec<_>>();
+    sorted.sort();
+    sorted.serialize(serializer)
+}
+
+fn deserialize_sorted_egress_hosts<'de, D>(deserializer: D) -> Result<Vec<EgressHost>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut hosts = Vec::<EgressHost>::deserialize(deserializer)?;
+    hosts.sort();
+    Ok(hosts)
+}
+
+impl EgressHost {
+    /// Checks the hostname format only: an exact, lowercase DNS name with at least two labels,
+    /// not an IP literal, wildcard, URL or `localhost`, and a non-zero port.
+    pub fn validate(&self) -> Result<(), String> {
+        let host = self.host.as_str();
+        let refuse = |reason: &str| Err(format!("egress host {host:?} {reason}"));
+        if self.port == 0 {
+            return refuse("must use a port from 1 to 65535");
+        }
+        if host.is_empty() || host.len() > 253 {
+            return refuse("must be a DNS name of 1 to 253 characters");
+        }
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return refuse("must be a DNS name, not an IP address");
+        }
+        let labels = host.split('.').collect::<Vec<_>>();
+        if labels.len() < 2 {
+            return refuse("must be a fully qualified DNS name");
+        }
+        for label in &labels {
+            if label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return refuse(
+                    "must be an exact lowercase DNS name of letters, digits, hyphens and dots",
+                );
+            }
+        }
+        if !labels
+            .last()
+            .is_some_and(|label| label.starts_with(|first: char| first.is_ascii_lowercase()))
+        {
+            return refuse("must end in a top-level domain that starts with a letter");
+        }
+        if labels.last() == Some(&"localhost") {
+            return refuse("must be a public DNS name");
+        }
+        Ok(())
+    }
+}
+
+/// Validates a list of egress hosts: each host's format, and no repeated host and port.
+pub fn validate_egress_hosts(hosts: &[EgressHost]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for host in hosts {
+        host.validate()?;
+        if !seen.insert((host.host.as_str(), host.port)) {
+            return Err(format!(
+                "egress host {}:{} is listed more than once",
+                host.host, host.port
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Budget {

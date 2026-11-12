@@ -7,6 +7,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Envelopes, Envelope templates and Envelope requests accept an optional `egress.hosts` grant of
+  public hosts (exact DNS names, port 443 by default). It follows the rules for models and tools:
+  the capability catalog's new optional `egressHosts` is the deployment ceiling, templates may
+  grant only catalog hosts (browser authoring and the operator API), and a request is provisioned
+  automatically within its template, waits for an administrator above it, and is refused with
+  `422 capability_not_available` for a host the catalog doesn't list on every path (user requests,
+  approval, browser and operator provisioning, legacy authoring and the default template). Hosts are
+  stored sorted, so the same set keeps one digest, and an Envelope without `egress` serializes
+  exactly as before. The platform preflight accepts and validates `egressHosts`. In the web app a
+  person picks hosts from the template (none by default), and approvers and the template editor
+  see them. Migration 0077 lets a request record exceedances in all twelve admission dimensions.
+  Task sandboxes don't use the grant yet.
+
+### Changed
+
+- The apiserver now parses and validates the configured capability catalog on every start, not
+  only when browser administration or the default LLM template is enabled; the chart always
+  configures it. An invalid catalog, including `egressHosts` entries the apiserver refuses (a
+  malformed host, port 0, or the same host and port listed twice), now stops the apiserver from
+  starting. Before upgrading, confirm the catalog passes the platform preflight. The Helm schema
+  requires an explicit `port` for each `egressHosts` entry, so a host listed twice fails at
+  `helm install` or `helm upgrade` instead of at startup.
+
 ## [0.3.31] - 2026-11-11
 
 Steward v0.3.31 makes governed `kubectl` and `remote-shell` commands in the Codex reference

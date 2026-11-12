@@ -9798,6 +9798,7 @@ mod tests {
         Envelope {
             revision: 4,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "example".to_owned(),
                     model: "model-a".to_owned(),
@@ -10540,6 +10541,7 @@ mod webhook_tests {
             envelope: Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: vec![ModelRef {
                         provider: "provider-a".to_owned(),
                         model: "model-a".to_owned(),

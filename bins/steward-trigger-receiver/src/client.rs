@@ -1437,6 +1437,7 @@ mod tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: Vec::new(),
                 tools: Vec::new(),
                 budget: Budget {

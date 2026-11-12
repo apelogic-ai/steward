@@ -200,6 +200,8 @@ pub struct BrowserEnvelopeSpec {
     pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<steward_types::EgressAuthority>,
 }
 
 impl From<Envelope> for BrowserEnvelope {
@@ -214,6 +216,7 @@ impl From<Envelope> for BrowserEnvelope {
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
                 workspace: envelope.spec.workspace,
+                egress: envelope.spec.egress,
             },
         }
     }
@@ -224,6 +227,7 @@ impl From<BrowserEnvelope> for Envelope {
         Self {
             revision: envelope.revision,
             spec: steward_admission::EnvelopeSpec {
+                egress: envelope.spec.egress,
                 llms: envelope.spec.llms,
                 tools: envelope.spec.tools,
                 budget: envelope.spec.budget,
@@ -286,6 +290,7 @@ pub enum EnvelopeRequestField {
     RunnerCompute,
     RunnerStorage,
     Workspace,
+    EgressHosts,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -931,7 +936,45 @@ pub(crate) fn capability_catalog_violation_fields(
     }) {
         fields.push(EnvelopeRequestField::Tools);
     }
+    if egress_hosts_unavailable(capabilities, envelope) {
+        fields.push(EnvelopeRequestField::EgressHosts);
+    }
     fields
+}
+
+/// Hostname-format check for an egress grant, run before any catalog comparison so a malformed
+/// host is reported as invalid rather than unavailable.
+pub(crate) fn egress_format_is_valid(egress: Option<&steward_types::EgressAuthority>) -> bool {
+    egress.is_none_or(|egress| {
+        !egress.hosts.is_empty() && steward_types::validate_egress_hosts(&egress.hosts).is_ok()
+    })
+}
+
+/// The one deployment check for public egress, shared by every Envelope and template writer: a
+/// host the capability catalog's `egressHosts` doesn't list is refused with
+/// `422 capability_not_available`, field `egressHosts`.
+pub(crate) fn egress_unavailable_response(
+    capabilities: &CapabilityCatalog,
+    envelope: &Envelope,
+) -> Option<Response> {
+    egress_hosts_unavailable(capabilities, envelope).then(|| {
+        envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "capability_not_available",
+            "This deployment does not provide the requested egress hosts.",
+            vec![EnvelopeRequestField::EgressHosts],
+        )
+    })
+}
+
+/// True when the Envelope grants a public egress host the deployment catalog does not list.
+pub fn egress_hosts_unavailable(capabilities: &CapabilityCatalog, envelope: &Envelope) -> bool {
+    envelope.spec.egress.as_ref().is_some_and(|egress| {
+        egress
+            .hosts
+            .iter()
+            .any(|host| !capabilities.egress_hosts.contains(host))
+    })
 }
 
 pub(crate) fn envelope_request_error_response(
@@ -971,6 +1014,7 @@ fn envelope_request_field_label(field: EnvelopeRequestField) -> &'static str {
         EnvelopeRequestField::RunnerCompute => "runner compute",
         EnvelopeRequestField::RunnerStorage => "runner storage",
         EnvelopeRequestField::Workspace => "workspace",
+        EnvelopeRequestField::EgressHosts => "egress hosts",
     }
 }
 
@@ -1551,6 +1595,21 @@ where
     } else {
         false
     };
+    // Unlike stale model and tool entries, a public egress host outside the deployment catalog
+    // is never provisioned, even within a template.
+    if auto_provision
+        && state
+            .broker
+            .envelope_capability_violation_fields(&requested_envelope)
+            .contains(&EnvelopeRequestField::EgressHosts)
+    {
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "capability_not_available",
+            "This deployment does not provide the requested egress hosts.",
+            vec![EnvelopeRequestField::EgressHosts],
+        );
+    }
     if !auto_provision && let Some(existing) = replayed_request {
         return (
             StatusCode::CREATED,
@@ -1859,8 +1918,9 @@ mod tests {
         EnvelopeRequestField, EnvelopeRequestHistoryEvent, EnvelopeRequestStatus,
         PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeProjectionStore,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        attach_request_projection, capability_catalog_violation_fields, envelope_usage_view,
-        inner_router, inner_router_with_agents, inner_router_with_capabilities,
+        attach_request_projection, capability_catalog_violation_fields,
+        envelope_request_field_list, envelope_usage_view, inner_router, inner_router_with_agents,
+        inner_router_with_capabilities,
     };
     use crate::browser_admin::{CapabilityCatalog, CapabilityTool, ToolAccessClass};
     use crate::connections::{
@@ -2271,6 +2331,7 @@ mod tests {
         let ceiling = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),
@@ -2324,6 +2385,7 @@ mod tests {
         };
         requested.spec.tools = vec![jira_read.clone()];
         let capabilities = CapabilityCatalog {
+            egress_hosts: Vec::new(),
             schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![model],
             tools: vec![CapabilityTool {
@@ -2814,6 +2876,233 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn egress_template(hosts: &[&str]) -> AvailableEnvelopeTemplate {
+        let mut template = template();
+        template.ceiling.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+        });
+        template
+    }
+
+    async fn post_egress_request(
+        broker: TestBroker,
+        hosts: &[&str],
+        idempotency_key: &str,
+    ) -> Result<(StatusCode, serde_json::Value), String> {
+        let mut requested = template().ceiling;
+        requested.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+        });
+        let response = inner_router(broker)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": idempotency_key,
+                            "justification": "Needed to read public advisories",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build {idempotency_key} request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit {idempotency_key} request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read {idempotency_key} response: {error}"))?;
+        let value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse {idempotency_key} response: {error}"))?;
+        Ok((status, value))
+    }
+
+    #[tokio::test]
+    async fn egress_request_within_the_template_still_needs_the_catalog_host() -> Result<(), String>
+    {
+        let broker = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            capability_violation_fields: vec![EnvelopeRequestField::EgressHosts],
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            broker.clone(),
+            &["advisories.example.com"],
+            "within-not-catalog",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "lock create calls")?
+                .is_empty(),
+            "a host outside the deployment catalog must not be provisioned, even within a template"
+        );
+
+        let stale_model_catalog = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            capability_violation_fields: vec![EnvelopeRequestField::Llms],
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            stale_model_catalog,
+            &["advisories.example.com"],
+            "within-stale-model",
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "within-template requests keep tolerating a stale model catalog: {value}"
+        );
+        assert_eq!(value["request"]["status"], "provisioned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn egress_request_above_the_template_waits_for_review_or_is_refused_outside_the_catalog()
+    -> Result<(), String> {
+        let broker = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            broker,
+            &["advisories.example.com", "feeds.example.org"],
+            "above-template",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert_eq!(value["request"]["status"], "pending");
+        assert_eq!(
+            value["request"]["ceilingExceedances"],
+            serde_json::json!([{
+                "dimension": "egressHosts",
+                "requested": [{"host": "feeds.example.org", "port": 443}],
+                "ceiling": [{"host": "advisories.example.com", "port": 443}],
+            }])
+        );
+
+        let refused = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            capability_violation_fields: vec![EnvelopeRequestField::EgressHosts],
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            refused.clone(),
+            &["advisories.example.com", "other.example.net"],
+            "above-not-catalog",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert!(
+            refused
+                .create_owners
+                .lock()
+                .map_err(|_| "lock create calls")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn egress_hosts_outside_the_capability_catalog_are_unavailable() {
+        let requested = template().ceiling;
+        let catalog = CapabilityCatalog {
+            schema_version: "steward.capability-catalog/v2".to_owned(),
+            models: requested.spec.llms.clone(),
+            tools: vec![CapabilityTool {
+                provider: "github".to_owned(),
+                resource: "repository".to_owned(),
+                action: "get_file_contents".to_owned(),
+                access_class: ToolAccessClass::Read,
+                toolsets: Vec::new(),
+            }],
+            catalogs: Vec::new(),
+            egress_hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        assert!(
+            capability_catalog_violation_fields(&catalog, &requested).is_empty(),
+            "an Envelope without egress needs no egress capability"
+        );
+        let with_hosts = |hosts: &[(&str, u16)]| {
+            let mut envelope = requested.clone();
+            envelope.spec.egress = Some(steward_types::EgressAuthority {
+                hosts: hosts
+                    .iter()
+                    .map(|(host, port)| steward_types::EgressHost {
+                        host: (*host).to_owned(),
+                        port: *port,
+                    })
+                    .collect(),
+            });
+            envelope
+        };
+        assert!(
+            capability_catalog_violation_fields(
+                &catalog,
+                &with_hosts(&[("advisories.example.com", 443)])
+            )
+            .is_empty(),
+            "a listed host is available"
+        );
+        for hosts in [
+            vec![("other.example.net", 443)],
+            vec![("advisories.example.com", 8443)],
+            vec![("advisories.example.com", 443), ("other.example.net", 443)],
+        ] {
+            assert_eq!(
+                capability_catalog_violation_fields(&catalog, &with_hosts(&hosts)),
+                vec![EnvelopeRequestField::EgressHosts],
+                "hosts {hosts:?} include one the deployment does not provide"
+            );
+        }
+        let no_egress_catalog = CapabilityCatalog {
+            egress_hosts: Vec::new(),
+            ..catalog
+        };
+        assert_eq!(
+            capability_catalog_violation_fields(
+                &no_egress_catalog,
+                &with_hosts(&[("advisories.example.com", 443)])
+            ),
+            vec![EnvelopeRequestField::EgressHosts],
+            "a deployment without egress hosts provides none"
+        );
+        assert_eq!(
+            envelope_request_field_list(&[EnvelopeRequestField::EgressHosts]),
+            "egress hosts"
+        );
     }
 
     #[tokio::test]

@@ -83,6 +83,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
+mod envelope_egress;
 mod personal_agents;
 
 const RUNTIME_PATH_PREFIX: &str =
@@ -353,6 +354,7 @@ async fn publish_task_workflow(
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
@@ -1187,6 +1189,7 @@ async fn concurrent_identical_custom_and_template_provisioning_reuses_active_env
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
@@ -1352,6 +1355,7 @@ async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
     let envelope = |revision, monthly_limit: &str| Envelope {
         revision,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
@@ -1879,6 +1883,7 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: Vec::new(),
             tools: Vec::new(),
             budget: Budget {
@@ -2905,6 +2910,7 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
@@ -3190,6 +3196,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
@@ -4257,6 +4264,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),
@@ -6864,6 +6872,7 @@ async fn inference_budget_failures_persist_plain_reasons_without_retrying_reject
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
+            egress: None,
             llms: vec![ModelRef {
                 provider: "example".to_owned(),
                 model: "model-a".to_owned(),

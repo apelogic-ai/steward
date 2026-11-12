@@ -951,6 +951,10 @@ pub enum DirectAdmissionDelta {
         requested: WorkspaceAuthority,
         ceiling: Option<WorkspaceAuthority>,
     },
+    EgressHosts {
+        requested: Vec<crate::EgressHost>,
+        ceiling: Vec<crate::EgressHost>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

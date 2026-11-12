@@ -2683,6 +2683,7 @@ where
 async fn author_envelope_handler<R, L, D>(
     State(state): State<AppState<R, L, D>>,
     Extension(admin): Extension<AdminContext>,
+    capabilities: Option<Extension<browser_admin::CapabilityCatalog>>,
     Path(member_role): Path<String>,
     Json(envelope): Json<Envelope>,
 ) -> Response
@@ -2691,6 +2692,20 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
+    if !user_envelopes::egress_format_is_valid(envelope.spec.egress.as_ref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "invalid egress hosts" })),
+        )
+            .into_response();
+    }
+    let empty = browser_admin::CapabilityCatalog::default();
+    let catalog = capabilities
+        .as_ref()
+        .map_or(&empty, |Extension(catalog)| catalog);
+    if let Some(response) = user_envelopes::egress_unavailable_response(catalog, &envelope) {
+        return response;
+    }
     if member_role.is_empty() || envelope.revision <= 0 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -5790,6 +5805,37 @@ mod tests {
             .await
             .map_err(|error| format!("execute admin Envelope provision request: {error}"))?;
         assert_eq!(provisioned.status(), StatusCode::OK);
+        let unlisted_egress = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelopes/provision")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ownerUserId":"usr_0123456789abcdef0123456789abcdef","templateId":"engineer","templateRevision":3,"requestedEnvelope":{"revision":3,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"200.00","currency":"USD"},"ttl":"24h","runner":{},"egress":{"hosts":[{"host":"advisories.example.com"}]}}},"idempotencyKey":"admin-provision-unlisted-egress"}"#,
+                    ))
+                    .map_err(|error| format!("build unlisted egress provision: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unlisted egress provision: {error}"))?;
+        assert_eq!(
+            unlisted_egress.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "administrator provisioning must refuse a host the catalog doesn't list"
+        );
+        let refusal: serde_json::Value = serde_json::from_slice(
+            &to_bytes(unlisted_egress.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read unlisted egress provision: {error}"))?,
+        )
+        .map_err(|error| format!("parse unlisted egress provision: {error}"))?;
+        assert_eq!(refusal["error"], "capability_not_available");
+        assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
         let admin_provisions = admin_ledger
             .admin_provisions
             .lock()
@@ -6830,6 +6876,15 @@ mod tests {
             max_history_depth: Some(100),
             max_submodule_depth: Some(1),
         });
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
         let recorded = review_ledger.user_envelopes.clone();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
@@ -6874,11 +6929,11 @@ mod tests {
         assert_eq!(rejection["error"], "capability_not_available");
         assert_eq!(
             rejection["fields"],
-            serde_json::json!(["llms", "tools", "workspace"])
+            serde_json::json!(["llms", "tools", "egressHosts", "workspace"])
         );
         assert_eq!(
             rejection["failureReason"],
-            "This deployment does not provide the requested models, tools, workspace."
+            "This deployment does not provide the requested models, tools, egress hosts, workspace."
         );
         assert!(
             recorded
@@ -7217,6 +7272,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_envelope_authoring_checks_egress_against_the_deployment_ceiling()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let ledger = ledger();
+        let mut envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .clone();
+        envelope.revision += 1;
+        envelope.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let body = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+        let author = |app: axum::Router, body: Vec<u8>| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/envelopes/engineer")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .map_err(|error| format!("build legacy envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("legacy envelope request failed: {error}"))
+        };
+
+        let without_ceiling = author(
+            router(
+                runtimes.clone(),
+                ledger.clone(),
+                FakeAuthenticator,
+                FakeDecisionChannel::default(),
+            ),
+            body.clone(),
+        )
+        .await?;
+        assert_eq!(
+            without_ceiling.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a host outside the deployment ceiling cannot be authored"
+        );
+        let refusal: serde_json::Value = serde_json::from_slice(
+            &to_bytes(without_ceiling.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read legacy refusal: {error}"))?,
+        )
+        .map_err(|error| format!("parse legacy refusal: {error}"))?;
+        assert_eq!(refusal["error"], "capability_not_available");
+        assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
+
+        let with_ceiling = author(
+            router(
+                runtimes,
+                ledger,
+                FakeAuthenticator,
+                FakeDecisionChannel::default(),
+            )
+            .layer(axum::Extension(browser_admin::CapabilityCatalog {
+                egress_hosts: vec![steward_types::EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                }],
+                ..browser_admin::CapabilityCatalog::default()
+            })),
+            body,
+        )
+        .await?;
+        assert_eq!(with_ceiling.status(), StatusCode::CREATED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_admin_template_authoring_refuses_egress_hosts_outside_the_catalog()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let ledger = ledger();
+        let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let model = ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        };
+        let app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_admin::CapabilityCatalog {
+                schema_version: "steward.capability-catalog/v2".to_owned(),
+                models: vec![model.clone()],
+                tools: Vec::new(),
+                catalogs: Vec::new(),
+                egress_hosts: vec![steward_types::EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                }],
+            },
+            auth,
+        );
+        let mut next = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock member template")?
+            .clone();
+        next.spec.llms = vec![model];
+        next.spec.tools.clear();
+        let submit = |envelope: Envelope, label: &'static str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/api/v1/envelope-templates/engineer")
+                        .header(header::COOKIE, &cookie)
+                        .header(header::ORIGIN, origin)
+                        .header("sec-fetch-site", "same-origin")
+                        .header("x-steward-csrf", &csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
+                        ))
+                        .map_err(|error| format!("build {label} template request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("submit {label} template: {error}"))
+            }
+        };
+
+        next.revision += 1;
+        next.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let listed = submit(next.clone(), "listed-egress").await?;
+        assert_eq!(
+            listed.status(),
+            StatusCode::CREATED,
+            "a template may grant a host the capability catalog lists"
+        );
+
+        next.revision += 1;
+        next.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "other.example.net".to_owned(),
+                port: 443,
+            }],
+        });
+        let unlisted = submit(next, "unlisted-egress").await?;
+        assert_eq!(unlisted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(unlisted.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read unlisted-egress template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse unlisted-egress template response: {error}"))?;
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert_eq!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .len(),
+            1,
+            "a host outside the capability catalog cannot write a template revision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_admin_template_authoring_uses_the_descriptive_capability_catalog()
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
@@ -7234,6 +7469,7 @@ mod tests {
             ledger.clone(),
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog {
+                egress_hosts: Vec::new(),
                 schema_version: "steward.capability-catalog/v2".to_owned(),
                 models: vec![ModelRef {
                     provider: "provider-b".to_owned(),
@@ -7490,6 +7726,7 @@ mod tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),
@@ -10550,6 +10787,7 @@ mod tests {
         let envelope = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "provider-a".to_owned(),
                     model: "model-a".to_owned(),
@@ -10576,6 +10814,7 @@ mod tests {
                 ceiling: Envelope {
                     revision: 3,
                     spec: EnvelopeSpec {
+                        egress: None,
                         llms: vec![ModelRef {
                             provider: "provider-a".to_owned(),
                             model: "model-a".to_owned(),
@@ -10595,6 +10834,7 @@ mod tests {
                 auto_provision_threshold: Some(Envelope {
                     revision: 3,
                     spec: EnvelopeSpec {
+                        egress: None,
                         llms: vec![ModelRef {
                             provider: "provider-a".to_owned(),
                             model: "model-a".to_owned(),
@@ -10650,6 +10890,7 @@ mod tests {
 
     fn browser_capability_catalog() -> browser_admin::CapabilityCatalog {
         browser_admin::CapabilityCatalog {
+            egress_hosts: Vec::new(),
             schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![ModelRef {
                 provider: "provider-a".to_owned(),
@@ -10735,6 +10976,7 @@ mod tests {
             requested_envelope: Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: vec![ModelRef {
                         provider: "provider-a".to_owned(),
                         model: "model-a".to_owned(),
@@ -10754,6 +10996,7 @@ mod tests {
             template_envelope: Some(Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
+                    egress: None,
                     llms: vec![ModelRef {
                         provider: "provider-a".to_owned(),
                         model: "model-a".to_owned(),
@@ -10827,6 +11070,7 @@ mod tests {
         let approved = Envelope {
             revision: 4,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),
@@ -10888,6 +11132,7 @@ mod tests {
             .map_err(|_| "fake Envelope template ledger lock was poisoned")? = Envelope {
             revision: 7,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: vec![ModelRef {
                     provider: "openai".to_owned(),
                     model: "gpt-5.4".to_owned(),
@@ -16846,6 +17091,7 @@ mod tests {
             ledger.clone(),
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog {
+                egress_hosts: Vec::new(),
                 schema_version: "steward.capability-catalog/v2".to_owned(),
                 models: Vec::new(),
                 tools: Vec::new(),

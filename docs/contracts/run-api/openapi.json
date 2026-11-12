@@ -8075,6 +8075,16 @@
           "budget": {
             "$ref": "#/components/schemas/Budget"
           },
+          "egress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EgressAuthority"
+              }
+            ]
+          },
           "llms": {
             "type": "array",
             "items": {
@@ -8157,6 +8167,7 @@
           "compute",
           "storage",
           "workspace",
+          "egressHosts",
           "autoProvisionThreshold"
         ]
       },
@@ -10117,6 +10128,13 @@
               "$ref": "#/components/schemas/CapabilityProviderCatalog"
             }
           },
+          "egressHosts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressHost"
+            },
+            "description": "Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means\nno public egress is available; omitted when empty."
+          },
           "models": {
             "type": "array",
             "items": {
@@ -10880,6 +10898,34 @@
                 "$ref": "#/components/schemas/WorkspaceAuthority"
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "requested",
+              "ceiling",
+              "dimension"
+            ],
+            "properties": {
+              "ceiling": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/EgressHost"
+                }
+              },
+              "dimension": {
+                "type": "string",
+                "enum": [
+                  "egressHosts"
+                ]
+              },
+              "requested": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/EgressHost"
+                }
+              }
+            }
           }
         ]
       },
@@ -11278,6 +11324,45 @@
       "Duration": {
         "type": "string"
       },
+      "EgressAuthority": {
+        "type": "object",
+        "description": "Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,\nwith the port always written, so the same host set always serializes to the same Envelope\ndigest.",
+        "required": [
+          "hosts"
+        ],
+        "properties": {
+          "hosts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressHost"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "EgressHost": {
+        "type": "object",
+        "description": "A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and\nport. Hosts are granted only through an Envelope, within the deployment capability catalog.",
+        "required": [
+          "host"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "default": 443,
+            "maximum": 65535,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
       "Email": {
         "type": "string"
       },
@@ -11350,7 +11435,8 @@
           "runnerMemory",
           "runnerCompute",
           "runnerStorage",
-          "workspace"
+          "workspace",
+          "egressHosts"
         ]
       },
       "EnvelopeRequestHistoryEvent": {

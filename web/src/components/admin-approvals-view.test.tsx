@@ -235,6 +235,22 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("not auto-provisioned");
   });
 
+  test("shows the approver every requested public egress host", () => {
+    const html = renderToStaticMarkup(<EnvelopeRequestCard request={{
+      ...request,
+      requestedEnvelope: {
+        ...request.requestedEnvelope,
+        spec: {
+          ...request.requestedEnvelope.spec,
+          egress: { hosts: [{ host: "advisories.example.com", port: 443 }, { host: "feeds.example.org", port: 8443 }] },
+        },
+      },
+    }} />);
+
+    expect(html).toContain("Public egress (read-only)");
+    expect(html).toContain("advisories.example.com:443, feeds.example.org:8443");
+  });
+
   test("shows the requested access beside its exact governing template revision", () => {
     const html = renderToStaticMarkup(<EnvelopeRequestCard request={{
       ...request,

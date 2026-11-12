@@ -19,6 +19,14 @@ function authoredEnvelope() {
   };
 }
 
+describe("template egress grant", () => {
+  test("keeps the template's egress hosts when saving and highlights an egressHosts rejection", () => {
+    expect(source).toContain("...(template.spec.egress ? { egress: template.spec.egress } : {})");
+    expect(source).toContain('"workspace", "egressHosts"] as const');
+    expect(source).toContain('fieldInvalid("egressHosts")');
+  });
+});
+
 describe("first envelope template", () => {
   test("starts as an editable, least-authority version-one template", () => {
     expect(initialEnvelopeTemplate).toEqual({

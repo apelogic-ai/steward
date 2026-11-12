@@ -505,6 +505,7 @@ mod tests {
 
     fn catalog(tool_count: usize) -> CapabilityCatalog {
         CapabilityCatalog {
+            egress_hosts: Vec::new(),
             schema_version: "steward.capability-catalog/v2".to_owned(),
             models: Vec::new(),
             tools: (0..tool_count)

@@ -620,6 +620,7 @@ mod browser_rbac_tests {
         Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: Vec::new(),
                 tools: Vec::new(),
                 budget: Budget {
@@ -902,6 +903,90 @@ mod migration_tests {
                         .contains("personal agent claim attempts")
             }),
             "migration 75 must add a bounded claim counter without rewriting existing turns"
+        );
+    }
+
+    #[test]
+    fn ceiling_exceedance_bound_covers_every_admission_dimension() {
+        use super::{MAX_ENVELOPE_REQUEST_CEILING_EXCEEDANCES, grant_dimension};
+        use steward_admission::AdmissionDelta;
+        use steward_types::direct_package::{WorkspaceAuthority, WorkspaceEntryType};
+        use steward_types::{EgressHost, KubernetesQuantity, RunnerPlatform};
+        let quantity = || KubernetesQuantity("1".to_owned());
+        // One delta per dimension: grant_dimension's exhaustive match makes a new dimension
+        // fail to compile until it is listed here and the bound is raised.
+        let one_per_dimension = [
+            AdmissionDelta::Budget {
+                requested: "2".to_owned(),
+                ceiling: "1".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            AdmissionDelta::SingleRunBudget {
+                requested: None,
+                ceiling: "1".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            AdmissionDelta::RuntimeMinutes {
+                requested: None,
+                ceiling: "1".to_owned(),
+            },
+            AdmissionDelta::Ttl {
+                requested: "2h".to_owned(),
+                ceiling: "1h".to_owned(),
+            },
+            AdmissionDelta::Models {
+                requested: Vec::new(),
+                ceiling: Vec::new(),
+            },
+            AdmissionDelta::Tools {
+                requested: Vec::new(),
+                ceiling: Vec::new(),
+            },
+            AdmissionDelta::RunnerPlatforms {
+                requested: vec![RunnerPlatform::Linux],
+                ceiling: Vec::new(),
+            },
+            AdmissionDelta::RunnerMemory {
+                requested: quantity(),
+                ceiling: None,
+            },
+            AdmissionDelta::RunnerCompute {
+                requested: quantity(),
+                ceiling: None,
+            },
+            AdmissionDelta::RunnerStorage {
+                requested: quantity(),
+                ceiling: None,
+            },
+            AdmissionDelta::Workspace {
+                requested: WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git],
+                    max_total_size: None,
+                    max_files: None,
+                    max_history_depth: None,
+                    max_submodule_depth: None,
+                },
+                ceiling: None,
+            },
+            AdmissionDelta::EgressHosts {
+                requested: vec![EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                }],
+                ceiling: Vec::new(),
+            },
+        ];
+        let dimensions = one_per_dimension
+            .iter()
+            .map(grant_dimension)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(dimensions.len(), one_per_dimension.len());
+        assert_eq!(MAX_ENVELOPE_REQUEST_CEILING_EXCEEDANCES, dimensions.len());
+        let migration =
+            include_str!("../../../migrations/0077_envelope_request_egress_exceedances.sql");
+        assert!(
+            migration.contains("jsonb_array_length(ceiling_exceedances) <= 12"),
+            "the database bound must match MAX_ENVELOPE_REQUEST_CEILING_EXCEEDANCES"
         );
     }
 
@@ -5403,7 +5488,7 @@ impl PgStore {
             || request.justification.is_some_and(|value| {
                 value.trim() != value || value.is_empty() || value.chars().count() > 2_000
             })
-            || request.ceiling_exceedances.len() > 11
+            || request.ceiling_exceedances.len() > MAX_ENVELOPE_REQUEST_CEILING_EXCEEDANCES
             || (request.template_id.is_none() && !request.ceiling_exceedances.is_empty())
             || request.actor.trim().is_empty()
         {
@@ -13540,6 +13625,7 @@ mod task_execution_binding_tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
+                egress: None,
                 llms: spec.llms.clone(),
                 tools: spec.tools.clone(),
                 budget: spec.budget.clone(),
@@ -16862,6 +16948,9 @@ async fn lock_envelope_scope(
     Ok(())
 }
 
+/// One exceedance per admission dimension at most; migration 0077 holds the same bound.
+const MAX_ENVELOPE_REQUEST_CEILING_EXCEEDANCES: usize = 12;
+
 fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
     match delta {
         AdmissionDelta::Budget { .. } => "budget",
@@ -16875,5 +16964,6 @@ fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
         AdmissionDelta::RunnerCompute { .. } => "runner-compute",
         AdmissionDelta::RunnerStorage { .. } => "runner-storage",
         AdmissionDelta::Workspace { .. } => "workspace",
+        AdmissionDelta::EgressHosts { .. } => "egress-hosts",
     }
 }
