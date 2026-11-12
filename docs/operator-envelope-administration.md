@@ -43,7 +43,7 @@ but ignored for one release and emits one startup warning when set.
 
 ## Public egress grants
 
-An Envelope may grant read-only access to named public hosts with
+An Envelope may grant HTTPS access to named public hosts with
 `spec.egress.hosts`, a list of `{"host": "<exact DNS name>", "port": <1-65535>}`
 entries (the port defaults to 443). The grant follows the same rules as models
 and tools:
@@ -71,8 +71,24 @@ repeated entries are refused. Hosts are stored sorted with the port written, so
 the same host set always gives the same Envelope digest, and an Envelope without
 `egress` serializes exactly as before.
 
-This release records and admits egress grants. Task sandboxes don't use them yet;
-sandbox enforcement is added separately.
+A Task's sandbox can reach exactly the hosts its Envelope grants:
+
+- when a Task is admitted, its runtime records the Envelope's `egress` hosts
+  that the capability catalog still lists, so a host removed from the catalog
+  reaches no new Task; admission refuses a runtime that names a host its
+  Envelope doesn't grant;
+- the sandbox adapter keeps one OpenShell sandbox network rule,
+  `steward-egress`, set to exactly those hosts: each host on its port over
+  HTTPS, every HTTP method, from any binary in the sandbox;
+- every other public host is refused by OpenShell's proxy (`CONNECT` returns
+  403);
+- when the grant is removed, the rule is removed and the host is refused again.
+
+The adapter changes only the `steward-egress` rule and never touches other rules
+in the sandbox policy. Per-sandbox rules need OpenShell without a global policy:
+when a global policy is set, OpenShell refuses the update, and a Task with an
+egress grant fails to start instead of running without its hosts. Tasks without
+an egress grant are unaffected.
 
 ## Multiple active Envelopes and Task selection
 

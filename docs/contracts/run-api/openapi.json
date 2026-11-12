@@ -7450,6 +7450,17 @@
               }
             ]
           },
+          "egress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EgressAuthority",
+                "description": "Public hosts the selected Envelope grants, within the deployment capability catalog; the\nsandbox may reach only these. Omitted when absent so existing runtime-spec digests do not\nchange."
+              }
+            ]
+          },
           "llms": {
             "type": "array",
             "items": {
@@ -10133,7 +10144,7 @@
             "items": {
               "$ref": "#/components/schemas/EgressHost"
             },
-            "description": "Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means\nno public egress is available; omitted when empty."
+            "description": "Public hosts this deployment allows Envelopes to grant for egress. Empty means\nno public egress is available; omitted when empty."
           },
           "models": {
             "type": "array",
@@ -11326,7 +11337,7 @@
       },
       "EgressAuthority": {
         "type": "object",
-        "description": "Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,\nwith the port always written, so the same host set always serializes to the same Envelope\ndigest.",
+        "description": "Public egress an Envelope grants: only the listed hosts. Hosts are stored sorted,\nwith the port always written, so the same host set always serializes to the same Envelope\ndigest.",
         "required": [
           "hosts"
         ],
@@ -11342,7 +11353,7 @@
       },
       "EgressHost": {
         "type": "object",
-        "description": "A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and\nport. Hosts are granted only through an Envelope, within the deployment capability catalog.",
+        "description": "A public host a Task sandbox may reach over HTTPS, with any method: an exact DNS name and\nport. Hosts are granted only through an Envelope, within the deployment capability catalog.",
         "required": [
           "host"
         ],

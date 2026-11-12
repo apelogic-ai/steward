@@ -59,8 +59,8 @@ use steward_types::task_output_archive::{
 };
 use steward_types::{
     AgentRuntimeSpec, CallerReference, CanonicalAuthorityBinding, CanonicalPrincipal,
-    CanonicalUserId, DisposableExecutionBinding, EgressAuthority, Email, InferenceMode, ModelRef,
-    Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
+    CanonicalUserId, DisposableExecutionBinding, EgressAuthority, EgressHost, Email, InferenceMode,
+    ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -430,6 +430,9 @@ pub struct TaskApiConfig {
     inference_mode: InferenceMode,
     managed_inference_cipher: Option<ManagedInferenceKeyCipher>,
     workspace_policy: WorkspaceDeploymentPolicy,
+    /// Public hosts the deployment capability catalog lists. A Task's runtime gets only the
+    /// Envelope-granted hosts that are still in this list.
+    egress_ceiling: Vec<EgressHost>,
 }
 
 impl Default for TaskApiConfig {
@@ -446,6 +449,7 @@ impl Default for TaskApiConfig {
             inference_mode: InferenceMode::Stock,
             managed_inference_cipher: None,
             workspace_policy: WorkspaceDeploymentPolicy::default(),
+            egress_ceiling: Vec::new(),
         }
     }
 }
@@ -589,6 +593,12 @@ impl TaskApiConfig {
             }
         }
         Ok(self)
+    }
+
+    /// Sets the capability catalog's egress hosts, the ceiling for every Task runtime's egress.
+    pub fn with_egress_ceiling(mut self, hosts: Vec<EgressHost>) -> Self {
+        self.egress_ceiling = hosts;
+        self
     }
 
     pub fn with_workspace_policy_json(mut self, value: Option<&str>) -> Result<Self, String> {
@@ -846,7 +856,7 @@ fn resolve_versioned_task_plan(
     )
     .map_err(ApiError::Admission)?;
     let spec = AgentRuntimeSpec {
-        egress: approved.spec.egress.clone(),
+        egress: runtime_egress(approved.spec.egress.as_ref(), &config.egress_ceiling),
         principal: Principal::Service {
             name: identity.service.clone(),
             acting_user: identity.acting_user.clone(),
@@ -5027,7 +5037,7 @@ where
         identity,
         &definition,
         &effective_requirements,
-        approved.spec.egress.as_ref(),
+        runtime_egress(approved.spec.egress.as_ref(), &config.egress_ceiling).as_ref(),
     )?;
     let model = ModelRef {
         provider: selected_model.provider.as_str().to_owned(),
@@ -5820,7 +5830,7 @@ where
         identity,
         &definition,
         &effective_requirements,
-        approved.spec.egress.as_ref(),
+        runtime_egress(approved.spec.egress.as_ref(), &config.egress_ceiling).as_ref(),
     )?;
     let model = steward_types::ModelRef {
         provider: selected_model.provider.as_str().to_owned(),
@@ -6892,8 +6902,24 @@ fn direct_effective_requirements(
     Ok(effective)
 }
 
-/// Projects a direct Task's runtime. `egress` is the selected Envelope's grant: a Task receives
-/// every host its Envelope grants.
+/// The egress a Task runtime receives: the Envelope's granted hosts that the capability catalog
+/// still lists. A host the catalog has dropped is not given to new Tasks. `None` when nothing
+/// remains, so the runtime spec omits egress.
+fn runtime_egress(
+    grant: Option<&EgressAuthority>,
+    ceiling: &[EgressHost],
+) -> Option<EgressAuthority> {
+    let hosts = grant?
+        .hosts
+        .iter()
+        .filter(|host| ceiling.contains(host))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!hosts.is_empty()).then_some(EgressAuthority { hosts })
+}
+
+/// Projects a direct Task's runtime. `egress` is the Envelope grant within the catalog (see
+/// [`runtime_egress`]).
 fn direct_runtime_spec(
     identity: &TaskIdentity,
     definition: &DirectTaskDefinition,

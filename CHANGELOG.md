@@ -20,7 +20,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   exactly as before. The platform preflight accepts and validates `egressHosts`. In the web app a
   person picks hosts from the template (none by default), and approvers and the template editor
   see them. Migration 0077 lets a request record exceedances in all twelve admission dimensions.
-  Task sandboxes don't use the grant yet.
+- Task sandboxes enforce the Envelope `egress` grant. A Task's runtime records the Envelope's
+  hosts that the capability catalog still lists (a host the catalog drops reaches no new Task),
+  and admission refuses a runtime host the Envelope doesn't grant. The OpenShell adapter keeps one
+  sandbox network rule, `steward-egress`, set to exactly those hosts: each host on its port over
+  HTTPS with every HTTP method, from any binary in the sandbox. Every other public host is refused
+  at the proxy with `CONNECT` 403, and revoking the grant removes the rule. The adapter changes
+  only its own rule and reads the policy back to confirm it. A deployment with a global OpenShell
+  policy can't use per-sandbox rules: OpenShell refuses the update, so a Task with an egress grant
+  fails to start there instead of running without it. No provider profile, bundle or preflight
+  change is needed. Runtimes without egress serialize exactly as before, so their digests don't
+  change. The `AgentRuntime` CRD adds the optional `spec.egress` field.
 
 ### Changed
 

@@ -24,11 +24,16 @@ use kube::discovery::Discovery;
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
+use openshell_sdk::raw::proto::sandbox::v1::{
+    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+};
+#[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
-    AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxRequest,
-    ListSandboxProvidersRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
-    exec_sandbox_event,
+    AddNetworkRule, AttachSandboxProviderRequest, CreateProviderRequest,
+    DetachSandboxProviderRequest, ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest,
+    GetSandboxRequest, ListSandboxProvidersRequest, PolicyMergeOperation, RemoveNetworkRule,
+    Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, UpdateConfigRequest,
+    exec_sandbox_event, policy_merge_operation,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -61,7 +66,7 @@ use steward_types::direct_package::{
 #[cfg(feature = "runtime")]
 use steward_types::task_input_archive::split_task_input_archive;
 #[cfg(feature = "runtime")]
-use steward_types::{AgentType, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
+use steward_types::{AgentType, EgressHost, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
 #[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use tokio::sync::Mutex;
 #[cfg(feature = "runtime")]
@@ -101,6 +106,10 @@ pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
 const INFERENCE_PROVIDER: &str = "steward-litellm";
+/// The one sandbox network rule Steward owns. It lists the hosts the runtime's Envelope grants;
+/// every other rule in the sandbox policy belongs to someone else and is never changed.
+#[cfg(feature = "runtime")]
+const EGRESS_POLICY_RULE: &str = "steward-egress";
 #[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
@@ -999,6 +1008,95 @@ fn tar_string(field: &[u8]) -> Option<&str> {
     let nul = field.iter().position(|byte| *byte == 0)?;
     field[nul..].iter().all(|byte| *byte == 0).then_some(())?;
     std::str::from_utf8(&field[..nul]).ok()
+}
+
+/// The Steward egress rule for granted hosts: each host on its exact port over HTTPS, every
+/// HTTP method, from any binary in the sandbox. TLS is terminated automatically.
+#[cfg(feature = "runtime")]
+fn egress_policy_rule(hosts: &[EgressHost]) -> NetworkPolicyRule {
+    NetworkPolicyRule {
+        name: EGRESS_POLICY_RULE.to_owned(),
+        endpoints: hosts
+            .iter()
+            .map(|host| NetworkEndpoint {
+                host: host.host.clone(),
+                port: u32::from(host.port),
+                protocol: "rest".to_owned(),
+                enforcement: "enforce".to_owned(),
+                access: "full".to_owned(),
+                ..NetworkEndpoint::default()
+            })
+            .collect(),
+        binaries: vec![NetworkBinary {
+            path: "/**".to_owned(),
+            ..NetworkBinary::default()
+        }],
+    }
+}
+
+/// Whether an existing Steward rule already grants exactly `hosts` with the Steward shape.
+#[cfg(feature = "runtime")]
+fn egress_rule_matches(rule: &NetworkPolicyRule, hosts: &[EgressHost]) -> bool {
+    let endpoint_ports = |endpoint: &NetworkEndpoint| {
+        if endpoint.ports.is_empty() {
+            vec![endpoint.port]
+        } else {
+            endpoint.ports.clone()
+        }
+    };
+    let actual = rule
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| {
+            endpoint_ports(endpoint)
+                .into_iter()
+                .map(|port| (endpoint.host.clone(), port))
+        })
+        .collect::<BTreeSet<_>>();
+    let desired = hosts
+        .iter()
+        .map(|host| (host.host.clone(), u32::from(host.port)))
+        .collect::<BTreeSet<_>>();
+    actual == desired
+        && rule.endpoints.iter().all(|endpoint| {
+            endpoint.protocol == "rest"
+                && endpoint.enforcement == "enforce"
+                && endpoint.access == "full"
+                && endpoint.rules.is_empty()
+                && endpoint.allowed_ips.is_empty()
+        })
+        && rule.binaries.len() == 1
+        && rule.binaries.iter().all(|binary| binary.path == "/**")
+}
+
+/// Merge operations that bring the Steward egress rule to exactly the granted hosts: add it,
+/// replace it when it differs, or remove it when nothing is granted. Other rules are untouched.
+#[cfg(feature = "runtime")]
+fn egress_policy_operations(
+    policy: Option<&SandboxPolicy>,
+    hosts: &[EgressHost],
+) -> Vec<PolicyMergeOperation> {
+    let current = policy.and_then(|policy| policy.network_policies.get(EGRESS_POLICY_RULE));
+    let remove = || PolicyMergeOperation {
+        operation: Some(policy_merge_operation::Operation::RemoveRule(
+            RemoveNetworkRule {
+                rule_name: EGRESS_POLICY_RULE.to_owned(),
+            },
+        )),
+    };
+    let add = || PolicyMergeOperation {
+        operation: Some(policy_merge_operation::Operation::AddRule(AddNetworkRule {
+            rule_name: EGRESS_POLICY_RULE.to_owned(),
+            rule: Some(egress_policy_rule(hosts)),
+        })),
+    };
+    match current {
+        None if hosts.is_empty() => Vec::new(),
+        None => vec![add()],
+        Some(rule) if egress_rule_matches(rule, hosts) => Vec::new(),
+        Some(_) if hosts.is_empty() => vec![remove()],
+        Some(_) => vec![remove(), add()],
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -2443,6 +2541,63 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
+    async fn sandbox_policy(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+    ) -> Result<Option<SandboxPolicy>, PortError> {
+        let mut client = self.authenticated_client().await?.raw_grpc();
+        let snapshot = client
+            .get_sandbox(GetSandboxRequest {
+                name: sandbox.to_owned(),
+                workspace: workspace.to_owned(),
+            })
+            .await
+            .map_err(raw_port_failure)?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| PortError::Failed {
+                reason: "OpenShell returned an empty sandbox response".to_owned(),
+            })?;
+        Ok(snapshot.spec.and_then(|spec| spec.policy))
+    }
+
+    /// Brings the sandbox's Steward egress rule to exactly the granted hosts, then reads the
+    /// policy back to confirm it converged.
+    async fn converge_egress_policy(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        hosts: &[EgressHost],
+    ) -> Result<(), PortError> {
+        let operations = egress_policy_operations(
+            self.sandbox_policy(workspace, sandbox).await?.as_ref(),
+            hosts,
+        );
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let mut client = self.authenticated_client().await?.raw_grpc();
+        client
+            .update_config(UpdateConfigRequest {
+                name: sandbox.to_owned(),
+                merge_operations: operations,
+                workspace: workspace.to_owned(),
+                ..UpdateConfigRequest::default()
+            })
+            .await
+            .map_err(raw_port_failure)?;
+        let converged = self.sandbox_policy(workspace, sandbox).await?;
+        if egress_policy_operations(converged.as_ref(), hosts).is_empty() {
+            Ok(())
+        } else {
+            Err(PortError::Failed {
+                reason: "OpenShell sandbox egress rule did not converge to the granted hosts"
+                    .to_owned(),
+            })
+        }
+    }
+
     async fn attached_providers(
         &self,
         workspace: &str,
@@ -2756,7 +2911,15 @@ impl SandboxRuntime for OpenShellRuntime {
         }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
-            SandboxPhase::Ready => Ok(SandboxObservation::Running { refs }),
+            SandboxPhase::Ready => {
+                self.converge_egress_policy(
+                    &projection.workspace,
+                    &projection.sandbox,
+                    &request.egress,
+                )
+                .await?;
+                Ok(SandboxObservation::Running { refs })
+            }
             SandboxPhase::Error => Err(PortError::SandboxFailed),
             _ => Ok(SandboxObservation::Provisioning { refs }),
         }

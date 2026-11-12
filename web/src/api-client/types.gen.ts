@@ -187,6 +187,7 @@ export type AgentRuntimeSpec = {
     bindings?: Array<BindingRef> | null;
     budget: Budget;
     canonicalAuthority?: null | CanonicalAuthorityBinding;
+    egress?: null | EgressAuthority;
     llms: Array<ModelRef>;
     owner: Email;
     principal: Principal;
@@ -853,7 +854,7 @@ export type CanonicalUserId = string;
 export type CapabilityCatalog = {
     catalogs: Array<CapabilityProviderCatalog>;
     /**
-     * Public hosts this deployment allows Envelopes to grant for read-only egress. Empty means
+     * Public hosts this deployment allows Envelopes to grant for egress. Empty means
      * no public egress is available; omitted when empty.
      */
     egressHosts?: Array<EgressHost>;
@@ -1124,7 +1125,7 @@ export type DispatchTaskResponse = {
 export type Duration = string;
 
 /**
- * Public egress an Envelope grants: only the listed hosts, read-only. Hosts are stored sorted,
+ * Public egress an Envelope grants: only the listed hosts. Hosts are stored sorted,
  * with the port always written, so the same host set always serializes to the same Envelope
  * digest.
  */
@@ -1133,7 +1134,7 @@ export type EgressAuthority = {
 };
 
 /**
- * A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and
+ * A public host a Task sandbox may reach over HTTPS, with any method: an exact DNS name and
  * port. Hosts are granted only through an Envelope, within the deployment capability catalog.
  */
 export type EgressHost = {

@@ -72,14 +72,15 @@ spec:
                   rule: "!has(self.actingUserId) || self.actingUserId == self.ownerUserId"
               egress:
                 description: |-
-                  Public hosts the selected Envelope grants; the sandbox attaches only their egress
-                  profiles. Omitted when absent so existing runtime-spec digests do not change.
+                  Public hosts the selected Envelope grants, within the deployment capability catalog; the
+                  sandbox may reach only these. Omitted when absent so existing runtime-spec digests do not
+                  change.
                 nullable: true
                 properties:
                   hosts:
                     items:
                       description: |-
-                        A public host a Task sandbox may reach with read-only HTTP requests: an exact DNS name and
+                        A public host a Task sandbox may reach over HTTPS, with any method: an exact DNS name and
                         port. Hosts are granted only through an Envelope, within the deployment capability catalog.
                       properties:
                         host:
