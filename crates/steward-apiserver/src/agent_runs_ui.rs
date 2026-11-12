@@ -3185,6 +3185,11 @@ mod tests {
         );
 
         assert_eq!(
+            public_run_failure_reason(Some(steward_ports::SANDBOX_EGRESS_UNAVAILABLE_FAILURE)),
+            Some(steward_ports::SANDBOX_EGRESS_UNAVAILABLE_FAILURE),
+            "a sandbox that could not be given its granted hosts tells the user why the run failed"
+        );
+        assert_eq!(
             public_run_failure_reason(Some(steward_ports::TASK_TOOL_FAILURE)),
             Some("This run stopped because an approved tool could not complete the request.")
         );

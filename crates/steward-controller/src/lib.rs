@@ -7972,6 +7972,43 @@ mod tests {
     }
 
     #[test]
+    fn egress_start_failure_is_recorded_on_the_runtime_and_names_the_task_cause() {
+        let egress_refusal = super::ReconcileError::Runtime(PortError::Rejected {
+            reason: format!(
+                "{}OpenShell refused the rule: a global OpenShell policy is set",
+                steward_ports::SANDBOX_EGRESS_REJECTION_PREFIX
+            ),
+        });
+        let condition = super::start_failure_condition(&egress_refusal, 3)
+            .unwrap_or_else(|| panic!("an egress refusal must be recorded on the runtime"));
+        assert_eq!(condition.type_, steward_types::SANDBOX_EGRESS_CONDITION);
+        assert_eq!(condition.status, "False");
+        assert!(condition.message.contains("global OpenShell policy"));
+        assert!(
+            super::start_failure_condition(
+                &super::ReconcileError::Runtime(PortError::Rejected {
+                    reason: "the image digest does not match".to_owned(),
+                }),
+                3,
+            )
+            .is_none(),
+            "only egress refusals get the egress condition"
+        );
+
+        let mut failed = fixture();
+        failed.status = Some(steward_types::AgentRuntimeStatus {
+            phase: Phase::Failed,
+            observed_generation: 3,
+            spec_digest: String::new(),
+            refs: RuntimeRefs::default(),
+            conditions: vec![condition],
+            spend: None,
+        });
+        assert!(super::runtime_failed_on_egress(&failed));
+        assert!(!super::runtime_failed_on_egress(&fixture()));
+    }
+
+    #[test]
     fn exact_failed_runtime_observation_terminalizes_task_start() -> Result<(), String> {
         let mut runtime = fixture();
         runtime.spec.agent_type.name = steward_connections_v1::AGENT_TYPE.to_owned();
