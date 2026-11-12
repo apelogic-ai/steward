@@ -851,7 +851,7 @@
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["host"],
+                    "required": ["host", "port"],
                     "properties": {
                       "host": {
                         "type": "string",

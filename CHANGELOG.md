@@ -22,6 +22,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   see them. Migration 0077 lets a request record exceedances in all twelve admission dimensions.
   Task sandboxes don't use the grant yet.
 
+### Changed
+
+- The apiserver now parses and validates the configured capability catalog on every start, not
+  only when browser administration or the default LLM template is enabled; the chart always
+  configures it. An invalid catalog, including `egressHosts` entries the apiserver refuses (a
+  malformed host, port 0, or the same host and port listed twice), now stops the apiserver from
+  starting. Before upgrading, confirm the catalog passes the platform preflight. The Helm schema
+  requires an explicit `port` for each `egressHosts` entry, so a host listed twice fails at
+  `helm install` or `helm upgrade` instead of at startup.
+
 ## [0.3.31] - 2026-11-11
 
 Steward v0.3.31 makes governed `kubectl` and `remote-shell` commands in the Codex reference
