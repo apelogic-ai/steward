@@ -846,7 +846,11 @@ async fn run_egress_probe(
         execution_class: SandboxExecutionClass::Agent,
         agent_type: sandbox.agent_type.clone(),
         models: Vec::new(),
-        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), EGRESS_PROBE.to_owned()],
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            EGRESS_PROBE.to_owned(),
+        ],
         diagnostics: DiagnosticsRequest {
             execution_log: ExecutionLogMode::Full,
         },
@@ -902,7 +906,10 @@ where
 {
     let mut last = String::new();
     for attempt in 0..12_u32 {
-        let id = format!("00000000-0000-4000-8000-{:08}{:04}", attempt_prefix, attempt);
+        let id = format!(
+            "00000000-0000-4000-8000-{:08}{:04}",
+            attempt_prefix, attempt
+        );
         last = run_egress_probe(runtime, sandbox, caller_archive, &id).await?;
         if accept(&last) {
             return Ok(last);
