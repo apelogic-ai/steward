@@ -76,34 +76,40 @@ A Task's sandbox can reach exactly the hosts its Envelope grants:
 - when a Task is admitted, its runtime records the Envelope's `egress` hosts
   that the capability catalog still lists; admission refuses a runtime that
   names a host its Envelope doesn't grant;
-- the sandbox adapter keeps one OpenShell sandbox network rule,
-  `steward-egress`, set to exactly those hosts: each host on its port over
-  HTTPS, every HTTP method, from any binary in the sandbox;
-- the Task starts only after the sandbox has loaded Steward's write of that
-  rule. If OpenShell can't load it, or the load doesn't finish within 120
-  seconds, the Task fails; other writers' policy revisions never hold up or
-  fail a Task;
+- a sandbox with an egress grant is created with a Steward policy: OpenShell's
+  restrictive default filesystem and landlock settings, the `sandbox` user and
+  group, and one network rule, `steward-egress`, that allows each granted host
+  on its port over HTTPS, every HTTP method, from any binary in the sandbox;
 - every other public host is refused by OpenShell's proxy (`CONNECT` returns
   403).
 
-Like its models and tools, a Task keeps the egress it was admitted with until it
-ends. Revoking a host on the Envelope, or removing it from the catalog, applies
-to new Tasks, not to Tasks already running.
+The policy is set when the sandbox is created and never changed. Like its models
+and tools, a Task keeps the egress it was admitted with until it ends. Revoking a
+host on the Envelope, or removing it from the catalog, applies to new Tasks, not
+to Tasks already running.
 
-The adapter changes only the `steward-egress` rule, repairs drift in it, and
-never touches other rules in the sandbox policy. If another rule already covers a
-granted host and port, OpenShell would merge Steward's rule into it, so the Task
-fails instead and the reason names that rule. Per-sandbox rules need OpenShell
-without a global policy: when a global policy is set, OpenShell refuses the
-update, and a Task with an egress grant fails to start instead of running without
-its hosts. Tasks without an egress grant are unaffected.
+**Granting egress replaces the image's own sandbox policy for that sandbox,
+including the image's network rules.** Without a grant, OpenShell uses the policy
+the image ships at `/etc/openshell/policy.yaml`. The reference images' policy
+allows, for specific binaries:
 
-When a sandbox can't be given its hosts, the `AgentRuntime` status gets a
-`SandboxEgress` condition whose message carries the category (global policy,
-ambiguous endpoints, unsafe content, merge error, failed or slow load, or a
-covering rule) and OpenShell's own text. The person who started the Task sees
-"This run could not start because its sandbox could not be given the public
-hosts its Envelope grants."
+- Claude Code: api.anthropic.com, statsig.anthropic.com, sentry.io,
+  raw.githubusercontent.com and platform.claude.com;
+- git over HTTPS to github.com, and the GitHub REST API (api.github.com);
+- NVIDIA inference (integrate.api.nvidia.com);
+- GitHub Copilot, PyPI, VS Code, Cursor, opencode and npm hosts;
+- OpenAI and ChatGPT (api.openai.com, auth.openai.com and chatgpt.com).
+
+A sandbox with an egress grant can reach none of these unless its Envelope grants
+them. Models and tools still work: they reach the gateways through provider
+profiles, which OpenShell adds on top of either policy. Sandboxes without an
+egress grant keep the image's policy exactly as before.
+
+When OpenShell refuses an egress sandbox's policy, the `AgentRuntime` status gets
+a `SandboxEgress` condition with OpenShell's reason, and the person who started
+the Task sees "This run could not start because its sandbox could not be given
+the public hosts its Envelope grants." Under a global OpenShell policy, OpenShell
+runs the global policy instead, so granted hosts are not reachable.
 
 ## Multiple active Envelopes and Task selection
 
