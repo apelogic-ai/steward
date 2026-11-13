@@ -73,8 +73,8 @@ with a grant can reach only those hosts.
   its granted hosts.
 - Before upgrading, run the v0.3.32 platform preflight on your capability catalog. The apiserver
   now checks the catalog on every start and does not start when it is invalid.
-- Steward applies migration 0077 automatically. It changes no existing rows. Back up the database
-  before upgrading.
+- Steward applies migration 0077 automatically. It widens one check constraint on Envelope requests
+  and changes no existing rows. Back up the database before upgrading.
 - Deploy the chart, component images, and reference runtimes as one release unit, then update
   mirrored v0.3.31 reference runtimes and execution bindings to the v0.3.32 artifacts. The only new
   Helm value is the optional `config.apiserver.capabilityCatalog.egressHosts`; leave it unset for no
