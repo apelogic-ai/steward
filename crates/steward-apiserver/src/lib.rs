@@ -5836,6 +5836,40 @@ mod tests {
         .map_err(|error| format!("parse unlisted egress provision: {error}"))?;
         assert_eq!(refusal["error"], "capability_not_available");
         assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
+        assert_eq!(
+            refusal["failureReason"],
+            "This installation doesn't allow web access to advisories.example.com:443."
+        );
+        let malformed_egress = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelopes/provision")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ownerUserId":"usr_0123456789abcdef0123456789abcdef","templateId":"engineer","templateRevision":3,"requestedEnvelope":{"revision":3,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"200.00","currency":"USD"},"ttl":"24h","runner":{},"egress":{"hosts":[{"host":"*.example.com"}]}}},"idempotencyKey":"admin-provision-malformed-egress"}"#,
+                    ))
+                    .map_err(|error| format!("build malformed egress provision: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute malformed egress provision: {error}"))?;
+        assert_eq!(malformed_egress.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let malformed: serde_json::Value = serde_json::from_slice(
+            &to_bytes(malformed_egress.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read malformed egress provision: {error}"))?,
+        )
+        .map_err(|error| format!("parse malformed egress provision: {error}"))?;
+        assert_eq!(
+            malformed["error"], "invalid_egress_hosts",
+            "a malformed host is reported as malformed before the catalog check: {malformed}"
+        );
+        assert_eq!(malformed["fields"], serde_json::json!(["egressHosts"]));
         let admin_provisions = admin_ledger
             .admin_provisions
             .lock()
@@ -6933,7 +6967,7 @@ mod tests {
         );
         assert_eq!(
             rejection["failureReason"],
-            "This deployment does not provide the requested models, tools, egress hosts, workspace."
+            "This deployment does not provide the requested models, tools, workspace. This installation doesn't allow web access to advisories.example.com:443."
         );
         assert!(
             recorded

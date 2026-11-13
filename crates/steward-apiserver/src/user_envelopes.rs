@@ -556,6 +556,10 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         capability_catalog_violation_fields(&self.capabilities, envelope)
     }
 
+    fn unavailable_egress_hosts(&self, envelope: &Envelope) -> Vec<steward_types::EgressHost> {
+        unavailable_egress_hosts(&self.capabilities, envelope)
+    }
+
     fn templates<'a>(
         &'a self,
         session: &'a UserEnvelopeSession<BrowserSessionBinding>,
@@ -957,24 +961,81 @@ pub(crate) fn egress_unavailable_response(
     capabilities: &CapabilityCatalog,
     envelope: &Envelope,
 ) -> Option<Response> {
-    egress_hosts_unavailable(capabilities, envelope).then(|| {
-        envelope_request_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "capability_not_available",
-            "This deployment does not provide the requested egress hosts.",
-            vec![EnvelopeRequestField::EgressHosts],
-        )
-    })
+    let unavailable = unavailable_egress_hosts(capabilities, envelope);
+    (!unavailable.is_empty()).then(|| egress_refusal_response(&unavailable))
 }
 
 /// True when the Envelope grants a public egress host the deployment catalog does not list.
 pub fn egress_hosts_unavailable(capabilities: &CapabilityCatalog, envelope: &Envelope) -> bool {
-    envelope.spec.egress.as_ref().is_some_and(|egress| {
-        egress
-            .hosts
-            .iter()
-            .any(|host| !capabilities.egress_hosts.contains(host))
-    })
+    !unavailable_egress_hosts(capabilities, envelope).is_empty()
+}
+
+/// The Envelope's public egress hosts that the deployment catalog does not list, in order.
+pub(crate) fn unavailable_egress_hosts(
+    capabilities: &CapabilityCatalog,
+    envelope: &Envelope,
+) -> Vec<steward_types::EgressHost> {
+    envelope
+        .spec
+        .egress
+        .as_ref()
+        .map(|egress| {
+            egress
+                .hosts
+                .iter()
+                .filter(|host| !capabilities.egress_hosts.contains(host))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The plain-language reason for a capability-catalog refusal. Refused web access hosts are
+/// named, so the person knows which host to remove.
+pub(crate) fn capability_refusal_reason(
+    fields: &[EnvelopeRequestField],
+    unavailable_egress_hosts: &[steward_types::EgressHost],
+) -> String {
+    let other_fields = fields
+        .iter()
+        .copied()
+        .filter(|field| *field != EnvelopeRequestField::EgressHosts)
+        .collect::<Vec<_>>();
+    let mut sentences = Vec::new();
+    if !other_fields.is_empty() {
+        sentences.push(format!(
+            "This deployment does not provide the requested {}.",
+            envelope_request_field_list(&other_fields)
+        ));
+    }
+    if fields.contains(&EnvelopeRequestField::EgressHosts) {
+        sentences.push(if unavailable_egress_hosts.is_empty() {
+            "This installation doesn't allow the requested web access.".to_owned()
+        } else {
+            format!(
+                "This installation doesn't allow web access to {}.",
+                unavailable_egress_hosts
+                    .iter()
+                    .map(|host| format!("{}:{}", host.host, host.port))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+    }
+    sentences.join(" ")
+}
+
+/// `422 capability_not_available` for web access hosts the deployment catalog doesn't list.
+fn egress_refusal_response(unavailable_egress_hosts: &[steward_types::EgressHost]) -> Response {
+    envelope_request_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "capability_not_available",
+        capability_refusal_reason(
+            &[EnvelopeRequestField::EgressHosts],
+            unavailable_egress_hosts,
+        ),
+        vec![EnvelopeRequestField::EgressHosts],
+    )
 }
 
 pub(crate) fn envelope_request_error_response(
@@ -1014,7 +1075,7 @@ fn envelope_request_field_label(field: EnvelopeRequestField) -> &'static str {
         EnvelopeRequestField::RunnerCompute => "runner compute",
         EnvelopeRequestField::RunnerStorage => "runner storage",
         EnvelopeRequestField::Workspace => "workspace",
-        EnvelopeRequestField::EgressHosts => "egress hosts",
+        EnvelopeRequestField::EgressHosts => "web access hosts",
     }
 }
 
@@ -1066,9 +1127,9 @@ where
         return Err(Box::new(envelope_request_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "capability_not_available",
-            format!(
-                "This deployment does not provide the requested {}.",
-                envelope_request_field_list(&capability_fields)
+            capability_refusal_reason(
+                &capability_fields,
+                &broker.unavailable_egress_hosts(envelope),
             ),
             capability_fields,
         )));
@@ -1098,6 +1159,11 @@ where
         &self,
         _envelope: &Envelope,
     ) -> Vec<EnvelopeRequestField> {
+        Vec::new()
+    }
+
+    /// The requested web access hosts the deployment catalog doesn't list.
+    fn unavailable_egress_hosts(&self, _envelope: &Envelope) -> Vec<steward_types::EgressHost> {
         Vec::new()
     }
 
@@ -1597,18 +1663,11 @@ where
     };
     // Unlike stale model and tool entries, a public egress host outside the deployment catalog
     // is never provisioned, even within a template.
-    if auto_provision
-        && state
-            .broker
-            .envelope_capability_violation_fields(&requested_envelope)
-            .contains(&EnvelopeRequestField::EgressHosts)
-    {
-        return envelope_request_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "capability_not_available",
-            "This deployment does not provide the requested egress hosts.",
-            vec![EnvelopeRequestField::EgressHosts],
-        );
+    if auto_provision {
+        let unavailable = state.broker.unavailable_egress_hosts(&requested_envelope);
+        if !unavailable.is_empty() {
+            return egress_refusal_response(&unavailable);
+        }
     }
     if !auto_provision && let Some(existing) = replayed_request {
         return (
@@ -1620,14 +1679,7 @@ where
         )
             .into_response();
     }
-    if !auto_provision && justification.is_none() {
-        return envelope_request_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "justification_required",
-            "Justification is required for requests that need administrator approval.",
-            vec![EnvelopeRequestField::Justification],
-        );
-    }
+    // A request the deployment can't grant is refused before asking for a justification.
     if !auto_provision
         && let Err(response) = validate_capabilities(
             &state.broker,
@@ -1636,6 +1688,14 @@ where
         )
     {
         return *response;
+    }
+    if !auto_provision && justification.is_none() {
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "justification_required",
+            "Justification is required for requests that need administrator approval.",
+            vec![EnvelopeRequestField::Justification],
+        );
     }
     match state
         .broker
@@ -1918,7 +1978,7 @@ mod tests {
         EnvelopeRequestField, EnvelopeRequestHistoryEvent, EnvelopeRequestStatus,
         PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeProjectionStore,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        attach_request_projection, capability_catalog_violation_fields,
+        attach_request_projection, capability_catalog_violation_fields, capability_refusal_reason,
         envelope_request_field_list, envelope_usage_view, inner_router, inner_router_with_agents,
         inner_router_with_capabilities,
     };
@@ -1945,6 +2005,8 @@ mod tests {
         create_owners: Arc<Mutex<Vec<CanonicalUserId>>>,
         replayed_request: Arc<Mutex<Option<UserEnvelopeRequest>>>,
         capability_violation_fields: Vec<EnvelopeRequestField>,
+        /// When set, the fake enforces this catalog's web access hosts like the real broker.
+        egress_catalog: Option<Vec<steward_types::EgressHost>>,
         template_override: Option<AvailableEnvelopeTemplate>,
         steward_run_version: String,
         workflow_installation_mode: StewardRunWorkflowInstallationMode,
@@ -1957,6 +2019,7 @@ mod tests {
                 create_owners: Arc::new(Mutex::new(Vec::new())),
                 replayed_request: Arc::new(Mutex::new(None)),
                 capability_violation_fields: Vec::new(),
+                egress_catalog: None,
                 template_override: None,
                 steward_run_version: "0.7.6".to_owned(),
                 workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
@@ -1991,9 +2054,38 @@ mod tests {
 
         fn envelope_capability_violation_fields(
             &self,
-            _envelope: &Envelope,
+            envelope: &Envelope,
         ) -> Vec<EnvelopeRequestField> {
-            self.capability_violation_fields.clone()
+            let mut fields = self.capability_violation_fields.clone();
+            if !self.unavailable_egress_hosts(envelope).is_empty()
+                && !fields.contains(&EnvelopeRequestField::EgressHosts)
+            {
+                fields.push(EnvelopeRequestField::EgressHosts);
+            }
+            fields
+        }
+
+        fn unavailable_egress_hosts(&self, envelope: &Envelope) -> Vec<steward_types::EgressHost> {
+            let requested = envelope
+                .spec
+                .egress
+                .as_ref()
+                .map(|egress| egress.hosts.clone())
+                .unwrap_or_default();
+            match self.egress_catalog.as_ref() {
+                Some(catalog) => requested
+                    .into_iter()
+                    .filter(|host| !catalog.contains(host))
+                    .collect(),
+                // A configured egressHosts violation stands for a catalog that lists no host.
+                None if self
+                    .capability_violation_fields
+                    .contains(&EnvelopeRequestField::EgressHosts) =>
+                {
+                    requested
+                }
+                None => Vec::new(),
+            }
         }
 
         fn templates<'a>(
@@ -2897,6 +2989,21 @@ mod tests {
         hosts: &[&str],
         idempotency_key: &str,
     ) -> Result<(StatusCode, serde_json::Value), String> {
+        post_egress_request_with_justification(
+            broker,
+            hosts,
+            idempotency_key,
+            Some("Needed to read public advisories"),
+        )
+        .await
+    }
+
+    async fn post_egress_request_with_justification(
+        broker: TestBroker,
+        hosts: &[&str],
+        idempotency_key: &str,
+        justification: Option<&str>,
+    ) -> Result<(StatusCode, serde_json::Value), String> {
         let mut requested = template().ceiling;
         requested.spec.egress = Some(steward_types::EgressAuthority {
             hosts: hosts
@@ -2921,7 +3028,7 @@ mod tests {
                             "templateRevision": 3,
                             "requestedEnvelope": requested,
                             "idempotencyKey": idempotency_key,
-                            "justification": "Needed to read public advisories",
+                            "justification": justification,
                         })
                         .to_string(),
                     ))
@@ -3032,6 +3139,126 @@ mod tests {
         Ok(())
     }
 
+    fn egress_catalog(hosts: &[&str]) -> Option<Vec<steward_types::EgressHost>> {
+        Some(
+            hosts
+                .iter()
+                .map(|host| steward_types::EgressHost {
+                    host: (*host).to_owned(),
+                    port: 443,
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn web_access_refusal_names_only_the_host_the_catalog_does_not_list() -> Result<(), String>
+    {
+        let broker = TestBroker {
+            template_override: Some(egress_template(&[
+                "advisories.example.com",
+                "feeds.example.org",
+            ])),
+            egress_catalog: egress_catalog(&["advisories.example.com"]),
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request(
+            broker.clone(),
+            &["advisories.example.com", "feeds.example.org"],
+            "within-one-unlisted",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        assert_eq!(
+            value["failureReason"],
+            "This installation doesn't allow web access to feeds.example.org:443."
+        );
+        assert!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "lock create calls")?
+                .is_empty(),
+            "a refused web access request must not persist"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_access_outside_the_catalog_is_refused_before_asking_for_a_justification()
+    -> Result<(), String> {
+        let broker = TestBroker {
+            template_override: Some(egress_template(&["advisories.example.com"])),
+            egress_catalog: egress_catalog(&["advisories.example.com"]),
+            ..TestBroker::default()
+        };
+        let (status, value) = post_egress_request_with_justification(
+            broker.clone(),
+            &["advisories.example.com", "other.example.net"],
+            "above-unlisted-no-justification",
+            None,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        assert_eq!(
+            value["error"], "capability_not_available",
+            "a host that can't be granted is reported before the justification: {value}"
+        );
+        assert_eq!(
+            value["failureReason"],
+            "This installation doesn't allow web access to other.example.net:443."
+        );
+        assert!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "lock create calls")?
+                .is_empty()
+        );
+
+        let (status, value) = post_egress_request_with_justification(
+            broker,
+            &["advisories.example.com"],
+            "within-listed-no-justification",
+            None,
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a catalog host within the template still provisions without a justification: {value}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capability_refusal_reason_names_web_access_hosts_beside_other_fields() {
+        let hosts = egress_catalog(&["feeds.example.org", "other.example.net"]).unwrap_or_default();
+        assert_eq!(
+            capability_refusal_reason(&[EnvelopeRequestField::EgressHosts], &hosts),
+            "This installation doesn't allow web access to feeds.example.org:443, other.example.net:443."
+        );
+        assert_eq!(
+            capability_refusal_reason(
+                &[
+                    EnvelopeRequestField::Llms,
+                    EnvelopeRequestField::EgressHosts
+                ],
+                &hosts[..1]
+            ),
+            "This deployment does not provide the requested models. This installation doesn't allow web access to feeds.example.org:443."
+        );
+        assert_eq!(
+            capability_refusal_reason(
+                &[EnvelopeRequestField::Llms, EnvelopeRequestField::Tools],
+                &[]
+            ),
+            "This deployment does not provide the requested models, tools."
+        );
+    }
+
     #[test]
     fn egress_hosts_outside_the_capability_catalog_are_unavailable() {
         let requested = template().ceiling;
@@ -3101,7 +3328,7 @@ mod tests {
         );
         assert_eq!(
             envelope_request_field_list(&[EnvelopeRequestField::EgressHosts]),
-            "egress hosts"
+            "web access hosts"
         );
     }
 
