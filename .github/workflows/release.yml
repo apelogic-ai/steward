@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.31"
+          test "$version" = "0.3.32"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -962,7 +962,8 @@ jobs:
                 "0073_task_caller_reference.sql",
                 "0074_personal_agents.sql",
                 "0075_personal_agent_claim_attempts.sql",
-                "0076_agent_run_token_usage.sql"
+                "0076_agent_run_token_usage.sql",
+                "0077_envelope_request_egress_exceedances.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -970,14 +971,15 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.31 makes governed kubectl and remote-shell commands in the Codex reference sandbox reach the command gateway. After v0.3.30 they passed helper configuration but failed with CLI request failed or Remote shell request failed: the sandbox supervisor starts the helper with an empty environment, so it could not see the sandbox egress proxy and connected directly, which the sandbox refuses. The reference image now pins the checksum-verified MCP-GW 0.8.2 sandbox helper, and the wrappers pass the sandbox HTTPS_PROXY and SSL_CERT_FILE as the helper proxy and CA options. Grants, exact routes, and refusals are unchanged. CI now runs the packaged wrappers in a real OpenShell sandbox against a gateway stub that is reachable only through the proxy.\n\n'
-            printf 'The release also adds a user guide for people who run Tasks under docs/user-guide, with every JSON example checked against the Task contract in CI.\n\n'
+            printf 'Steward v0.3.32 lets Envelopes grant public hosts to Task sandboxes. The capability catalog lists the hosts an installation offers in the new optional config.apiserver.capabilityCatalog.egressHosts value. Templates grant only catalog hosts, a request within its template is provisioned automatically, a request above it waits for an administrator, and a host the catalog does not list is refused. When a Task is admitted, its runtime records the granted hosts the catalog still lists.\n\n'
+            printf 'A sandbox with an egress grant is created with a Steward policy: the OpenShell restrictive filesystem and landlock defaults, the sandbox user, and one network rule that allows each granted host over HTTPS. Every other public host is refused. The policy is set when the sandbox is created and never changed. Granting egress replaces the image\x27s own sandbox policy for that sandbox, including its network rules: such a sandbox cannot reach the hosts the reference image allows, such as api.anthropic.com, github.com, PyPI or npm, unless the Envelope grants them. Sandboxes without a grant keep the image\x27s policy exactly as before.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Deploy the chart, component images, and reference runtimes as one release unit. No database migration, Helm value, provider-profile, or MCP-GW gateway change is added; the provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later. The MCP-GW 0.8.2 helper is a sandbox-side client only. Installations still on provider-profile bundle 1.2.2 follow the documented 1.2.2 to 1.3.0 same-ID transition from the exact v0.3.31 source revision.\n\n'
-            printf 'Rolling back to v0.3.30 is an image and chart rollback with no data step, but it restores the reference image whose governed kubectl and remote-shell commands cannot reach the gateway from the sandbox.\n\n'
+            printf 'Back up the database. Apply the updated AgentRuntime CRD from this release (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, for example with kubectl apply --server-side. Helm installs CRDs from crds/ only on first install and never updates them; with the old CRD the cluster drops spec.egress from new runtimes, so a granted sandbox starts with the image\x27s policy instead of its granted hosts. Run the v0.3.32 platform preflight on the capability catalog first: the apiserver now checks the catalog on every start and does not start when it is invalid.\n\n'
+            printf 'Deploy the chart, component images, and reference runtimes as one release unit. Steward applies migration 0077 automatically; it widens one check constraint on Envelope requests and changes no existing rows. The provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later.\n\n'
+            printf 'Steward v0.3.31 does not start against a database with migration 0077 applied. To roll back, restore the pre-upgrade database backup to a new database target and point v0.3.31 at it. Records written after the upgrade are not in the backup; preserve any audit or decision records that must be retained first. Leave the updated CRD in place; v0.3.31 does not read spec.egress.\n\n'
             printf '## Required action\n\n'
-            printf 'Update mirrored v0.3.30 reference runtimes and execution bindings to the v0.3.31 artifacts.\n\n'
+            printf 'Back up the database, apply the updated AgentRuntime CRD, and run the platform preflight before upgrading. Before granting egress to an Envelope, list every host its Tasks need, including model and source hosts the image used to allow. After deployment, update mirrored v0.3.31 reference runtimes and execution bindings to the v0.3.32 artifacts.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, exact command-route and signed-target refusals, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1057,7 +1059,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.31.json
+          subject-path: dist/steward-product-compatibility-0.3.32.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1067,7 +1069,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.31.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.32.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
