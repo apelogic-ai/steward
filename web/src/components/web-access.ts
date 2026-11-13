@@ -31,11 +31,11 @@ export function provisionedEnvelope(template: BrowserEnvelope, selected: Readonl
 
 /** Template editor options: every host this installation allows, plus selected hosts it no longer allows, which can only be removed. */
 export function templateWebAccessOptions(installationHosts: ReadonlyArray<EgressHost> | null | undefined, selectedHosts: ReadonlyArray<EgressHost>): Array<TagSelectOption> {
-  const allowed = (installationHosts ?? []).map((host) => ({ key: webAccessHostKey(host), kind: "read" as const, label: webAccessHostKey(host) }));
+  const allowed = (installationHosts ?? []).map((host) => ({ key: webAccessHostKey(host), kind: "neutral" as const, label: webAccessHostKey(host) }));
   const dropped = unavailableWebAccessHosts(selectedHosts, installationHosts).map((host) => ({
     disabled: true,
     key: webAccessHostKey(host),
-    kind: "read" as const,
+    kind: "neutral" as const,
     label: webAccessHostKey(host),
     note: "Not allowed in this installation",
   }));

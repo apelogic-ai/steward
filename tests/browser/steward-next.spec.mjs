@@ -3122,6 +3122,7 @@ test("administrators and members choose web access hosts from the installation's
     const templateHosts = administrator.page.getByRole("combobox", { name: "Web access hosts" });
     const templateSection = templateHosts.locator("xpath=ancestor::section[1]");
     await expect(templateSection.getByRole("button", { name: "Remove retired.example.com:443" })).toBeVisible();
+    await expect(templateSection.getByText("Not allowed in this installation", { exact: true })).toHaveCount(1);
     await expect(administrator.page.getByText("Change them through the operator API")).toHaveCount(0);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(templateSection.getByText("Remove every web access host this installation doesn't allow.", { exact: true })).toBeVisible();
@@ -3142,6 +3143,7 @@ test("administrators and members choose web access hosts from the installation's
     await provisionHosts.fill("example");
     await expect(administrator.page.getByRole("listbox").getByRole("option")).toHaveCount(1);
     await expect(administrator.page.getByRole("listbox").getByRole("option")).toContainText("advisories.example.com:443");
+    await expect(administrator.page.getByRole("listbox").getByRole("option")).not.toContainText(/read|neutral/i);
     await provisionHosts.press("Enter");
     await administrator.page.getByRole("button", { name: "Provision envelope" }).click();
     await expect(administrator.page.getByRole("status")).toContainText("Envelope provisioned");
@@ -3160,6 +3162,7 @@ test("administrators and members choose web access hosts from the installation's
     await requestHosts.fill("example");
     await expect(developer.page.getByRole("listbox").getByRole("option")).toHaveCount(1);
     await expect(developer.page.getByRole("listbox").getByRole("option")).toContainText("advisories.example.com:443");
+    await expect(developer.page.getByRole("listbox").getByRole("option")).not.toContainText(/read|neutral/i);
     await requestHosts.press("Enter");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(new RegExp(`^${origin}/envelopes/`));

@@ -82,7 +82,7 @@ function durationExceeds(value: string, ceiling: string): boolean {
 
 function EgressHostList({ hosts }: Readonly<{ hosts?: Array<EgressHost> | null }>) {
   if (!hosts?.length) return <p className="text-sm text-muted-ink">None</p>;
-  return <GrantChipList grants={hosts.map((host) => ({ kind: "read", name: webAccessHostKey(host) }))} />;
+  return <GrantChipList grants={hosts.map((host) => ({ kind: "neutral", name: webAccessHostKey(host) }))} />;
 }
 
 export function templateRequestReviewSummary({ budget, models, runtimeMinutes, singleRunLimit, template, tools, ttl }: Readonly<{
@@ -295,7 +295,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, webAccessHo
   }
 
   const modelOptions = template.ceiling.spec.llms.map((item) => ({ key: `${item.provider}\u0000${item.model}`, kind: "model" as const, label: `${item.provider}/${item.model}` }));
-  const egressOptions = offeredWebAccessHosts.map((host) => ({ key: webAccessHostKey(host), kind: "read" as const, label: webAccessHostKey(host) }));
+  const egressOptions = offeredWebAccessHosts.map((host) => ({ key: webAccessHostKey(host), kind: "neutral" as const, label: webAccessHostKey(host) }));
   const toolOptions = template.ceiling.spec.tools.map((item) => ({ key: `${item.provider}\u0000${item.resource}\u0000${item.action}`, kind: grantKindForAction(item.action), label: `${item.provider}:${item.resource}:${item.action}` }));
   const { exceedances, requiresApproval } = templateRequestReviewSummary({ budget, models, runtimeMinutes, singleRunLimit, template, tools, ttl });
   const exceededFields = new Set(exceedances.map(({ label }) => label));

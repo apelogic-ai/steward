@@ -14,5 +14,6 @@ describe("administrator envelope provisioning", () => {
     expect(source).toContain("getAdminCapabilities");
     expect(source).toContain("allowedWebAccessHosts(template.envelope.spec.egress?.hosts, options.webAccessHosts)");
     expect(source).toContain('label="Web access hosts"');
+    expect(source).toContain('kind: "neutral" as const, label: webAccessHostKey(host)');
   });
 });

@@ -17,16 +17,19 @@ const kindClasses: Record<GrantKind, string> = {
   destructive: "bg-err-soft text-err",
 };
 
-export function GrantChip({ className, kind, name, onRemove }: Readonly<{
+export function GrantChip({ className, kind, name, note, onRemove }: Readonly<{
   className?: string;
   kind: GrantKind;
   name: string;
+  /** A short warning shown on the chip, such as why the grant can't be kept. */
+  note?: string;
   onRemove?: () => void;
 }>) {
   return (
     <span className={cn("inline-flex h-6.5 items-center gap-1.5 rounded-full px-2.5", kindClasses[kind], className)}>
       <span className="font-mono text-sm text-ink">{name}</span>
       {kind === "neutral" ? null : <span className="text-[11px] font-semibold">{kind}</span>}
+      {note ? <span className="text-[11px] font-semibold text-warn">{note}</span> : null}
       {onRemove ? (
         <button
           aria-label={`Remove ${name}`}

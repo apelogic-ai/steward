@@ -52,10 +52,11 @@ describe("web access hosts", () => {
   });
 
   test("lets a template editor add any allowed host and remove a host the installation dropped", () => {
+    // A grant allows every HTTP method, so web access hosts carry no access-class badge.
     expect(templateWebAccessOptions([advisories, feeds], [retired])).toEqual([
-      { key: "advisories.example.com:443", kind: "read", label: "advisories.example.com:443" },
-      { key: "feeds.example.com:8443", kind: "read", label: "feeds.example.com:8443" },
-      { disabled: true, key: "retired.example.com:443", kind: "read", label: "retired.example.com:443", note: "Not allowed in this installation" },
+      { key: "advisories.example.com:443", kind: "neutral", label: "advisories.example.com:443" },
+      { key: "feeds.example.com:8443", kind: "neutral", label: "feeds.example.com:8443" },
+      { disabled: true, key: "retired.example.com:443", kind: "neutral", label: "retired.example.com:443", note: "Not allowed in this installation" },
     ]);
     expect(unavailableWebAccessHosts([advisories, retired], [advisories, feeds])).toEqual([retired]);
     expect(unavailableWebAccessHosts([advisories], undefined)).toEqual([advisories]);

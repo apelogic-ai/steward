@@ -70,7 +70,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
   const idempotencyKey = useRef<string | null>(null);
   const template = options.templates.find((item) => item.id === templateId) ?? options.templates[0];
   const webAccessOptions = allowedWebAccessHosts(template.envelope.spec.egress?.hosts, options.webAccessHosts)
-    .map((host) => ({ key: webAccessHostKey(host), kind: "read" as const, label: webAccessHostKey(host) }));
+    .map((host) => ({ key: webAccessHostKey(host), kind: "neutral" as const, label: webAccessHostKey(host) }));
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

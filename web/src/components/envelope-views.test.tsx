@@ -44,7 +44,8 @@ describe("envelope run history", () => {
     expect(source).toContain("Web access");
     expect(source).not.toContain("Public egress");
     expect(source).toContain("envelope.spec.egress?.hosts");
-    expect(source).toContain("webAccessHostKey(host)");
+    expect(source).toContain('kind: "neutral", name: webAccessHostKey(host)');
+    expect(source).not.toContain('kind: "read" as const, label: webAccessHostKey(host)');
   });
 
   test("requests only the template web access hosts the person selects, none by default", () => {

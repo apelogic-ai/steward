@@ -102,7 +102,7 @@ export function TagSelect({
   return (
     <div className="relative" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
       <div className={`flex min-h-[42px] flex-wrap items-center gap-1.5 rounded-control border bg-panel px-1.5 py-[5px] ${open ? "border-brand ring-3 ring-brand-soft" : invalid ? "border-err ring-1 ring-err" : "border-field"}`}>
-        {selectedOptions.map((option) => <GrantChip key={option.key} kind={option.kind} name={option.label} onRemove={disabled ? undefined : () => remove(option.key)} />)}
+        {selectedOptions.map((option) => <GrantChip className={option.disabled ? "h-auto min-h-6.5 flex-wrap bg-warn-soft py-0.5 ring-1 ring-warn" : undefined} key={option.key} kind={option.kind} name={option.label} note={option.disabled ? option.note : undefined} onRemove={disabled ? undefined : () => remove(option.key)} />)}
         <input
           aria-activedescendant={open && visible[activeIndex] ? `${listboxId}-${activeIndex}` : undefined}
           aria-autocomplete="list"
@@ -125,7 +125,7 @@ export function TagSelect({
         <div className="absolute z-20 mt-1 max-h-72 w-full overflow-y-auto rounded-control border bg-panel p-1 shadow-lg">
           <div id={listboxId} role="listbox">
             {visible.map((option, index) => (
-              <button aria-disabled={option.disabled || undefined} aria-selected={index === activeIndex} className={`flex min-h-10 w-full items-center justify-between gap-4 rounded-control px-3 text-left text-sm ${option.disabled ? "cursor-not-allowed text-faint-ink" : index === activeIndex ? "bg-brand-soft" : "hover:bg-subtle"}`} disabled={option.disabled} id={`${listboxId}-${index}`} key={option.key} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveIndex(index)} onClick={() => choose(option)} role="option" type="button"><span className="font-mono">{option.label}</span><span className="flex items-center gap-2">{option.note ? <span className="text-xs text-muted-ink">{option.note}</span> : null}<span className="rounded-full bg-line-soft px-2 py-0.5 text-[11px] font-semibold capitalize text-muted-ink">{option.kind}</span></span></button>
+              <button aria-disabled={option.disabled || undefined} aria-selected={index === activeIndex} className={`flex min-h-10 w-full items-center justify-between gap-4 rounded-control px-3 text-left text-sm ${option.disabled ? "cursor-not-allowed text-faint-ink" : index === activeIndex ? "bg-brand-soft" : "hover:bg-subtle"}`} disabled={option.disabled} id={`${listboxId}-${index}`} key={option.key} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveIndex(index)} onClick={() => choose(option)} role="option" type="button"><span className="font-mono">{option.label}</span><span className="flex items-center gap-2">{option.note ? <span className="text-xs text-muted-ink">{option.note}</span> : null}{option.kind === "neutral" ? null : <span className="rounded-full bg-line-soft px-2 py-0.5 text-[11px] font-semibold capitalize text-muted-ink">{option.kind}</span>}</span></button>
             ))}
           </div>
           {visible.length === 0 ? <p className="px-3 py-4 text-center text-sm text-muted-ink" id={statusId} role="status">{filter ? noResultsMessage?.(filter.trim()) ?? `No match for “${filter}”` : "Everything available is selected"}</p> : null}
