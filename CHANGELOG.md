@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.32] - 2026-11-13
+
+Steward v0.3.32 lets Envelopes grant public hosts to Task sandboxes. The capability catalog lists
+the hosts an installation offers, templates and Envelopes grant hosts within it, and a sandbox
+with a grant can reach only those hosts.
+
 ### Added
 
 - Envelopes, Envelope templates and Envelope requests accept an optional `egress.hosts` grant of
@@ -53,6 +59,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   starting. Before upgrading, confirm the catalog passes the platform preflight. The Helm schema
   requires an explicit `port` for each `egressHosts` entry, so a host listed twice fails at
   `helm install` or `helm upgrade` instead of at startup.
+
+### Upgrade and rollback
+
+- **Granting egress replaces the image's own sandbox policy for that sandbox, including its network
+  rules.** A sandbox whose Envelope grants hosts can reach only those hosts, not the hosts the
+  reference image allows (for example api.anthropic.com, github.com, PyPI or npm). Grant every host
+  such a Task needs. Sandboxes without a grant keep the image's policy exactly as before.
+- Apply the updated `AgentRuntime` CRD (`charts/steward/crds/agentruntimes.yaml` from this release)
+  before upgrading the chart, for example with `kubectl apply --server-side`. Helm installs CRDs
+  from `crds/` only on first install and never updates them. With the old CRD the cluster drops
+  `spec.egress` from new runtimes, so a granted sandbox starts with the image's policy instead of
+  its granted hosts.
+- Before upgrading, run the v0.3.32 platform preflight on your capability catalog. The apiserver
+  now checks the catalog on every start and does not start when it is invalid.
+- Steward applies migration 0077 automatically. It changes no existing rows. Back up the database
+  before upgrading.
+- Deploy the chart, component images, and reference runtimes as one release unit, then update
+  mirrored v0.3.31 reference runtimes and execution bindings to the v0.3.32 artifacts. The only new
+  Helm value is the optional `config.apiserver.capabilityCatalog.egressHosts`; leave it unset for no
+  public egress. The provider-profile bundle remains 1.3.0, and remote shell still requires MCP-GW
+  v0.8.0 or later as the gateway.
+- Steward v0.3.31 does not start against a database with migration 0077 applied. To roll back,
+  restore the pre-upgrade database backup to a new database target and point v0.3.31 at it. Records
+  written after the upgrade are not in the backup; preserve any audit or decision records you must
+  keep first. Leave the updated CRD in place; v0.3.31 does not read `spec.egress`.
 
 ## [0.3.31] - 2026-11-11
 

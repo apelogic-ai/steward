@@ -1,6 +1,6 @@
 # Steward GitHub Actions generator contract
 
-Status: current contract for Steward v0.3.31, including the optional
+Status: current contract for Steward v0.3.32, including the optional
 `workflowRef` behavior.
 
 The generator turns one authoritative Steward envelope selection and one bounded task template

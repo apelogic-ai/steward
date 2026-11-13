@@ -1,4 +1,4 @@
-# Source: caller acceptance for the upcoming 0.3.31 release.
+# Source: caller acceptance for the upcoming 0.3.32 release.
 # The direct receiver scenarios use the deployed Trigger contract. The live path remains owner-only.
 @callers
 Feature: J12 - Service callers run governed work
