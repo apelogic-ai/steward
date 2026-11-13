@@ -7,6 +7,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Web access (Envelope egress) hosts can be managed in the browser, labelled
+  "Web access" (#672).
+  - The template editor adds and removes hosts from the capability catalog's
+    `egressHosts`. Before, it showed them read-only and they could be set only
+    through the operator API. A host the catalog no longer lists can be
+    removed, and the template can't be saved until it is.
+  - Administrator provisioning lets the administrator pick hosts, none by
+    default. Before, provisioning from a template granted every template host.
+  - The Envelope request form offers only template hosts the catalog still
+    lists.
+- A web access refusal (`422 capability_not_available`, field `egressHosts`)
+  now names each refused host. A request that needs review gets the
+  capability refusal before the justification check. Browser provisioning
+  refuses a malformed host with `422 invalid_egress_hosts` before checking the
+  catalog. Clients that match on the old "requested egress hosts" reason text
+  must match on the error code and fields instead.
+- `GET /app/api/v1/capabilities` now includes the catalog's `egressHosts` for
+  signed-in users. It is omitted when the catalog lists none.
+
 ## [0.3.32] - 2026-11-13
 
 Steward v0.3.32 lets Envelopes grant public hosts to Task sandboxes. The capability catalog lists

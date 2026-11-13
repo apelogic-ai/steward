@@ -483,6 +483,8 @@ async function startWeb() {
   let mutationFailures = {};
   let mutationSink;
   let decisionChannelEnabled = true;
+  // Web access hosts the installation allows. Like the real server, every writer refuses others.
+  let installationWebAccessHosts = [];
   let rerunFixtures = [];
   let rerunFixtureIndex = 0;
   let connectionStartPolls = 0;
@@ -549,6 +551,17 @@ async function startWeb() {
         if (failureStatus) {
           response.writeHead(failureStatus, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify(typeof failure === "object" && failure !== null ? (failure.body ?? {}) : {}));
+          return;
+        }
+        const submittedEnvelope = rawBody ? (JSON.parse(rawBody).envelope ?? JSON.parse(rawBody).requestedEnvelope) : null;
+        const refusedWebAccessHosts = (submittedEnvelope?.spec?.egress?.hosts ?? []).filter((host) => !installationWebAccessHosts.some((allowed) => allowed.host === host.host && (allowed.port ?? 443) === (host.port ?? 443)));
+        if (refusedWebAccessHosts.length) {
+          response.writeHead(422, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({
+            error: "capability_not_available",
+            failureReason: `This installation doesn't allow web access to ${refusedWebAccessHosts.map((host) => `${host.host}:${host.port ?? 443}`).join(", ")}.`,
+            fields: ["egressHosts"],
+          }));
           return;
         }
         if (requestUrl.pathname.endsWith("/rerun")) {
@@ -797,6 +810,7 @@ async function startWeb() {
     useMutationFailures: (failures) => { mutationFailures = failures; },
     useMutationSink: (sink) => { mutationSink = sink; },
     useDecisionChannel: (enabled) => { decisionChannelEnabled = enabled; },
+    useInstallationWebAccessHosts: (hosts) => { installationWebAccessHosts = hosts; },
     useConnectionStartFixture: ({ alwaysPending, deadlineMs, hangPoll }) => {
       connectionStartAlwaysPending = alwaysPending;
       connectionStartDeadlineMs = deadlineMs;
@@ -885,6 +899,7 @@ async function guardedPage(browser, {
     ],
   },
   adminTemplateAutoProvisionThreshold = null,
+  adminTemplateWebAccessHosts = null,
   adminTemplateModels = adminEnvelope.spec.llms,
   adminTemplateTools = adminEnvelope.spec.tools,
   adminPagination = false,
@@ -938,6 +953,7 @@ async function guardedPage(browser, {
   starterTask = starterTaskFixture,
   userEnvelopeRequests = null,
   viewport = { width: 1280, height: 800 },
+  webAccessHosts = [],
 } = {}) {
   const context = await browser.newContext({ colorScheme, viewport });
   const executionLogRequests = [];
@@ -972,6 +988,7 @@ async function guardedPage(browser, {
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
   web.useDecisionChannel(decisionChannelEnabled);
+  web.useInstallationWebAccessHosts(webAccessHosts);
   web.useConnectionStartFixture({
     alwaysPending: connectionStartPendingDeadlineMs !== null,
     deadlineMs: connectionStartPendingDeadlineMs ?? 30_000,
@@ -1077,6 +1094,7 @@ async function guardedPage(browser, {
       ],
       apiVersion: "steward.user-capabilities/v1",
       workspace: capabilityCatalog.workspace,
+      ...(webAccessHosts.length ? { egressHosts: webAccessHosts } : {}),
     });
   });
   if (connectionStartFailure) {
@@ -1093,7 +1111,7 @@ async function guardedPage(browser, {
   await context.route(`${origin}/app/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.envelope-requests/v1",
     templates: emptyCollections ? [] : [
-      { id: "analyst", displayName: "Analyst", revision: 2, ceiling: templateTools ? { ...analystEnvelope, spec: { ...analystEnvelope.spec, tools: templateTools } } : analystEnvelope, autoProvisionThreshold: null, githubConnection: "connected" },
+      { id: "analyst", displayName: "Analyst", revision: 2, ceiling: { ...analystEnvelope, spec: { ...analystEnvelope.spec, ...(templateTools ? { tools: templateTools } : {}), ...(adminTemplateWebAccessHosts ? { egress: { hosts: adminTemplateWebAccessHosts } } : {}) } }, autoProvisionThreshold: null, githubConnection: "connected" },
       { id: "developer", displayName: "Developer", revision: 4, ceiling: templateTools ? { ...envelope, spec: { ...envelope.spec, tools: templateTools } } : envelope, autoProvisionThreshold: null, githubConnection: "connected" },
     ],
   }));
@@ -1669,13 +1687,13 @@ async function guardedPage(browser, {
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
         : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], autoProvisionThreshold: adminTemplateAutoProvisionThreshold, envelope: {
           ...adminEnvelope,
-          spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools },
+          spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools, ...(adminTemplateWebAccessHosts ? { egress: { hosts: adminTemplateWebAccessHosts } } : {}) },
         } });
   });
   await context.route(`${origin}/admin/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
     templates: emptyCollections ? [] : [
-      { id: "analyst", displayName: "Analyst", memberRoles: ["analyst"], envelope: adminEnvelope, autoProvisionThreshold: null },
+      { id: "analyst", displayName: "Analyst", memberRoles: ["analyst"], envelope: adminTemplateWebAccessHosts ? { ...adminEnvelope, spec: { ...adminEnvelope.spec, egress: { hosts: adminTemplateWebAccessHosts } } } : adminEnvelope, autoProvisionThreshold: null },
       { id: "developer", displayName: "Developer", memberRoles: ["developer"], envelope, autoProvisionThreshold: null },
     ],
   }));
@@ -1821,6 +1839,7 @@ async function guardedPage(browser, {
       tools: capabilityCatalogTools,
       catalogs: capabilityCatalog.catalogs,
       workspace: capabilityCatalog.workspace,
+      ...(webAccessHosts.length ? { egressHosts: webAccessHosts } : {}),
     })
     : route.fulfill({ status: capabilityCatalogStatus, body: "" }));
   await context.route(`${origin}/admin/api/v1/workflows`, async (route) => {
@@ -3088,6 +3107,65 @@ test("administrators can provision a template envelope directly to a user", asyn
     expect(mutation.body.requestedEnvelope).toEqual(envelope);
   } finally {
     await closeGuardedPage(administrator);
+  }
+});
+
+test("administrators and members choose web access hosts from the installation's list", async ({ browser }) => {
+  const advisories = { host: "advisories.example.com", port: 443 };
+  const feeds = { host: "feeds.example.org", port: 443 };
+  const retired = { host: "retired.example.net", port: 443 };
+  const webAccess = { adminTemplateWebAccessHosts: [advisories, retired], webAccessHosts: [advisories, feeds] };
+  const administrator = await guardedPage(browser, { ...webAccess, session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const templateHosts = administrator.page.getByRole("combobox", { name: "Web access hosts" });
+    const templateSection = templateHosts.locator("xpath=ancestor::section[1]");
+    await expect(templateSection.getByRole("button", { name: "Remove retired.example.net:443" })).toBeVisible();
+    await expect(administrator.page.getByText("Change them through the operator API")).toHaveCount(0);
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect(templateSection.getByText("Remove every web access host this installation doesn't allow.", { exact: true })).toBeVisible();
+    expect(administrator.mutations.filter((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst")).toHaveLength(0);
+    await templateSection.getByRole("button", { name: "Remove retired.example.net:443" }).click();
+    await templateHosts.fill("feeds");
+    await templateHosts.press("Enter");
+    await expect(templateSection.getByRole("button", { name: "Remove feeds.example.org:443" })).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect(administrator.page.getByText("Template revision saved.", { exact: true })).toBeVisible();
+    const savedTemplate = administrator.mutations.filter((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst").at(-1);
+    expect(savedTemplate.body.envelope.spec.egress).toEqual({ hosts: [advisories, feeds] });
+
+    await administrator.page.goto(`${origin}/admin/envelopes/provision`);
+    await administrator.page.getByLabel("User ID").fill(developerSession.principal.userId);
+    await administrator.page.getByLabel("Template").selectOption("analyst");
+    const provisionHosts = administrator.page.getByRole("combobox", { name: "Web access hosts" });
+    await provisionHosts.fill("example");
+    await expect(administrator.page.getByRole("listbox").getByRole("option")).toHaveCount(1);
+    await expect(administrator.page.getByRole("listbox").getByRole("option")).toContainText("advisories.example.com:443");
+    await provisionHosts.press("Enter");
+    await administrator.page.getByRole("button", { name: "Provision envelope" }).click();
+    await expect(administrator.page.getByRole("status")).toContainText("Envelope provisioned");
+    const provision = administrator.mutations.filter((entry) => entry.path === "/admin/api/v1/envelopes/provision").at(-1);
+    expect(provision.body.templateId).toBe("analyst");
+    expect(provision.body.requestedEnvelope.spec.egress).toEqual({ hosts: [advisories] });
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+
+  const developer = await guardedPage(browser, webAccess);
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:analyst");
+    const requestHosts = developer.page.getByRole("combobox", { name: "Web access hosts" });
+    await requestHosts.fill("example");
+    await expect(developer.page.getByRole("listbox").getByRole("option")).toHaveCount(1);
+    await expect(developer.page.getByRole("listbox").getByRole("option")).toContainText("advisories.example.com:443");
+    await requestHosts.press("Enter");
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    await expect(developer.page).toHaveURL(new RegExp(`^${origin}/envelopes/`));
+    const request = developer.mutations.filter((entry) => entry.path === "/app/api/v1/envelope-requests").at(-1);
+    expect(request.body.requestedEnvelope.spec.egress).toEqual({ hosts: [advisories] });
+  } finally {
+    await closeGuardedPage(developer);
   }
 });
 
