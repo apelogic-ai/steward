@@ -29,6 +29,7 @@ import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-
 import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, durationUnit, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
+import { allowedWebAccessHosts, webAccessGrant, webAccessHostKey } from "@/components/web-access";
 import { WorkspaceAuthorityDetails } from "@/components/workspace-authority-details";
 import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft, type WorkspaceAuthorityDraft } from "@/components/workspace-authority-controls";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
@@ -81,7 +82,7 @@ function durationExceeds(value: string, ceiling: string): boolean {
 
 function EgressHostList({ hosts }: Readonly<{ hosts?: Array<EgressHost> | null }>) {
   if (!hosts?.length) return <p className="text-sm text-muted-ink">None</p>;
-  return <GrantChipList grants={hosts.map((host) => ({ kind: "read", name: `${host.host}:${host.port}` }))} />;
+  return <GrantChipList grants={hosts.map((host) => ({ kind: "read", name: webAccessHostKey(host) }))} />;
 }
 
 export function templateRequestReviewSummary({ budget, models, runtimeMinutes, singleRunLimit, template, tools, ttl }: Readonly<{
@@ -180,15 +181,16 @@ export function NewEnvelopeView() {
   const state = useApiResource<EnvelopeTemplatesResponse>(loadTemplates);
   const capabilitiesState = useApiResource<UserCapabilitiesResponse>(loadCapabilities);
   const workspaceCapabilities = capabilitiesState.status === "ready" ? capabilitiesState.value.workspace : undefined;
+  const webAccessHosts = capabilitiesState.status === "ready" ? capabilitiesState.value.egressHosts ?? [] : undefined;
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Pick an existing template and adjust it, or create your own envelope request." title="Request an envelope" />
-      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} workspaceCapabilities={workspaceCapabilities} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} webAccessHosts={webAccessHosts} workspaceCapabilities={workspaceCapabilities} />}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeRequestForm({ templates, workspaceCapabilities }: Readonly<{ templates: Array<AvailableEnvelopeTemplate>; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
+function EnvelopeRequestForm({ templates, webAccessHosts, workspaceCapabilities }: Readonly<{ templates: Array<AvailableEnvelopeTemplate>; webAccessHosts?: Array<EgressHost>; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const searchParams = useSearchParams();
   const requestedTemplate = searchParams.get("template");
   const initialTemplate = templates.find((template) => template.id === requestedTemplate) ?? templates[0];
@@ -204,13 +206,13 @@ function EnvelopeRequestForm({ templates, workspaceCapabilities }: Readonly<{ te
         </select>
       </label>
       {template
-        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} workspaceCapabilities={workspaceCapabilities} />
+        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} webAccessHosts={webAccessHosts} workspaceCapabilities={workspaceCapabilities} />
         : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} workspaceCapabilities={workspaceCapabilities} />}
     </div>
   );
 }
 
-function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
+function TemplateEnvelopeRequestForm({ onSubmittingChange, template, webAccessHosts, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate; webAccessHosts?: Array<EgressHost>; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const router = useRouter();
   const session = useSession();
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
@@ -219,8 +221,10 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
   const [ttl, setTtl] = useState(template.ceiling.spec.ttl);
   const [models, setModels] = useState(() => new Set(template.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
   const [tools, setTools] = useState(() => new Set(template.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
-  // Public egress is an explicit choice: no template host is requested until the person selects it.
+  // Web access is an explicit choice: no template host is requested until the person selects it.
   const [egressHosts, setEgressHosts] = useState<ReadonlySet<string>>(() => new Set());
+  // Only template hosts this installation still allows are offered.
+  const offeredWebAccessHosts = allowedWebAccessHosts(template.ceiling.spec.egress?.hosts, webAccessHosts);
   const [justification, setJustification] = useState("");
   const [submission, setSubmission] = useState<"idle" | "submitting" | MutationFailureState>("idle");
   const [rejectedFields, setRejectedFields] = useState<Array<EnvelopeRequestField>>([]);
@@ -250,7 +254,6 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
     setSubmission("submitting");
     setRejectedFields([]);
     onSubmittingChange(true);
-    const selectedEgressHosts = (template.ceiling.spec.egress?.hosts ?? []).filter((host) => egressHosts.has(`${host.host}:${host.port}`));
     const result = await createRequest({
       body: {
         idempotencyKey: crypto.randomUUID(),
@@ -270,7 +273,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
             ttl,
             llms: template.ceiling.spec.llms.filter((item) => models.has(`${item.provider}\u0000${item.model}`)),
             tools: template.ceiling.spec.tools.filter((item) => tools.has(`${item.provider}\u0000${item.resource}\u0000${item.action}`)),
-            egress: selectedEgressHosts.length ? { hosts: selectedEgressHosts } : undefined,
+            egress: webAccessGrant(offeredWebAccessHosts, egressHosts),
           },
         },
       },
@@ -291,7 +294,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
   }
 
   const modelOptions = template.ceiling.spec.llms.map((item) => ({ key: `${item.provider}\u0000${item.model}`, kind: "model" as const, label: `${item.provider}/${item.model}` }));
-  const egressOptions = (template.ceiling.spec.egress?.hosts ?? []).map((host) => ({ key: `${host.host}:${host.port}`, kind: "read" as const, label: `${host.host}:${host.port}` }));
+  const egressOptions = offeredWebAccessHosts.map((host) => ({ key: webAccessHostKey(host), kind: "read" as const, label: webAccessHostKey(host) }));
   const toolOptions = template.ceiling.spec.tools.map((item) => ({ key: `${item.provider}\u0000${item.resource}\u0000${item.action}`, kind: grantKindForAction(item.action), label: `${item.provider}:${item.resource}:${item.action}` }));
   const { exceedances, requiresApproval } = templateRequestReviewSummary({ budget, models, runtimeMinutes, singleRunLimit, template, tools, ttl });
   const exceededFields = new Set(exceedances.map(({ label }) => label));
@@ -324,7 +327,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
         <SectionCard className={models.size === 0 || exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect aria-invalid={models.size === 0 || rejectedFields.includes("llms") || undefined} addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" noResultsMessage={(query) => `No models in this template match “${query}”`} onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} />{models.size === 0 ? <p className="mt-2 text-sm text-err" role="alert">Select at least one model.</p> : null}</SectionCard>
         <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect aria-invalid={rejectedFields.includes("tools") || undefined} addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search tools…" label="Tools" noResultsMessage={(query) => `No tools in this template match “${query}”`} onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
         <SectionCard className={rejectedFields.includes("workspace") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("04", "Workspace access")}><div aria-invalid={rejectedFields.includes("workspace") || undefined}><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={template.ceiling.spec.workspace} /></div></SectionCard>
-        <SectionCard className={rejectedFields.includes("egressHosts") ? "border-warn ring-1 ring-warn" : undefined} title="Public egress">{egressOptions.length ? <><TagSelect aria-invalid={rejectedFields.includes("egressHosts") || undefined} addPlaceholder="Add a host…" disabled={submission === "submitting"} emptyPlaceholder="Search hosts…" label="Public egress hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setEgressHosts(new Set(next)); clearRejectedSubmission(); }} options={egressOptions} value={[...egressHosts]} /><p className="mt-3 text-xs text-muted-ink">Select only the hosts your agents need to reach. Nothing is requested unless you add it.</p></> : <p className="text-sm text-muted-ink">This template grants no public egress.</p>}</SectionCard>
+        <SectionCard className={rejectedFields.includes("egressHosts") ? "border-warn ring-1 ring-warn" : undefined} title="Web access">{egressOptions.length ? <><TagSelect aria-invalid={rejectedFields.includes("egressHosts") || undefined} addPlaceholder="Add a host…" disabled={submission === "submitting"} emptyPlaceholder="Search hosts…" label="Web access hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setEgressHosts(new Set(next)); clearRejectedSubmission(); }} options={egressOptions} value={[...egressHosts]} /><p className="mt-3 text-xs text-muted-ink">Select only the websites your agents need to reach. Nothing is requested unless you add it.</p></> : <p className="text-sm text-muted-ink">This template allows no web access.</p>}</SectionCard>
         <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">{requiresApproval ? "Justification (required for approval)" : "Justification (optional)"}<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." required={requiresApproval} value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
@@ -556,7 +559,7 @@ function EnvelopeDetail({ request, workspaceCapabilities }: Readonly<{ request: 
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Models</p><GrantChipList grants={envelope.spec.llms.map((model) => ({ kind: "model", name: `${model.provider}/${model.model}` }))} /></div>
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Tools</p><GrantChipList grants={envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.provider}:${tool.resource}:${tool.action}` }))} /></div>
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Workspace</p><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={envelope.spec.workspace} /></div>
-            <div><p className="mb-2 text-xs font-semibold text-muted-ink">Public egress</p><EgressHostList hosts={envelope.spec.egress?.hosts} /></div>
+            <div><p className="mb-2 text-xs font-semibold text-muted-ink">Web access</p><EgressHostList hosts={envelope.spec.egress?.hosts} /></div>
           </div>
         </SectionCard>
         <SectionCard title="History">

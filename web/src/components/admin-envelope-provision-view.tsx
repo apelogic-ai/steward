@@ -4,11 +4,15 @@ import Link from "next/link";
 import { useCallback, useRef, useState, type FormEvent } from "react";
 
 import {
+  getAdminCapabilities,
   listAdminEnvelopeTemplates,
   provisionAdminEnvelope,
   type BrowserEnvelopeTemplateListItem,
+  type EgressHost,
 } from "@/api-client";
+import { TagSelect } from "@/components/hs";
 import { formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
+import { allowedWebAccessHosts, provisionedEnvelope, webAccessHostKey } from "@/components/web-access";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -16,13 +20,19 @@ import { useSession } from "@/session/session-context";
 
 type ProvisionOptions = {
   templates: Array<BrowserEnvelopeTemplateListItem>;
+  /** The web access hosts this installation allows. */
+  webAccessHosts: Array<EgressHost>;
 };
 
 async function loadProvisionOptions(): Promise<{ data?: ProvisionOptions; response?: Response }> {
-  const templates = await listAdminEnvelopeTemplates({ cache: "no-store", credentials: "same-origin" });
+  const [templates, capabilities] = await Promise.all([
+    listAdminEnvelopeTemplates({ cache: "no-store", credentials: "same-origin" }),
+    getAdminCapabilities({ cache: "no-store", credentials: "same-origin" }),
+  ]);
   if (!templates.data || !templates.response?.ok) return { response: templates.response };
+  if (!capabilities.data || !capabilities.response?.ok) return { response: capabilities.response };
   return {
-    data: { templates: templates.data.templates },
+    data: { templates: templates.data.templates, webAccessHosts: capabilities.data.egressHosts ?? [] },
     response: templates.response,
   };
 }
@@ -55,8 +65,12 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
   const [templateId, setTemplateId] = useState(options.templates[0].id);
   const [status, setStatus] = useState<"idle" | "submitting" | "provisioned" | MutationFailureState>("idle");
   const [provisionedId, setProvisionedId] = useState<string | null>(null);
+  // Web access is an explicit choice: no template host is granted until the administrator picks it.
+  const [webAccessHosts, setWebAccessHosts] = useState<ReadonlySet<string>>(() => new Set());
   const idempotencyKey = useRef<string | null>(null);
   const template = options.templates.find((item) => item.id === templateId) ?? options.templates[0];
+  const webAccessOptions = allowedWebAccessHosts(template.envelope.spec.egress?.hosts, options.webAccessHosts)
+    .map((host) => ({ key: webAccessHostKey(host), kind: "read" as const, label: webAccessHostKey(host) }));
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -65,7 +79,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
       body: {
         idempotencyKey: idempotencyKey.current ??= crypto.randomUUID(),
         ownerUserId,
-        requestedEnvelope: template.envelope,
+        requestedEnvelope: provisionedEnvelope(template.envelope, webAccessHosts),
         templateId: template.id,
         templateRevision: template.envelope.revision,
       },
@@ -96,7 +110,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
           <input className="min-h-11 min-w-0 rounded-md border bg-panel px-3 font-mono font-normal" disabled={status === "submitting"} onChange={(event) => { setOwnerUserId(event.target.value); idempotencyKey.current = null; setStatus("idle"); }} placeholder="usr_…" required value={ownerUserId} />
         </label>
         <label className="grid gap-2 text-sm font-semibold">Template
-          <select className="min-h-11 min-w-0 rounded-md border bg-panel px-3 font-normal" disabled={status === "submitting"} onChange={(event) => { setTemplateId(event.target.value); idempotencyKey.current = null; setStatus("idle"); }} value={template.id}>
+          <select className="min-h-11 min-w-0 rounded-md border bg-panel px-3 font-normal" disabled={status === "submitting"} onChange={(event) => { setTemplateId(event.target.value); setWebAccessHosts(new Set()); idempotencyKey.current = null; setStatus("idle"); }} value={template.id}>
             {options.templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.envelope.revision}</option>)}
           </select>
         </label>
@@ -111,8 +125,14 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
           ["Time-to-live limit", formatDuration(template.envelope.spec.ttl)],
           ["Models", formatCount(template.envelope.spec.llms.length, "model")],
           ["Tools", formatCount(template.envelope.spec.tools.length, "tool")],
-          ["Public egress", template.envelope.spec.egress?.hosts.map((host) => `${host.host}:${host.port}`).join(", ") || "None"],
         ]} />
+      </section>
+      <section aria-labelledby="provision-web-access-title" className="space-y-3">
+        <h2 className="font-semibold" id="provision-web-access-title">Web access</h2>
+        {webAccessOptions.length ? <>
+          <TagSelect addPlaceholder="Add a host…" disabled={status === "submitting"} emptyPlaceholder="Search hosts…" label="Web access hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setWebAccessHosts(new Set(next)); idempotencyKey.current = null; setStatus("idle"); }} options={webAccessOptions} value={[...webAccessHosts]} />
+          <p className="text-sm text-muted-ink">Choose only the websites this person&apos;s agents need. Nothing is granted unless you add it.</p>
+        </> : <p className="text-sm text-muted-ink">This template allows no web access.</p>}
       </section>
       <p className="text-sm text-muted-ink">The selected user remains the owner. Your administrator identity is recorded as the person who made this change.</p>
       {status === "provisioned" ? <p className="rounded-md bg-notice p-4 text-sm" role="status"><strong>Envelope provisioned.</strong>{provisionedId ? ` Instance ${provisionedId}.` : ""}</p> : null}
