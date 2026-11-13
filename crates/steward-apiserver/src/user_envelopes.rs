@@ -1012,7 +1012,7 @@ pub(crate) fn capability_refusal_reason(
     let mut sentences = Vec::new();
     if !other_fields.is_empty() {
         sentences.push(format!(
-            "This deployment does not provide the requested {}.",
+            "This installation doesn't provide the requested {}.",
             envelope_request_field_list(&other_fields)
         ));
     }
@@ -1677,11 +1677,15 @@ where
     };
     // Unlike stale model and tool entries, a public egress host outside the deployment catalog
     // is never provisioned, even within a template.
-    if auto_provision {
-        let unavailable = state.broker.unavailable_egress_hosts(&requested_envelope);
-        if !unavailable.is_empty() {
-            return egress_refusal_response(&unavailable);
-        }
+    if auto_provision
+        && state
+            .broker
+            .envelope_capability_violation_fields(&requested_envelope)
+            .contains(&EnvelopeRequestField::EgressHosts)
+    {
+        return egress_refusal_response(
+            &state.broker.unavailable_egress_hosts(&requested_envelope),
+        );
     }
     if !auto_provision && let Some(existing) = replayed_request {
         return (
@@ -2019,7 +2023,7 @@ mod tests {
         create_owners: Arc<Mutex<Vec<CanonicalUserId>>>,
         replayed_request: Arc<Mutex<Option<UserEnvelopeRequest>>>,
         capability_violation_fields: Vec<EnvelopeRequestField>,
-        /// When set, the fake enforces this catalog's web access hosts like the real broker.
+        /// The catalog's web access hosts; unset means none, as in the real broker.
         egress_catalog: Option<Vec<steward_types::EgressHost>>,
         template_override: Option<AvailableEnvelopeTemplate>,
         steward_run_version: String,
@@ -2086,20 +2090,12 @@ mod tests {
                 .as_ref()
                 .map(|egress| egress.hosts.clone())
                 .unwrap_or_default();
-            match self.egress_catalog.as_ref() {
-                Some(catalog) => requested
-                    .into_iter()
-                    .filter(|host| !catalog.contains(host))
-                    .collect(),
-                // A configured egressHosts violation stands for a catalog that lists no host.
-                None if self
-                    .capability_violation_fields
-                    .contains(&EnvelopeRequestField::EgressHosts) =>
-                {
-                    requested
-                }
-                None => Vec::new(),
-            }
+            // Like the real broker, a fake without a catalog allows no web access host.
+            let catalog = self.egress_catalog.clone().unwrap_or_default();
+            requested
+                .into_iter()
+                .filter(|host| !catalog.contains(host))
+                .collect()
         }
 
         fn egress_hosts(&self) -> Vec<steward_types::EgressHost> {
@@ -2445,7 +2441,7 @@ mod tests {
     async fn signed_in_users_can_read_the_deployment_web_access_hosts() -> Result<(), String> {
         let response = inner_router_with_capabilities(
             TestBroker {
-                egress_catalog: egress_catalog(&["advisories.example.com", "feeds.example.org"]),
+                egress_catalog: egress_catalog(&["advisories.example.com", "feeds.example.com"]),
                 ..TestBroker::default()
             },
             Vec::new(),
@@ -2470,7 +2466,7 @@ mod tests {
             body["egressHosts"],
             serde_json::json!([
                 {"host": "advisories.example.com", "port": 443},
-                {"host": "feeds.example.org", "port": 443},
+                {"host": "feeds.example.com", "port": 443},
             ])
         );
         Ok(())
@@ -3131,6 +3127,7 @@ mod tests {
         let stale_model_catalog = TestBroker {
             template_override: Some(egress_template(&["advisories.example.com"])),
             capability_violation_fields: vec![EnvelopeRequestField::Llms],
+            egress_catalog: egress_catalog(&["advisories.example.com"]),
             ..TestBroker::default()
         };
         let (status, value) = post_egress_request(
@@ -3153,6 +3150,7 @@ mod tests {
     -> Result<(), String> {
         let broker = TestBroker {
             template_override: Some(egress_template(&["advisories.example.com"])),
+            egress_catalog: egress_catalog(&["advisories.example.com", "feeds.example.org"]),
             ..TestBroker::default()
         };
         let (status, value) = post_egress_request(
@@ -3214,14 +3212,14 @@ mod tests {
         let broker = TestBroker {
             template_override: Some(egress_template(&[
                 "advisories.example.com",
-                "feeds.example.org",
+                "feeds.example.com",
             ])),
             egress_catalog: egress_catalog(&["advisories.example.com"]),
             ..TestBroker::default()
         };
         let (status, value) = post_egress_request(
             broker.clone(),
-            &["advisories.example.com", "feeds.example.org"],
+            &["advisories.example.com", "feeds.example.com"],
             "within-one-unlisted",
         )
         .await?;
@@ -3230,7 +3228,7 @@ mod tests {
         assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
         assert_eq!(
             value["failureReason"],
-            "This installation doesn't allow web access to feeds.example.org:443."
+            "This installation doesn't allow web access to feeds.example.com:443."
         );
         assert!(
             broker
@@ -3253,7 +3251,7 @@ mod tests {
         };
         let (status, value) = post_egress_request_with_justification(
             broker.clone(),
-            &["advisories.example.com", "other.example.net"],
+            &["advisories.example.com", "other.example.com"],
             "above-unlisted-no-justification",
             None,
         )
@@ -3265,7 +3263,7 @@ mod tests {
         );
         assert_eq!(
             value["failureReason"],
-            "This installation doesn't allow web access to other.example.net:443."
+            "This installation doesn't allow web access to other.example.com:443."
         );
         assert!(
             broker
@@ -3292,10 +3290,10 @@ mod tests {
 
     #[test]
     fn capability_refusal_reason_names_web_access_hosts_beside_other_fields() {
-        let hosts = egress_catalog(&["feeds.example.org", "other.example.net"]).unwrap_or_default();
+        let hosts = egress_catalog(&["feeds.example.com", "other.example.com"]).unwrap_or_default();
         assert_eq!(
             capability_refusal_reason(&[EnvelopeRequestField::EgressHosts], &hosts),
-            "This installation doesn't allow web access to feeds.example.org:443, other.example.net:443."
+            "This installation doesn't allow web access to feeds.example.com:443, other.example.com:443."
         );
         assert_eq!(
             capability_refusal_reason(
@@ -3305,14 +3303,14 @@ mod tests {
                 ],
                 &hosts[..1]
             ),
-            "This deployment does not provide the requested models. This installation doesn't allow web access to feeds.example.org:443."
+            "This installation doesn't provide the requested models. This installation doesn't allow web access to feeds.example.com:443."
         );
         assert_eq!(
             capability_refusal_reason(
                 &[EnvelopeRequestField::Llms, EnvelopeRequestField::Tools],
                 &[]
             ),
-            "This deployment does not provide the requested models, tools."
+            "This installation doesn't provide the requested models, tools."
         );
     }
 
@@ -3490,7 +3488,7 @@ mod tests {
         );
         assert_eq!(
             value["failureReason"],
-            "This deployment does not provide the requested models, tools, workspace."
+            "This installation doesn't provide the requested models, tools, workspace."
         );
         Ok(())
     }

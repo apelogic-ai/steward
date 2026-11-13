@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { BrowserEnvelope } from "@/api-client";
-import { allowedWebAccessHosts, provisionedEnvelope, templateWebAccessOptions, unavailableWebAccessHosts, webAccessGrant, webAccessHostKey } from "./web-access";
+import { allowedWebAccessHosts, provisionedEnvelope, templateWebAccessOptions, unavailableWebAccessHosts, webAccessEmptyMessage, webAccessGrant, webAccessHostKey } from "./web-access";
 
 const advisories = { host: "advisories.example.com", port: 443 };
 const feeds = { host: "feeds.example.com", port: 8443 };
@@ -59,5 +59,14 @@ describe("web access hosts", () => {
     ]);
     expect(unavailableWebAccessHosts([advisories, retired], [advisories, feeds])).toEqual([retired]);
     expect(unavailableWebAccessHosts([advisories], undefined)).toEqual([advisories]);
+  });
+
+  test("explains why no web access host is offered", () => {
+    expect(webAccessEmptyMessage([advisories], [advisories], [advisories], false)).toBeNull();
+    expect(webAccessEmptyMessage([], [], [advisories], false)).toBe("This template allows no web access.");
+    expect(webAccessEmptyMessage(undefined, [], undefined, true)).toBe("This template allows no web access.");
+    expect(webAccessEmptyMessage([retired], [], [advisories], false)).toBe("This installation no longer allows this template's web access hosts.");
+    expect(webAccessEmptyMessage([advisories], [], undefined, true)).toBe("Loading web access hosts…");
+    expect(webAccessEmptyMessage([advisories], [], undefined, false)).toBe("Web access hosts couldn't be loaded. Reload the page to try again.");
   });
 });

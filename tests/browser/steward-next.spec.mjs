@@ -483,7 +483,8 @@ async function startWeb() {
   let mutationFailures = {};
   let mutationSink;
   let decisionChannelEnabled = true;
-  // Web access hosts the installation allows. Like the real server, every writer refuses others.
+  // Web access hosts the installation allows. Like the real server, every Envelope or template
+  // submission refuses other hosts (the approve path is not modelled).
   let installationWebAccessHosts = [];
   let rerunFixtures = [];
   let rerunFixtureIndex = 0;
@@ -2914,7 +2915,7 @@ test("a template without a runtime limit still accepts an optional runtime limit
 });
 
 test("a capability rejection identifies the field and clears after correction", async ({ browser }) => {
-  const failureReason = "This deployment does not provide the requested models.";
+  const failureReason = "This installation doesn't provide the requested models.";
   const developer = await guardedPage(browser, {
     expectedHttpStatuses: [422],
     mutationFailures: {

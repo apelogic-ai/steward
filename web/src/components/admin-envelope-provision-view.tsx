@@ -12,7 +12,7 @@ import {
 } from "@/api-client";
 import { TagSelect } from "@/components/hs";
 import { formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
-import { allowedWebAccessHosts, provisionedEnvelope, webAccessHostKey } from "@/components/web-access";
+import { allowedWebAccessHosts, provisionedEnvelope, webAccessEmptyMessage, webAccessHostKey } from "@/components/web-access";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -132,7 +132,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
         {webAccessOptions.length ? <>
           <TagSelect addPlaceholder="Add a host…" disabled={status === "submitting"} emptyPlaceholder="Search hosts…" label="Web access hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setWebAccessHosts(new Set(next)); idempotencyKey.current = null; setStatus("idle"); }} options={webAccessOptions} value={[...webAccessHosts]} />
           <p className="text-sm text-muted-ink">Choose only the websites this person&apos;s agents need. Nothing is granted unless you add it.</p>
-        </> : <p className="text-sm text-muted-ink">This template allows no web access.</p>}
+        </> : <p className="text-sm text-muted-ink">{webAccessEmptyMessage(template.envelope.spec.egress?.hosts, [], options.webAccessHosts, false)}</p>}
       </section>
       <p className="text-sm text-muted-ink">The selected user remains the owner. Your administrator identity is recorded as the person who made this change.</p>
       {status === "provisioned" ? <p className="rounded-md bg-notice p-4 text-sm" role="status"><strong>Envelope provisioned.</strong>{provisionedId ? ` Instance ${provisionedId}.` : ""}</p> : null}

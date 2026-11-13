@@ -29,7 +29,7 @@ import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-
 import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, durationUnit, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
-import { allowedWebAccessHosts, webAccessGrant, webAccessHostKey } from "@/components/web-access";
+import { allowedWebAccessHosts, webAccessEmptyMessage, webAccessGrant, webAccessHostKey } from "@/components/web-access";
 import { WorkspaceAuthorityDetails } from "@/components/workspace-authority-details";
 import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft, type WorkspaceAuthorityDraft } from "@/components/workspace-authority-controls";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
@@ -182,15 +182,16 @@ export function NewEnvelopeView() {
   const capabilitiesState = useApiResource<UserCapabilitiesResponse>(loadCapabilities);
   const workspaceCapabilities = capabilitiesState.status === "ready" ? capabilitiesState.value.workspace : undefined;
   const webAccessHosts = capabilitiesState.status === "ready" ? capabilitiesState.value.egressHosts ?? [] : undefined;
+  const webAccessLoading = capabilitiesState.status === "loading";
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Pick an existing template and adjust it, or create your own envelope request." title="Request an envelope" />
-      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} webAccessHosts={webAccessHosts} workspaceCapabilities={workspaceCapabilities} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} webAccessHosts={webAccessHosts} webAccessLoading={webAccessLoading} workspaceCapabilities={workspaceCapabilities} />}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeRequestForm({ templates, webAccessHosts, workspaceCapabilities }: Readonly<{ templates: Array<AvailableEnvelopeTemplate>; webAccessHosts?: Array<EgressHost>; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
+function EnvelopeRequestForm({ templates, webAccessHosts, webAccessLoading, workspaceCapabilities }: Readonly<{ templates: Array<AvailableEnvelopeTemplate>; webAccessHosts?: Array<EgressHost>; webAccessLoading: boolean; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const searchParams = useSearchParams();
   const requestedTemplate = searchParams.get("template");
   const initialTemplate = templates.find((template) => template.id === requestedTemplate) ?? templates[0];
@@ -206,13 +207,13 @@ function EnvelopeRequestForm({ templates, webAccessHosts, workspaceCapabilities 
         </select>
       </label>
       {template
-        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} webAccessHosts={webAccessHosts} workspaceCapabilities={workspaceCapabilities} />
+        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} webAccessHosts={webAccessHosts} webAccessLoading={webAccessLoading} workspaceCapabilities={workspaceCapabilities} />
         : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} workspaceCapabilities={workspaceCapabilities} />}
     </div>
   );
 }
 
-function TemplateEnvelopeRequestForm({ onSubmittingChange, template, webAccessHosts, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate; webAccessHosts?: Array<EgressHost>; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
+function TemplateEnvelopeRequestForm({ onSubmittingChange, template, webAccessHosts, webAccessLoading, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate; webAccessHosts?: Array<EgressHost>; webAccessLoading: boolean; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const router = useRouter();
   const session = useSession();
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
@@ -327,7 +328,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, webAccessHo
         <SectionCard className={models.size === 0 || exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect aria-invalid={models.size === 0 || rejectedFields.includes("llms") || undefined} addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" noResultsMessage={(query) => `No models in this template match “${query}”`} onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} />{models.size === 0 ? <p className="mt-2 text-sm text-err" role="alert">Select at least one model.</p> : null}</SectionCard>
         <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect aria-invalid={rejectedFields.includes("tools") || undefined} addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search tools…" label="Tools" noResultsMessage={(query) => `No tools in this template match “${query}”`} onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
         <SectionCard className={rejectedFields.includes("workspace") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("04", "Workspace access")}><div aria-invalid={rejectedFields.includes("workspace") || undefined}><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={template.ceiling.spec.workspace} /></div></SectionCard>
-        <SectionCard className={rejectedFields.includes("egressHosts") ? "border-warn ring-1 ring-warn" : undefined} title="Web access">{egressOptions.length ? <><TagSelect aria-invalid={rejectedFields.includes("egressHosts") || undefined} addPlaceholder="Add a host…" disabled={submission === "submitting"} emptyPlaceholder="Search hosts…" label="Web access hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setEgressHosts(new Set(next)); clearRejectedSubmission(); }} options={egressOptions} value={[...egressHosts]} /><p className="mt-3 text-xs text-muted-ink">Select only the websites your agents need to reach. Nothing is requested unless you add it.</p></> : <p className="text-sm text-muted-ink">This template allows no web access.</p>}</SectionCard>
+        <SectionCard className={rejectedFields.includes("egressHosts") ? "border-warn ring-1 ring-warn" : undefined} title="Web access">{egressOptions.length ? <><TagSelect aria-invalid={rejectedFields.includes("egressHosts") || undefined} addPlaceholder="Add a host…" disabled={submission === "submitting"} emptyPlaceholder="Search hosts…" label="Web access hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setEgressHosts(new Set(next)); clearRejectedSubmission(); }} options={egressOptions} value={[...egressHosts]} /><p className="mt-3 text-xs text-muted-ink">Select only the websites your agents need to reach. Nothing is requested unless you add it.</p></> : <p className="text-sm text-muted-ink">{webAccessEmptyMessage(template.ceiling.spec.egress?.hosts, offeredWebAccessHosts, webAccessHosts, webAccessLoading)}</p>}</SectionCard>
         <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">{requiresApproval ? "Justification (required for approval)" : "Justification (optional)"}<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." required={requiresApproval} value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">

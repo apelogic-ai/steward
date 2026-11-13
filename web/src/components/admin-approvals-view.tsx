@@ -69,7 +69,7 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec, workspaceDeployment?:
     ["Runner compute", runner?.compute ?? "Not set"],
     ["Runner storage", runner?.storage ?? "Not set"],
     ["Workspace", <WorkspaceAuthorityDetails deployment={workspaceDeployment} key="workspace" showDeploymentFallback workspace={spec.workspace} />],
-    ["Public egress", spec.egress?.hosts.map((host) => `${host.host}:${host.port}`).join(", ") || "None"],
+    ["Web access", spec.egress?.hosts.map((host) => `${host.host}:${host.port}`).join(", ") || "None"],
   ];
 }
 
@@ -213,7 +213,7 @@ function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]):
     runnerCompute: "Compute",
     runnerStorage: "Storage",
     workspace: "Workspace",
-    egressHosts: "Egress hosts",
+    egressHosts: "Web access hosts",
   }[dimension];
 }
 

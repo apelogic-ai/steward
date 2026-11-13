@@ -247,7 +247,8 @@ describe("envelope request approval controls", () => {
       },
     }} />);
 
-    expect(html).toContain("Public egress");
+    expect(html).toContain("Web access");
+    expect(html).not.toContain("Public egress");
     expect(html).toContain("advisories.example.com:443, feeds.example.org:8443");
   });
 

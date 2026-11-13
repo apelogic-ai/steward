@@ -18,14 +18,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - Administrator provisioning lets the administrator pick hosts, none by
     default. Before, provisioning from a template granted every template host.
   - The Envelope request form offers only template hosts the catalog still
-    lists.
+    lists, and says why when it offers none. The provisioning page now also
+    loads `GET /admin/api/v1/capabilities`.
+  - Approval and request-summary labels say "Web access" instead of "Public
+    egress" and "Egress hosts".
 - A web access refusal (`422 capability_not_available`, field `egressHosts`)
-  now names each refused host. A request that needs review gets the
-  capability refusal before the justification check. Browser provisioning
-  refuses a malformed host with `422 invalid_egress_hosts` before checking the
-  catalog. Clients that match on the old "requested egress hosts" reason text
-  must match on the error code and fields instead.
-- `GET /app/api/v1/capabilities` now includes the catalog's `egressHosts` for
+  now names each refused host, on every write path. A request that needs
+  review gets the capability refusal before the justification check. Browser
+  provisioning refuses a malformed host with `422 invalid_egress_hosts` before
+  checking the catalog. Capability refusal reasons now read "This installation
+  doesn't provide the requested …" instead of "This deployment does not
+  provide the requested …". Clients that match on reason text must match on
+  the error code and fields instead.
+
+### Added
+
+- `GET /app/api/v1/capabilities` includes the catalog's `egressHosts` for
   signed-in users. It is omitted when the catalog lists none.
 
 ## [0.3.32] - 2026-11-13

@@ -47,3 +47,11 @@ export function unavailableWebAccessHosts(selectedHosts: ReadonlyArray<EgressHos
   const allowed = hostKeys(installationHosts);
   return selectedHosts.filter((host) => !allowed.has(webAccessHostKey(host)));
 }
+
+/** Why no web access host is offered, or null when some are. Undefined installation hosts mean they haven't loaded. */
+export function webAccessEmptyMessage(templateHosts: ReadonlyArray<EgressHost> | null | undefined, offeredHosts: ReadonlyArray<EgressHost>, installationHosts: ReadonlyArray<EgressHost> | null | undefined, loading: boolean): string | null {
+  if (offeredHosts.length) return null;
+  if (!templateHosts?.length) return "This template allows no web access.";
+  if (installationHosts === undefined || installationHosts === null) return loading ? "Loading web access hosts…" : "Web access hosts couldn't be loaded. Reload the page to try again.";
+  return "This installation no longer allows this template's web access hosts.";
+}

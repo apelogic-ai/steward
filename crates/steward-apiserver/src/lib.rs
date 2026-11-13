@@ -6967,7 +6967,7 @@ mod tests {
         );
         assert_eq!(
             rejection["failureReason"],
-            "This deployment does not provide the requested models, tools, workspace. This installation doesn't allow web access to advisories.example.com:443."
+            "This installation doesn't provide the requested models, tools, workspace. This installation doesn't allow web access to advisories.example.com:443."
         );
         assert!(
             recorded
