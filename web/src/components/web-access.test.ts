@@ -4,8 +4,8 @@ import type { BrowserEnvelope } from "@/api-client";
 import { allowedWebAccessHosts, provisionedEnvelope, templateWebAccessOptions, unavailableWebAccessHosts, webAccessGrant, webAccessHostKey } from "./web-access";
 
 const advisories = { host: "advisories.example.com", port: 443 };
-const feeds = { host: "feeds.example.org", port: 8443 };
-const retired = { host: "retired.example.net", port: 443 };
+const feeds = { host: "feeds.example.com", port: 8443 };
+const retired = { host: "retired.example.com", port: 443 };
 
 function templateEnvelope(): BrowserEnvelope {
   return {
@@ -23,7 +23,7 @@ function templateEnvelope(): BrowserEnvelope {
 
 describe("web access hosts", () => {
   test("keys a host by name and port, with HTTPS as the default port", () => {
-    expect(webAccessHostKey(feeds)).toBe("feeds.example.org:8443");
+    expect(webAccessHostKey(feeds)).toBe("feeds.example.com:8443");
     expect(webAccessHostKey({ host: "advisories.example.com" })).toBe("advisories.example.com:443");
   });
 
@@ -35,7 +35,7 @@ describe("web access hosts", () => {
 
   test("grants nothing until a host is chosen, then only the chosen hosts", () => {
     expect(webAccessGrant([advisories, feeds], new Set())).toBeUndefined();
-    expect(webAccessGrant([advisories, feeds], new Set(["feeds.example.org:8443"]))).toEqual({ hosts: [feeds] });
+    expect(webAccessGrant([advisories, feeds], new Set(["feeds.example.com:8443"]))).toEqual({ hosts: [feeds] });
   });
 
   test("provisions a template without web access unless the administrator picks hosts", () => {
@@ -54,8 +54,8 @@ describe("web access hosts", () => {
   test("lets a template editor add any allowed host and remove a host the installation dropped", () => {
     expect(templateWebAccessOptions([advisories, feeds], [retired])).toEqual([
       { key: "advisories.example.com:443", kind: "read", label: "advisories.example.com:443" },
-      { key: "feeds.example.org:8443", kind: "read", label: "feeds.example.org:8443" },
-      { disabled: true, key: "retired.example.net:443", kind: "read", label: "retired.example.net:443", note: "Not allowed in this installation" },
+      { key: "feeds.example.com:8443", kind: "read", label: "feeds.example.com:8443" },
+      { disabled: true, key: "retired.example.com:443", kind: "read", label: "retired.example.com:443", note: "Not allowed in this installation" },
     ]);
     expect(unavailableWebAccessHosts([advisories, retired], [advisories, feeds])).toEqual([retired]);
     expect(unavailableWebAccessHosts([advisories], undefined)).toEqual([advisories]);

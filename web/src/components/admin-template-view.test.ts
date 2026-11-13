@@ -33,10 +33,10 @@ describe("template web access", () => {
   };
 
   test("refuses to save a web access host this installation doesn't allow", () => {
-    const envelope = { ...authoredEnvelope(), spec: { ...authoredEnvelope().spec, egress: { hosts: [{ host: "retired.example.net", port: 443 }] } } };
+    const envelope = { ...authoredEnvelope(), spec: { ...authoredEnvelope().spec, egress: { hosts: [{ host: "retired.example.com", port: 443 }] } } };
     expect(validateTemplateFields({ ...validFields, envelope, installationWebAccessHosts: [{ host: "advisories.example.com", port: 443 }] }).egressHosts)
       .toBe("Remove every web access host this installation doesn't allow.");
-    expect(validateTemplateFields({ ...validFields, envelope, installationWebAccessHosts: [{ host: "retired.example.net", port: 443 }] }).egressHosts)
+    expect(validateTemplateFields({ ...validFields, envelope, installationWebAccessHosts: [{ host: "retired.example.com", port: 443 }] }).egressHosts)
       .toBeUndefined();
     expect(validateTemplateFields({ ...validFields, envelope: authoredEnvelope(), installationWebAccessHosts: [] }).egressHosts)
       .toBeUndefined();

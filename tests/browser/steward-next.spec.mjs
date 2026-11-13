@@ -3112,23 +3112,23 @@ test("administrators can provision a template envelope directly to a user", asyn
 
 test("administrators and members choose web access hosts from the installation's list", async ({ browser }) => {
   const advisories = { host: "advisories.example.com", port: 443 };
-  const feeds = { host: "feeds.example.org", port: 443 };
-  const retired = { host: "retired.example.net", port: 443 };
+  const feeds = { host: "feeds.example.com", port: 443 };
+  const retired = { host: "retired.example.com", port: 443 };
   const webAccess = { adminTemplateWebAccessHosts: [advisories, retired], webAccessHosts: [advisories, feeds] };
   const administrator = await guardedPage(browser, { ...webAccess, session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const templateHosts = administrator.page.getByRole("combobox", { name: "Web access hosts" });
     const templateSection = templateHosts.locator("xpath=ancestor::section[1]");
-    await expect(templateSection.getByRole("button", { name: "Remove retired.example.net:443" })).toBeVisible();
+    await expect(templateSection.getByRole("button", { name: "Remove retired.example.com:443" })).toBeVisible();
     await expect(administrator.page.getByText("Change them through the operator API")).toHaveCount(0);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(templateSection.getByText("Remove every web access host this installation doesn't allow.", { exact: true })).toBeVisible();
     expect(administrator.mutations.filter((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst")).toHaveLength(0);
-    await templateSection.getByRole("button", { name: "Remove retired.example.net:443" }).click();
+    await templateSection.getByRole("button", { name: "Remove retired.example.com:443" }).click();
     await templateHosts.fill("feeds");
     await templateHosts.press("Enter");
-    await expect(templateSection.getByRole("button", { name: "Remove feeds.example.org:443" })).toBeVisible();
+    await expect(templateSection.getByRole("button", { name: "Remove feeds.example.com:443" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision saved.", { exact: true })).toBeVisible();
     const savedTemplate = administrator.mutations.filter((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst").at(-1);
