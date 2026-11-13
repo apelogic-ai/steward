@@ -13,6 +13,7 @@ import {
   type BrowserEnvelopeTemplateErrorResponse,
   type BrowserEnvelopeTemplateField,
   type BrowserEnvelopeTemplateResponse,
+  type EgressHost,
   type ModelRef,
   type RunnerPlatform,
   type ToolGrant,
@@ -22,6 +23,7 @@ import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
+import { templateWebAccessOptions, unavailableWebAccessHosts, webAccessHostKey } from "@/components/web-access";
 import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft } from "@/components/workspace-authority-controls";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
@@ -199,6 +201,7 @@ export function validateTemplateFields({
   templateId,
   tools,
   workspace,
+  installationWebAccessHosts,
 }: Readonly<{
   allowedModels: ReadonlySet<string>;
   allowedTools: ReadonlySet<string>;
@@ -212,6 +215,8 @@ export function validateTemplateFields({
   templateId: string;
   tools: Array<ToolGrant>;
   workspace?: null | WorkspaceAuthority;
+  /** The web access hosts this installation allows; omit to skip the check. */
+  installationWebAccessHosts?: ReadonlyArray<EgressHost>;
 }>): TemplateFieldErrors {
   const errors: TemplateFieldErrors = {};
   if (!templateId) errors.templateId = "Enter a template ID.";
@@ -239,6 +244,7 @@ export function validateTemplateFields({
   if (models.length === 0) errors.models = "Select at least one model.";
   else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model that is not available in this installation.";
   if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool that is not available in this installation.";
+  if (installationWebAccessHosts !== undefined && unavailableWebAccessHosts(envelope.spec.egress?.hosts ?? [], installationWebAccessHosts).length > 0) errors.egressHosts = "Remove every web access host this installation doesn't allow.";
   if (workspace === null || (workspace !== undefined && !isWorkspaceAuthority(workspace))) errors.workspace = "Choose at least one workspace type and enter a positive whole-number size, or leave the size blank.";
   return errors;
 }
@@ -575,6 +581,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [templateIdDraft, setTemplateIdDraft] = useState("");
   const [allowInlineBrowserTasks, setAllowInlineBrowserTasks] = useState(initialAllowInlineBrowserTasks);
   const [workspaceDraft, setWorkspaceDraft] = useState(() => workspaceAuthorityDraft(template.spec.workspace, capabilities.workspace?.enabledTypes));
+  const [webAccessHosts, setWebAccessHosts] = useState<Array<EgressHost>>(() => template.spec.egress?.hosts ?? []);
   const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
   const selectedRoles = templateMemberRoles(parsedRoles);
   const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
@@ -633,7 +640,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         tools,
         ...(runtimeMinutesLimit.trim() ? { runtimeMinutesLimit: runtimeMinutesLimit.trim() } : {}),
         ...(workspace ? { workspace } : {}),
-        ...(template.spec.egress ? { egress: template.spec.egress } : {}),
+        ...(webAccessHosts.length ? { egress: { hosts: webAccessHosts } } : {}),
         ttl,
         runner: {
           platforms,
@@ -656,6 +663,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       templateId,
       tools,
       workspace,
+      installationWebAccessHosts: capabilities.egressHosts ?? [],
     });
     setFieldErrors(errors);
     if (Object.keys(errors).length > 0) {
@@ -699,7 +707,30 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   }
 
   const runner = template.spec.runner;
-  const egressHostsDisplay = template.spec.egress?.hosts.length ? <GrantChipList grants={template.spec.egress.hosts.map((host) => ({ kind: "read", name: `${host.host}:${host.port}` }))} /> : <p className="text-sm text-muted-ink">None</p>;
+  const webAccessOptions = templateWebAccessOptions(capabilities.egressHosts, webAccessHosts);
+  const webAccessControls = (
+    <>
+      <TagSelect
+        aria-invalid={fieldInvalid("egressHosts") || undefined}
+        addPlaceholder="Add a host…"
+        emptyPlaceholder={webAccessOptions.length ? "Search hosts…" : "No hosts allowed"}
+        inputDisabled={!capabilities.egressHosts?.length}
+        label="Web access hosts"
+        noResultsMessage={(query) => `No allowed hosts match “${query}”`}
+        onChange={(keys) => {
+          setWebAccessHosts(keys.flatMap((key) => {
+            const host = [...(capabilities.egressHosts ?? []), ...webAccessHosts].find((candidate) => webAccessHostKey(candidate) === key);
+            return host ? [host] : [];
+          }));
+          clearFieldError("egressHosts");
+        }}
+        options={webAccessOptions}
+        value={webAccessHosts.map(webAccessHostKey)}
+      />
+      <FieldError message={fieldErrors.egressHosts} />
+      {!capabilities.egressHosts?.length && !webAccessHosts.length ? <p className="mt-2 text-sm text-muted-ink">This installation allows no web access hosts.</p> : null}
+    </>
+  );
   const workspaceControls = capabilities.workspace ? (
     <WorkspaceAuthorityControls
       deployment={capabilities.workspace}
@@ -756,8 +787,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">
           <div aria-invalid={fieldInvalid("workspace") || undefined} className={`rounded-control ${invalidFieldClass("workspace")}`}>{workspaceControls}</div>
         </FormSection>
-        <FormSection description="Public hosts this template grants for egress, within the deployment capability catalog. Change them through the operator API." title="Public egress">
-          <div aria-invalid={fieldInvalid("egressHosts") || undefined} className={`rounded-control ${invalidFieldClass("egressHosts")}`}>{egressHostsDisplay}</div>
+        <FormSection description="Websites that agents may reach over HTTPS with this template. Only hosts this installation allows can be added. People choose from these when they request an Envelope." title="Web access">
+          {webAccessControls}
         </FormSection>
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
@@ -796,7 +827,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><div aria-invalid={fieldInvalid("tools") || undefined} className={`rounded-control ${invalidFieldClass("tools")}`}><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /></div><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
       <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access"><div aria-invalid={fieldInvalid("workspace") || undefined} className={`rounded-control ${invalidFieldClass("workspace")}`}>{workspaceControls}</div></FormSection>
-      <FormSection description="Public hosts this template grants for egress, within the deployment capability catalog. Change them through the operator API." title="Public egress"><div aria-invalid={fieldInvalid("egressHosts") || undefined} className={`rounded-control ${invalidFieldClass("egressHosts")}`}>{egressHostsDisplay}</div></FormSection>
+      <FormSection description="Websites that agents may reach over HTTPS with this template. Only hosts this installation allows can be added. People choose from these when they request an Envelope." title="Web access">{webAccessControls}</FormSection>
 
       <FormSection description="Choose the platforms this template allows. Leave resources blank to use platform defaults." title="Runner"><fieldset aria-invalid={fieldInvalid("platforms") || undefined} className={`space-y-4 rounded-control ${invalidFieldClass("platforms")}`}><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input aria-invalid={fieldInvalid("platforms") || undefined} defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={fieldInvalid("memory") || undefined} className={`${fieldClass} ${invalidFieldClass("memory")} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={fieldInvalid("compute") || undefined} className={`${fieldClass} ${invalidFieldClass("compute")} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={fieldInvalid("storage") || undefined} className={`${fieldClass} ${invalidFieldClass("storage")} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 

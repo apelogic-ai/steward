@@ -53,6 +53,16 @@ describe("envelope ceiling-exceedance summaries", () => {
     expect(html).toContain("Workspace: <strong>types git · size 1 GiB · files 1,000 files · history 100 generations · submodules 1 level</strong> (limit Not set)");
   });
 
+  test("labels web access host deltas in plain language", () => {
+    const summary = envelopeDeltaSummary({
+      dimension: "egressHosts",
+      ceiling: [{ host: "advisories.example.com", port: 443 }],
+      requested: [{ host: "feeds.example.com", port: 443 }],
+    } as DirectAdmissionDelta);
+    expect(summary.label).toBe("Web access hosts");
+    expect(summary.requested).toContain("feeds.example.com:443");
+  });
+
   test("names every deployment limit omitted by a wider workspace request", () => {
     const delta: DirectAdmissionDelta = {
       ceiling: { allowedTypes: ["git"], maxTotalSize: "2Gi" },

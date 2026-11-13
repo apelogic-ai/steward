@@ -14539,6 +14539,13 @@
           "apiVersion": {
             "type": "string"
           },
+          "egressHosts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressHost"
+            },
+            "description": "Public hosts this deployment allows Envelopes to grant for web access. Omitted when the\ndeployment allows none."
+          },
           "workspace": {
             "$ref": "#/components/schemas/WorkspaceDeploymentCapabilities"
           }

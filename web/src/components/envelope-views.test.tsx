@@ -40,16 +40,23 @@ describe("envelope run history", () => {
     expect(source).toContain('title={request.approvedEnvelope ? "Approved access" : "Requested access"}');
   });
 
-  test("shows granted public egress hosts on envelope details", () => {
-    expect(source).toContain("Public egress");
+  test("shows granted web access hosts on envelope details", () => {
+    expect(source).toContain("Web access");
+    expect(source).not.toContain("Public egress");
     expect(source).toContain("envelope.spec.egress?.hosts");
-    expect(source).toContain("`${host.host}:${host.port}`");
+    expect(source).toContain('kind: "neutral", name: webAccessHostKey(host)');
+    expect(source).not.toContain('kind: "read" as const, label: webAccessHostKey(host)');
   });
 
-  test("requests only the template egress hosts the person selects, none by default", () => {
+  test("requests only the template web access hosts the person selects, none by default", () => {
     expect(source).toContain("useState<ReadonlySet<string>>(() => new Set())");
-    expect(source).toContain("egress: selectedEgressHosts.length ? { hosts: selectedEgressHosts } : undefined");
+    expect(source).toContain("egress: webAccessGrant(offeredWebAccessHosts, egressHosts)");
     expect(source).toContain('rejectedFields.includes("egressHosts")');
+  });
+
+  test("offers only template web access hosts this installation still allows", () => {
+    expect(source).toContain("allowedWebAccessHosts(template.ceiling.spec.egress?.hosts, webAccessHosts)");
+    expect(source).toContain("capabilitiesState.value.egressHosts");
   });
 
   test("loads deployment workspace capabilities for template and custom requests", () => {

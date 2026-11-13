@@ -28,8 +28,8 @@ use crate::browser_auth::{
 use crate::tasks::WorkspaceDeploymentCapabilities;
 use crate::user_envelopes::{
     BrowserEnvelope, BrowserEnvelopeSpec, EnvelopeRequestErrorResponse, EnvelopeRequestField,
-    capability_catalog_violation_fields, envelope_content_digest, envelope_instance_id,
-    envelope_request_error_response, envelope_request_field_list,
+    capability_catalog_violation_fields, capability_refusal_reason, envelope_content_digest,
+    envelope_instance_id, envelope_request_error_response, unavailable_egress_hosts,
     workspace_capability_violation_fields,
 };
 use crate::{
@@ -1248,6 +1248,14 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     }
     let requested_envelope: Envelope = body.requested_envelope.into();
+    if !crate::user_envelopes::egress_format_is_valid(requested_envelope.spec.egress.as_ref()) {
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_egress_hosts",
+            "Enter each web access host as a full host name, such as api.example.com.",
+            vec![EnvelopeRequestField::EgressHosts],
+        );
+    }
     if let Some(response) =
         crate::user_envelopes::egress_unavailable_response(&state.capabilities, &requested_envelope)
     {
@@ -1363,9 +1371,9 @@ where
             return envelope_request_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "capability_not_available",
-                format!(
-                    "This deployment does not provide the requested {}.",
-                    envelope_request_field_list(&capability_fields)
+                capability_refusal_reason(
+                    &capability_fields,
+                    &unavailable_egress_hosts(&state.capabilities, &request.requested_envelope),
                 ),
                 capability_fields,
             );

@@ -61,9 +61,26 @@ and tools:
 - an Envelope without `egress` grants no public egress, even when the catalog
   lists hosts.
 
-In the web app a person picks hosts from the template; none is requested by
-default. Administrators see every requested host when reviewing a request or
-provisioning an Envelope.
+In the web app, where these hosts are labelled **Web access** (from the release
+after v0.3.32):
+
+- an administrator adds and removes a template's hosts in the template editor,
+  choosing from the catalog's `egressHosts`. A host the catalog no longer lists
+  stays visible so it can be removed, and the template can't be saved until it
+  is;
+- a person requesting an Envelope, and an administrator provisioning one, pick
+  from the template's hosts that the catalog still lists. None is selected by
+  default, so provisioning from a template grants no host unless the
+  administrator adds it;
+- approvers see every requested host when reviewing a request.
+
+On every write path (browser, operator API and legacy authoring), the
+`422 capability_not_available` reason names each refused host, for example
+"This installation doesn't allow web access to api.example.com:443.". A request
+that needs review gets it before being asked for a justification. Browser
+provisioning refuses a malformed host with `422 invalid_egress_hosts` before
+checking the catalog. `GET /app/api/v1/capabilities` lists the catalog's
+`egressHosts` to signed-in users, omitted when the catalog lists none.
 
 Hosts must be exact lowercase DNS names whose top-level domain starts with a
 letter. Wildcards, IP addresses, single-label names, `localhost`, URLs, port 0 and
