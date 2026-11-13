@@ -2004,6 +2004,11 @@ export type UserCapabilitiesResponse = {
      */
     agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
+    /**
+     * Public hosts this deployment allows Envelopes to grant for web access. Omitted when the
+     * deployment allows none.
+     */
+    egressHosts?: Array<EgressHost>;
     workspace: WorkspaceDeploymentCapabilities;
 };
 

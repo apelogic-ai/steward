@@ -63,6 +63,10 @@ pub struct UserCapabilitiesResponse {
     pub workspace: WorkspaceDeploymentCapabilities,
     /// Deployment-owned coding agents and their configured model compatibility.
     pub agents: Vec<ExecutionBindingAdvertisement>,
+    /// Public hosts this deployment allows Envelopes to grant for web access. Omitted when the
+    /// deployment allows none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_hosts: Vec<steward_types::EgressHost>,
 }
 
 /// The session binding is opaque to the request domain. It is only used by a broker to bind
@@ -558,6 +562,10 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
 
     fn unavailable_egress_hosts(&self, envelope: &Envelope) -> Vec<steward_types::EgressHost> {
         unavailable_egress_hosts(&self.capabilities, envelope)
+    }
+
+    fn egress_hosts(&self) -> Vec<steward_types::EgressHost> {
+        self.capabilities.egress_hosts.clone()
     }
 
     fn templates<'a>(
@@ -1167,6 +1175,11 @@ where
         Vec::new()
     }
 
+    /// The web access hosts the deployment catalog lists.
+    fn egress_hosts(&self) -> Vec<steward_types::EgressHost> {
+        Vec::new()
+    }
+
     fn templates<'a>(
         &'a self,
         session: &'a UserEnvelopeSession<B>,
@@ -1322,6 +1335,7 @@ where
         api_version: USER_CAPABILITIES_API_VERSION.to_owned(),
         workspace: state.workspace_capabilities,
         agents: state.agents,
+        egress_hosts: state.broker.egress_hosts(),
     })
     .into_response()
 }
@@ -2088,6 +2102,10 @@ mod tests {
             }
         }
 
+        fn egress_hosts(&self) -> Vec<steward_types::EgressHost> {
+            self.egress_catalog.clone().unwrap_or_default()
+        }
+
         fn templates<'a>(
             &'a self,
             _session: &'a UserEnvelopeSession<()>,
@@ -2415,6 +2433,45 @@ mod tests {
         assert_eq!(
             body["agents"][0]["models"]["providers"],
             serde_json::json!(["example"])
+        );
+        assert!(
+            body.get("egressHosts").is_none(),
+            "a deployment without web access hosts omits the list: {body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_in_users_can_read_the_deployment_web_access_hosts() -> Result<(), String> {
+        let response = inner_router_with_capabilities(
+            TestBroker {
+                egress_catalog: egress_catalog(&["advisories.example.com", "feeds.example.org"]),
+                ..TestBroker::default()
+            },
+            Vec::new(),
+            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities(),
+        )
+        .layer(axum::Extension(session()?))
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/capabilities")
+                .body(Body::empty())
+                .map_err(|error| format!("build user capabilities request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request user capabilities: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read user capabilities response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse user capabilities response: {error}"))?;
+        assert_eq!(
+            body["egressHosts"],
+            serde_json::json!([
+                {"host": "advisories.example.com", "port": 443},
+                {"host": "feeds.example.org", "port": 443},
+            ])
         );
         Ok(())
     }
