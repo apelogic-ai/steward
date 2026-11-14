@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.32"
+          test "$version" = "0.3.33"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -971,15 +971,15 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.32 lets Envelopes grant public hosts to Task sandboxes. The capability catalog lists the hosts an installation offers in the new optional config.apiserver.capabilityCatalog.egressHosts value. Templates grant only catalog hosts, a request within its template is provisioned automatically, a request above it waits for an administrator, and a host the catalog does not list is refused. When a Task is admitted, its runtime records the granted hosts the catalog still lists.\n\n'
-            printf 'A sandbox with an egress grant is created with a Steward policy: the OpenShell restrictive filesystem and landlock defaults, the sandbox user, and one network rule that allows each granted host over HTTPS. Every other public host is refused. The policy is set when the sandbox is created and never changed. Granting egress replaces the image\x27s own sandbox policy for that sandbox, including its network rules: such a sandbox cannot reach the hosts the reference image allows, such as api.anthropic.com, github.com, PyPI or npm, unless the Envelope grants them. Sandboxes without a grant keep the image\x27s policy exactly as before.\n\n'
+            printf 'Steward v0.3.33 makes Envelope web access (public egress) hosts manageable in the browser. Administrators add and remove a template\x27s web access hosts in the template editor, choosing only from the capability catalog\x27s egressHosts. A host the catalog no longer lists is marked on the template and must be removed before the template can be saved. Browser provisioning now preselects no host and grants only the hosts the administrator picks, instead of every template host. The Envelope request form offers only template hosts the catalog still lists. The web app labels these hosts Web access.\n\n'
+            printf 'A refused web access request (422 capability_not_available, field egressHosts) now names each refused host, on every write path. A request that needs review gets the capability refusal before it is asked for a justification. Browser provisioning refuses a malformed host with 422 invalid_egress_hosts before checking the catalog. Capability refusal reasons now say \x22This installation doesn\x27t provide the requested ...\x22, and web access refusals say \x22This installation doesn\x27t allow web access to <host>:<port>.\x22, instead of \x22This deployment does not provide the requested ...\x22. GET /app/api/v1/capabilities now includes the catalog\x27s egressHosts for signed-in users, omitted when the catalog lists none.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Back up the database. Apply the updated AgentRuntime CRD from this release (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, for example with kubectl apply --server-side. Helm installs CRDs from crds/ only on first install and never updates them; with the old CRD the cluster drops spec.egress from new runtimes, so a granted sandbox starts with the image\x27s policy instead of its granted hosts. Run the v0.3.32 platform preflight on the capability catalog first: the apiserver now checks the catalog on every start and does not start when it is invalid.\n\n'
-            printf 'Deploy the chart, component images, and reference runtimes as one release unit. Steward applies migration 0077 automatically; it widens one check constraint on Envelope requests and changes no existing rows. The provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later.\n\n'
-            printf 'Steward v0.3.31 does not start against a database with migration 0077 applied. To roll back, restore the pre-upgrade database backup to a new database target and point v0.3.31 at it. Records written after the upgrade are not in the backup; preserve any audit or decision records that must be retained first. Leave the updated CRD in place; v0.3.31 does not read spec.egress.\n\n'
+            printf 'Back up the database. v0.3.33 adds no migration, CRD change, or chart value. The AgentRuntime CRD is unchanged since v0.3.32, which added spec.egress: an installation upgrading from v0.3.31 or earlier must still apply the updated CRD (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, for example with kubectl apply --server-side, because Helm never updates CRDs. Run the v0.3.33 platform preflight first.\n\n'
+            printf 'Deploy the chart, component images, and reference runtimes as one release unit. The provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later.\n\n'
+            printf 'Rolling back to v0.3.32 needs no database restore, because v0.3.33 adds no migration. Rolling back to v0.3.31 or earlier needs the database backup taken before migration 0077 was applied, because v0.3.31 does not start against a database with 0077: restore it to a new database target as the v0.3.32 release notes describe, preserve any audit or decision records written since, and leave the updated CRD in place.\n\n'
             printf '## Required action\n\n'
-            printf 'Back up the database, apply the updated AgentRuntime CRD, and run the platform preflight before upgrading. Before granting egress to an Envelope, list every host its Tasks need, including model and source hosts the image used to allow. After deployment, update mirrored v0.3.31 reference runtimes and execution bindings to the v0.3.32 artifacts.\n\n'
+            printf 'Clients that match on capability refusal reason text must match on the error code and fields instead. Administrators who provision Envelopes from templates with web access hosts now pick those hosts explicitly. After deployment, update mirrored v0.3.32 reference runtimes and execution bindings to the v0.3.33 artifacts.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, exact command-route and signed-target refusals, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1059,7 +1059,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.32.json
+          subject-path: dist/steward-product-compatibility-0.3.33.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1069,7 +1069,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.32.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.33.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

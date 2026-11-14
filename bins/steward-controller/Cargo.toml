@@ -9,14 +9,14 @@ version.workspace = true
 [dependencies]
 axum.workspace = true # Serves the co-resident validating webhook.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
-steward-adapter-litellm = { path = "../../adapters/litellm", version = "=0.3.32" } # Enforces per-runtime model allowlists and spend budgets at the inference plane.
-steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.3.32" } # Verifies the signed, digest-pinned bridge sandbox artifact before OpenShell receives it.
-steward-adapter-jira = { path = "../../adapters/jira", version = "=0.3.32" } # Delivers durable Task approval outbox rows through the decision-channel port.
-steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.32", features = ["runtime"] }
-steward-controller = { path = "../../crates/steward-controller", version = "=0.3.32" }
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.32" } # Selects the deployment inference plane without leaking adapter types into core.
-steward-store = { path = "../../crates/steward-store", version = "=0.3.32" } # Shares the migrated authority ledger with reconciliation and admission.
-steward-types = { path = "../../crates/steward-types", version = "=0.3.32" } # Parses the stock or managed deployment inference mode.
+steward-adapter-litellm = { path = "../../adapters/litellm", version = "=0.3.33" } # Enforces per-runtime model allowlists and spend budgets at the inference plane.
+steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.3.33" } # Verifies the signed, digest-pinned bridge sandbox artifact before OpenShell receives it.
+steward-adapter-jira = { path = "../../adapters/jira", version = "=0.3.33" } # Delivers durable Task approval outbox rows through the decision-channel port.
+steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.33", features = ["runtime"] }
+steward-controller = { path = "../../crates/steward-controller", version = "=0.3.33" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.33" } # Selects the deployment inference plane without leaking adapter types into core.
+steward-store = { path = "../../crates/steward-store", version = "=0.3.33" } # Shares the migrated authority ledger with reconciliation and admission.
+steward-types = { path = "../../crates/steward-types", version = "=0.3.33" } # Parses the stock or managed deployment inference mode.
 tokio.workspace = true
 tokio-rustls.workspace = true # Terminates TLS required by Kubernetes admission webhooks.
 
