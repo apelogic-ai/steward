@@ -32,10 +32,11 @@ host. It adds no migration, CRD change or chart value.
   now names each refused host, on every write path. A request that needs
   review gets the capability refusal before the justification check. Browser
   provisioning refuses a malformed host with `422 invalid_egress_hosts` before
-  checking the catalog. Capability refusal reasons now read "This installation
-  doesn't provide the requested …" instead of "This deployment does not
-  provide the requested …". Clients that match on reason text must match on
-  the error code and fields instead.
+  checking the catalog. Capability refusal reasons now say "This installation
+  doesn't provide the requested …", and web access refusals say "This
+  installation doesn't allow web access to `<host>:<port>`.", instead of "This
+  deployment does not provide the requested …". Clients that match on reason
+  text must match on the error code and fields instead.
 
 ### Added
 
@@ -47,14 +48,15 @@ host. It adds no migration, CRD change or chart value.
 - Back up the database, run the v0.3.33 platform preflight, and deploy the chart, component
   images and reference runtimes as one release unit. There is no migration, CRD change or chart
   value change.
-- An installation upgrading from v0.3.31 or earlier must still apply the `AgentRuntime` CRD that
-  v0.3.32 introduced before upgrading the chart (see v0.3.32 below), because Helm never updates
-  CRDs.
+- An installation upgrading from v0.3.31 or earlier must still apply the updated `AgentRuntime`
+  CRD (v0.3.32 added `spec.egress`; see v0.3.32 below) before upgrading the chart, because Helm
+  never updates CRDs.
 - Clients that match on capability refusal reason text must match on the error code and fields
   instead.
 - Rolling back to v0.3.32 needs no database restore. Rolling back to v0.3.31 or earlier needs the
-  pre-v0.3.32 backup, because v0.3.31 does not start against a database with migration 0077
-  applied.
+  database backup taken before migration 0077 was applied, restored to a new database target as
+  described under v0.3.32 below; preserve audit and decision records written since, and leave the
+  updated CRD in place.
 
 ## [0.3.32] - 2026-11-13
 
