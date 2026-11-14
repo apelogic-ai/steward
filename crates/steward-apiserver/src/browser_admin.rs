@@ -29,8 +29,7 @@ use crate::tasks::WorkspaceDeploymentCapabilities;
 use crate::user_envelopes::{
     BrowserEnvelope, BrowserEnvelopeSpec, EnvelopeRequestErrorResponse, EnvelopeRequestField,
     capability_catalog_violation_fields, capability_refusal_reason, envelope_content_digest,
-    envelope_instance_id, envelope_request_error_response, unavailable_egress_hosts,
-    workspace_capability_violation_fields,
+    envelope_instance_id, envelope_request_error_response, workspace_capability_violation_fields,
 };
 use crate::{
     AdminContext, AdmissionLedger, ApiError, ApprovalRequest, DecisionChannel, RuntimeRepository,
@@ -228,8 +227,9 @@ pub struct CapabilityCatalog {
     pub models: Vec<ModelRef>,
     pub tools: Vec<CapabilityTool>,
     pub catalogs: Vec<CapabilityProviderCatalog>,
-    /// Public hosts this deployment allows Envelopes to grant for egress. Empty means
-    /// no public egress is available; omitted when empty.
+    /// Deprecated and ignored (#680): web access hosts are set on Envelope templates. Still
+    /// accepted, and still format-checked, so existing configurations keep starting; omitted
+    /// when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_hosts: Vec<steward_types::EgressHost>,
 }
@@ -1256,11 +1256,6 @@ where
             vec![EnvelopeRequestField::EgressHosts],
         );
     }
-    if let Some(response) =
-        crate::user_envelopes::egress_unavailable_response(&state.capabilities, &requested_envelope)
-    {
-        return response;
-    }
     let actor = authority.principal().canonical_user_id.as_str();
     match state
         .ledger
@@ -1371,10 +1366,7 @@ where
             return envelope_request_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "capability_not_available",
-                capability_refusal_reason(
-                    &capability_fields,
-                    &unavailable_egress_hosts(&state.capabilities, &request.requested_envelope),
-                ),
+                capability_refusal_reason(&capability_fields),
                 capability_fields,
             );
         }
@@ -2229,7 +2221,6 @@ where
         .filter_map(|field| match field {
             EnvelopeRequestField::Llms => Some(BrowserEnvelopeTemplateField::Models),
             EnvelopeRequestField::Tools => Some(BrowserEnvelopeTemplateField::Tools),
-            EnvelopeRequestField::EgressHosts => Some(BrowserEnvelopeTemplateField::EgressHosts),
             _ => None,
         })
         .collect::<Vec<_>>();

@@ -278,21 +278,10 @@ struct ErrorResponse {
     error: &'static str,
 }
 
-/// Refuses malformed egress hosts first, then hosts the deployment catalog doesn't list. Without
-/// a configured catalog no egress host is available.
-fn egress_refusal(
-    capabilities: Option<&Extension<crate::browser_admin::CapabilityCatalog>>,
-    envelope: Envelope,
-) -> Option<Response> {
-    if !crate::user_envelopes::egress_format_is_valid(envelope.spec.egress.as_ref()) {
-        return Some(error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid egress hosts",
-        ));
-    }
-    let empty = crate::browser_admin::CapabilityCatalog::default();
-    let catalog = capabilities.map_or(&empty, |Extension(catalog)| catalog);
-    crate::user_envelopes::egress_unavailable_response(catalog, &envelope)
+/// Refuses malformed egress hosts. No deployment list limits well-formed hosts (#680).
+fn egress_refusal(envelope: Envelope) -> Option<Response> {
+    (!crate::user_envelopes::egress_format_is_valid(envelope.spec.egress.as_ref()))
+        .then(|| error(StatusCode::UNPROCESSABLE_ENTITY, "invalid egress hosts"))
 }
 
 pub fn router<L, A>(ledger: L, authenticator: A) -> Router
@@ -566,7 +555,6 @@ pub(crate) async fn latest_template<L: OperatorLedger>(
 pub(crate) async fn apply_template<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
-    capabilities: Option<Extension<crate::browser_admin::CapabilityCatalog>>,
     Path((template_id, revision)): Path<(String, i64)>,
     Json(mut request): Json<OperatorTemplateApplyRequest>,
 ) -> Response {
@@ -576,7 +564,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
             steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
         );
     }
-    if let Some(response) = egress_refusal(capabilities.as_ref(), request.ceiling.clone().into()) {
+    if let Some(response) = egress_refusal(request.ceiling.clone().into()) {
         return response;
     }
     if !crate::browser_admin::valid_template_identifier(&template_id)
@@ -660,13 +648,9 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
 pub(crate) async fn provision<L: OperatorLedger>(
     State(ledger): State<L>,
     Extension(admin): Extension<AdminContext>,
-    capabilities: Option<Extension<crate::browser_admin::CapabilityCatalog>>,
     Json(request): Json<OperatorProvisionRequest>,
 ) -> Response {
-    if let Some(response) = egress_refusal(
-        capabilities.as_ref(),
-        request.requested_envelope.clone().into(),
-    ) {
+    if let Some(response) = egress_refusal(request.requested_envelope.clone().into()) {
         return response;
     }
     let owner_user_id = match CanonicalUserId::parse(request.owner_user_id) {
@@ -1007,23 +991,10 @@ mod tests {
         })
     }
 
-    fn ceiling(hosts: &[&str]) -> axum::Extension<crate::browser_admin::CapabilityCatalog> {
-        axum::Extension(crate::browser_admin::CapabilityCatalog {
-            egress_hosts: hosts
-                .iter()
-                .map(|host| steward_types::EgressHost {
-                    host: (*host).to_owned(),
-                    port: 443,
-                })
-                .collect(),
-            ..crate::browser_admin::CapabilityCatalog::default()
-        })
-    }
-
     #[tokio::test]
-    async fn operator_template_apply_and_provision_check_egress_against_the_deployment_ceiling()
+    async fn operator_template_apply_and_provision_take_any_well_formed_web_access_host()
     -> Result<(), String> {
-        let apply = |app: Router, host: &str| {
+        let apply = |host: &str| {
             let body = serde_json::json!({
                 "displayName": "Default",
                 "memberRoles": ["engineer"],
@@ -1031,7 +1002,11 @@ mod tests {
             })
             .to_string();
             async move {
-                app.oneshot(
+                router(
+                    FakeOperatorLedger::default(),
+                    FakeAuthenticator { is_admin: true },
+                )
+                .oneshot(
                     Request::builder()
                         .method("PUT")
                         .uri("/admin/operator/v1/templates/default/revisions/1")
@@ -1043,12 +1018,6 @@ mod tests {
                 .await
                 .map_err(|error| format!("execute egress template apply: {error}"))
             }
-        };
-        let app = || {
-            router(
-                FakeOperatorLedger::default(),
-                FakeAuthenticator { is_admin: true },
-            )
         };
         async fn error_of(response: Response) -> Result<(StatusCode, String), String> {
             let status = response.status();
@@ -1062,42 +1031,26 @@ mod tests {
                 value["error"].as_str().unwrap_or_default().to_owned(),
             ))
         }
-        let refused = (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "capability_not_available".to_owned(),
+        // No installation list exists (#680): a well-formed host reaches the ledger.
+        let (_, error) = error_of(apply("advisories.example.com").await?).await?;
+        assert!(
+            error != "capability_not_available" && error != "invalid egress hosts",
+            "a well-formed host passes the web access checks: {error}"
         );
         assert_eq!(
-            error_of(
-                apply(
-                    app().layer(ceiling(&["feeds.example.org"])),
-                    "advisories.example.com"
-                )
-                .await?
-            )
-            .await?,
-            refused,
-            "a host outside the ceiling is refused"
-        );
-        assert_eq!(
-            error_of(apply(app(), "advisories.example.com").await?).await?,
-            refused,
-            "without a configured ceiling no egress host is available"
-        );
-        let (_, listed_error) = error_of(
-            apply(
-                app().layer(ceiling(&["advisories.example.com"])),
-                "advisories.example.com",
-            )
-            .await?,
-        )
-        .await?;
-        assert_ne!(
-            listed_error, "capability_not_available",
-            "a listed host passes the egress check and reaches the ledger"
+            error_of(apply("*.example.com").await?).await?,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid egress hosts".to_owned()
+            ),
+            "the format check stays"
         );
 
-        let provision = app()
-            .layer(ceiling(&["feeds.example.org"]))
+        let provision = |host: &'static str, key: &'static str| async move {
+            router(
+                FakeOperatorLedger::default(),
+                FakeAuthenticator { is_admin: true },
+            )
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1109,16 +1062,30 @@ mod tests {
                             "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
                             "templateId": "default",
                             "templateRevision": 1,
-                            "requestedEnvelope": egress_envelope("advisories.example.com"),
-                            "idempotencyKey": "egress-provision",
+                            "requestedEnvelope": egress_envelope(host),
+                            "idempotencyKey": key,
                         })
                         .to_string(),
                     ))
                     .map_err(|error| format!("build egress provision: {error}"))?,
             )
             .await
-            .map_err(|error| format!("execute egress provision: {error}"))?;
-        assert_eq!(error_of(provision).await?, refused);
+            .map_err(|error| format!("execute egress provision: {error}"))
+        };
+        let (_, error) =
+            error_of(provision("advisories.example.com", "egress-provision").await?).await?;
+        assert!(
+            error != "capability_not_available" && error != "invalid egress hosts",
+            "a well-formed host passes the web access checks: {error}"
+        );
+        assert_eq!(
+            error_of(provision("*.example.com", "malformed-egress-provision").await?).await?,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid egress hosts".to_owned()
+            ),
+            "the format check stays on operator provisioning"
+        );
         Ok(())
     }
 

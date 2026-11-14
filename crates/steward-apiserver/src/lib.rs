@@ -2683,7 +2683,6 @@ where
 async fn author_envelope_handler<R, L, D>(
     State(state): State<AppState<R, L, D>>,
     Extension(admin): Extension<AdminContext>,
-    capabilities: Option<Extension<browser_admin::CapabilityCatalog>>,
     Path(member_role): Path<String>,
     Json(envelope): Json<Envelope>,
 ) -> Response
@@ -2698,13 +2697,6 @@ where
             Json(serde_json::json!({ "error": "invalid egress hosts" })),
         )
             .into_response();
-    }
-    let empty = browser_admin::CapabilityCatalog::default();
-    let catalog = capabilities
-        .as_ref()
-        .map_or(&empty, |Extension(catalog)| catalog);
-    if let Some(response) = user_envelopes::egress_unavailable_response(catalog, &envelope) {
-        return response;
     }
     if member_role.is_empty() || envelope.revision <= 0 {
         return (
@@ -5819,26 +5811,14 @@ mod tests {
                     .body(Body::from(
                         r#"{"ownerUserId":"usr_0123456789abcdef0123456789abcdef","templateId":"engineer","templateRevision":3,"requestedEnvelope":{"revision":3,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"200.00","currency":"USD"},"ttl":"24h","runner":{},"egress":{"hosts":[{"host":"advisories.example.com"}]}}},"idempotencyKey":"admin-provision-unlisted-egress"}"#,
                     ))
-                    .map_err(|error| format!("build unlisted egress provision: {error}"))?,
+                    .map_err(|error| format!("build never-listed egress provision: {error}"))?,
             )
             .await
             .map_err(|error| format!("execute unlisted egress provision: {error}"))?;
         assert_eq!(
             unlisted_egress.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "administrator provisioning must refuse a host the catalog doesn't list"
-        );
-        let refusal: serde_json::Value = serde_json::from_slice(
-            &to_bytes(unlisted_egress.into_body(), 16 * 1024)
-                .await
-                .map_err(|error| format!("read unlisted egress provision: {error}"))?,
-        )
-        .map_err(|error| format!("parse unlisted egress provision: {error}"))?;
-        assert_eq!(refusal["error"], "capability_not_available");
-        assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
-        assert_eq!(
-            refusal["failureReason"],
-            "This installation doesn't allow web access to advisories.example.com:443."
+            StatusCode::OK,
+            "no installation list limits web access hosts (#680)"
         );
         let malformed_egress = admin_app
             .clone()
@@ -5867,7 +5847,7 @@ mod tests {
         .map_err(|error| format!("parse malformed egress provision: {error}"))?;
         assert_eq!(
             malformed["error"], "invalid_egress_hosts",
-            "a malformed host is reported as malformed before the catalog check: {malformed}"
+            "a malformed host is reported as malformed: {malformed}"
         );
         assert_eq!(malformed["fields"], serde_json::json!(["egressHosts"]));
         let admin_provisions = admin_ledger
@@ -5875,7 +5855,7 @@ mod tests {
             .lock()
             .map_err(|_| "fake admin provision lock was poisoned")?
             .clone();
-        assert_eq!(admin_provisions.len(), 1);
+        assert_eq!(admin_provisions.len(), 2);
         assert_eq!(
             admin_provisions[0].owner_user_id,
             "usr_0123456789abcdef0123456789abcdef"
@@ -6961,13 +6941,15 @@ mod tests {
         let rejection: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse capability rejection: {error}"))?;
         assert_eq!(rejection["error"], "capability_not_available");
+        // Web access hosts are not checked against the catalog (#680); the requested host is not
+        // among the refused fields.
         assert_eq!(
             rejection["fields"],
-            serde_json::json!(["llms", "tools", "egressHosts", "workspace"])
+            serde_json::json!(["llms", "tools", "workspace"])
         );
         assert_eq!(
             rejection["failureReason"],
-            "This installation doesn't provide the requested models, tools, workspace. This installation doesn't allow web access to advisories.example.com:443."
+            "This installation doesn't provide the requested models, tools, workspace."
         );
         assert!(
             recorded
@@ -7306,8 +7288,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_envelope_authoring_checks_egress_against_the_deployment_ceiling()
-    -> Result<(), String> {
+    async fn legacy_envelope_authoring_takes_any_well_formed_web_access_host() -> Result<(), String>
+    {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
@@ -7320,7 +7302,7 @@ mod tests {
         envelope.revision += 1;
         envelope.spec.egress = Some(steward_types::EgressAuthority {
             hosts: vec![steward_types::EgressHost {
-                host: "advisories.example.com".to_owned(),
+                host: "never-listed.example.com".to_owned(),
                 port: 443,
             }],
         });
@@ -7339,53 +7321,46 @@ mod tests {
             .map_err(|error| format!("legacy envelope request failed: {error}"))
         };
 
-        let without_ceiling = author(
+        // No installation list exists (#680): a well-formed host is authored without one.
+        let authored = author(
             router(
                 runtimes.clone(),
                 ledger.clone(),
                 FakeAuthenticator,
                 FakeDecisionChannel::default(),
             ),
-            body.clone(),
+            body,
         )
         .await?;
-        assert_eq!(
-            without_ceiling.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "a host outside the deployment ceiling cannot be authored"
-        );
-        let refusal: serde_json::Value = serde_json::from_slice(
-            &to_bytes(without_ceiling.into_body(), 16 * 1024)
-                .await
-                .map_err(|error| format!("read legacy refusal: {error}"))?,
-        )
-        .map_err(|error| format!("parse legacy refusal: {error}"))?;
-        assert_eq!(refusal["error"], "capability_not_available");
-        assert_eq!(refusal["fields"], serde_json::json!(["egressHosts"]));
+        assert_eq!(authored.status(), StatusCode::CREATED);
 
-        let with_ceiling = author(
+        envelope.revision += 1;
+        envelope.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "*.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let malformed = author(
             router(
                 runtimes,
                 ledger,
                 FakeAuthenticator,
                 FakeDecisionChannel::default(),
-            )
-            .layer(axum::Extension(browser_admin::CapabilityCatalog {
-                egress_hosts: vec![steward_types::EgressHost {
-                    host: "advisories.example.com".to_owned(),
-                    port: 443,
-                }],
-                ..browser_admin::CapabilityCatalog::default()
-            })),
-            body,
+            ),
+            serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
         )
         .await?;
-        assert_eq!(with_ceiling.status(), StatusCode::CREATED);
+        assert_eq!(
+            malformed.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the format check stays"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn browser_admin_template_authoring_refuses_egress_hosts_outside_the_catalog()
+    async fn browser_admin_template_authoring_takes_any_well_formed_web_access_host()
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let ledger = ledger();
@@ -7405,10 +7380,7 @@ mod tests {
                 models: vec![model.clone()],
                 tools: Vec::new(),
                 catalogs: Vec::new(),
-                egress_hosts: vec![steward_types::EgressHost {
-                    host: "advisories.example.com".to_owned(),
-                    port: 443,
-                }],
+                egress_hosts: Vec::new(),
             },
             auth,
         );
@@ -7443,36 +7415,27 @@ mod tests {
             }
         };
 
+        // No installation list exists (#680): the catalog lists no host, and the template still
+        // takes one.
         next.revision += 1;
         next.spec.egress = Some(steward_types::EgressAuthority {
             hosts: vec![steward_types::EgressHost {
-                host: "advisories.example.com".to_owned(),
+                host: "never-listed.example.com".to_owned(),
                 port: 443,
             }],
         });
-        let listed = submit(next.clone(), "listed-egress").await?;
-        assert_eq!(
-            listed.status(),
-            StatusCode::CREATED,
-            "a template may grant a host the capability catalog lists"
-        );
+        let unlisted = submit(next.clone(), "unlisted-egress").await?;
+        assert_eq!(unlisted.status(), StatusCode::CREATED);
 
         next.revision += 1;
         next.spec.egress = Some(steward_types::EgressAuthority {
             hosts: vec![steward_types::EgressHost {
-                host: "other.example.net".to_owned(),
+                host: "*.example.com".to_owned(),
                 port: 443,
             }],
         });
-        let unlisted = submit(next, "unlisted-egress").await?;
-        assert_eq!(unlisted.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = to_bytes(unlisted.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read unlisted-egress template response: {error}"))?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse unlisted-egress template response: {error}"))?;
-        assert_eq!(value["error"], "capability_not_available");
-        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
+        let malformed = submit(next, "malformed-egress").await?;
+        assert_eq!(malformed.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             ledger
                 .envelope_authors
@@ -7480,7 +7443,7 @@ mod tests {
                 .map_err(|_| "lock template authors")?
                 .len(),
             1,
-            "a host outside the capability catalog cannot write a template revision"
+            "a malformed host cannot write a template revision"
         );
         Ok(())
     }
@@ -13819,7 +13782,6 @@ mod tests {
     /// approved authority.
     async fn submit_inline_run_on_envelope(
         adjust: impl FnOnce(&mut steward_admission::EnvelopeSpec),
-        catalog_hosts: Vec<steward_types::EgressHost>,
     ) -> Result<(StatusCode, serde_json::Value, FakeLedger), String> {
         let ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&ledger, true)?;
@@ -13836,8 +13798,7 @@ mod tests {
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
-        let config = task_api_config()?.with_egress_ceiling(catalog_hosts);
-        let response = browser_task_router(ledger.clone(), config, auth)
+        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -13862,17 +13823,13 @@ mod tests {
         Ok((status, body, ledger))
     }
 
-    async fn submit_inline_run_with_web_access(
-        catalog_hosts: Vec<steward_types::EgressHost>,
-    ) -> Result<(StatusCode, serde_json::Value, FakeLedger), String> {
-        submit_inline_run_on_envelope(
-            |spec| {
-                spec.egress = Some(steward_types::EgressAuthority {
-                    hosts: vec![api_example_host()],
-                });
-            },
-            catalog_hosts,
-        )
+    async fn submit_inline_run_with_web_access()
+    -> Result<(StatusCode, serde_json::Value, FakeLedger), String> {
+        submit_inline_run_on_envelope(|spec| {
+            spec.egress = Some(steward_types::EgressAuthority {
+                hosts: vec![api_example_host()],
+            });
+        })
         .await
     }
 
@@ -13897,14 +13854,8 @@ mod tests {
     #[tokio::test]
     async fn browser_run_on_an_envelope_with_web_access_is_admitted_with_the_granted_hosts()
     -> Result<(), String> {
-        let (status, body, ledger) = submit_inline_run_with_web_access(vec![
-            api_example_host(),
-            steward_types::EgressHost {
-                host: "mirror.example.com".to_owned(),
-                port: 443,
-            },
-        ])
-        .await?;
+        // No installation list exists: the sandbox gets exactly the granted hosts (#680).
+        let (status, body, ledger) = submit_inline_run_with_web_access().await?;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         assert_eq!(
             reserved_runtime_spec(&ledger, &body)?.egress,
@@ -13920,13 +13871,10 @@ mod tests {
     async fn browser_run_on_an_envelope_without_runner_platforms_keeps_the_envelope_runner()
     -> Result<(), String> {
         let mut envelope_runner = None;
-        let (status, body, ledger) = submit_inline_run_on_envelope(
-            |spec| {
-                spec.runner.platforms.clear();
-                envelope_runner = Some(spec.runner.clone());
-            },
-            Vec::new(),
-        )
+        let (status, body, ledger) = submit_inline_run_on_envelope(|spec| {
+            spec.runner.platforms.clear();
+            envelope_runner = Some(spec.runner.clone());
+        })
         .await?;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         assert_eq!(
@@ -13955,9 +13903,7 @@ mod tests {
         let app = task_router(
             ledger.clone(),
             FakeTaskIdentityResolver,
-            task_api_config()?
-                .with_git_hosting_plane(same_repository_direct_git_fixture()?)
-                .with_egress_ceiling(vec![api_example_host()]),
+            task_api_config()?.with_git_hosting_plane(same_repository_direct_git_fixture()?),
         );
         let response = app
             .oneshot(

@@ -20,10 +20,14 @@ function authoredEnvelope() {
 }
 
 describe("template web access", () => {
-  test("edits web access hosts from the installation list and saves only the chosen hosts", () => {
-    expect(source).toContain("templateWebAccessOptions(capabilities.egressHosts, webAccessHosts)");
+  test("takes any typed host name and saves only the chosen hosts", () => {
+    // No installation list limits web access hosts (#680): the administrator types them.
+    expect(source).toContain("allowCreate");
+    expect(source).toContain("parseWebAccessHost(key)");
+    expect(source).toContain("options={webAccessHostOptions(webAccessHosts)}");
     expect(source).toContain("...(webAccessHosts.length ? { egress: { hosts: webAccessHosts } } : {})");
-    expect(source).not.toContain("...(template.spec.egress ? { egress: template.spec.egress } : {})");
+    expect(source).not.toContain("capabilities.egressHosts");
+    expect(source).not.toContain("Not allowed in this installation");
     expect(source).not.toContain("Change them through the operator API");
     expect(source).toContain('title="Web access"');
     expect(source).toContain('"workspace", "egressHosts"] as const');

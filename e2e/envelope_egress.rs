@@ -1,6 +1,6 @@
-//! Envelope egress grants through the real request endpoint, the Postgres-backed request broker
-//! and a real deployment capability catalog, and a browser run on the granted Envelope through
-//! the real Task path.
+//! Envelope egress grants through the real request endpoint and the Postgres-backed request
+//! broker: hosts come from the template and the Envelope, with no installation list (#680), and a
+//! browser run on the granted Envelope goes through the real Task path.
 
 use std::env;
 use std::error::Error;
@@ -135,7 +135,7 @@ fn hosts(names: &[&str]) -> EgressAuthority {
 }
 
 #[tokio::test]
-async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_broker()
+async fn envelope_egress_hosts_come_from_the_template_through_the_real_broker()
 -> Result<(), Box<dyn Error>> {
     super::install_rustls_crypto_provider()?;
     let pool = PgPoolOptions::new()
@@ -169,7 +169,8 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
         provider: "example".to_owned(),
         model: "model-a".to_owned(),
     };
-    // The template lists one host the deployment still offers and one it no longer does.
+    // The template's hosts appear in no installation list: web access hosts come from the
+    // template and the Envelope only (#680).
     let template = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
@@ -187,7 +188,7 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
                 platforms: vec![RunnerPlatform::Linux],
                 ..RunnerRequirements::default()
             },
-            egress: Some(hosts(&["advisories.example.com", "retired.example.com"])),
+            egress: Some(hosts(&["advisories.example.com", "mirror.example.com"])),
         },
     };
     let template_id = format!("egress-{suffix}");
@@ -205,7 +206,7 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
     let catalog = CapabilityCatalog {
         schema_version: "steward.capability-catalog/v2".to_owned(),
         models: vec![model],
-        egress_hosts: hosts(&["advisories.example.com", "feeds.example.org"]).hosts,
+        egress_hosts: Vec::new(),
         ..CapabilityCatalog::default()
     };
     let auth = BrowserAuthService::google(
@@ -330,7 +331,7 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
     assert_eq!(within["request"]["status"], "provisioned");
 
     // Run now with that Envelope: a direct Task through the real browser run path and store.
-    // The sandbox receives exactly the granted host the catalog still lists.
+    // The sandbox receives exactly the granted host.
     let envelope_digest = within["request"]["envelopeDigest"]
         .as_str()
         .ok_or_else(|| io::Error::other("provisioned request omitted the Envelope digest"))?;
@@ -340,8 +341,7 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
     } else {
         format!("steward:{envelope_digest}")
     };
-    let task_config = super::published_workflow_task_config("example")?
-        .with_egress_ceiling(catalog.egress_hosts.clone());
+    let task_config = super::published_workflow_task_config("example")?;
     let run = browser_auth_router(auth.clone())
         .merge(browser_task_router(
             store.clone(),
@@ -412,19 +412,13 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
         "the Task runtime must carry the Envelope's granted web access hosts"
     );
 
-    let (status, retired) = request(&["retired.example.com"], "retired").await?;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "a template host the catalog no longer lists is never provisioned: {retired}"
-    );
-    assert_eq!(retired["error"], "capability_not_available");
-    assert_eq!(retired["fields"], serde_json::json!(["egressHosts"]));
-
     let (status, above) =
         request(&["advisories.example.com", "feeds.example.org"], "above").await?;
     assert_eq!(status, StatusCode::CREATED, "{above}");
-    assert_eq!(above["request"]["status"], "pending");
+    assert_eq!(
+        above["request"]["status"], "pending",
+        "a host above the template waits for an administrator"
+    );
     assert_eq!(
         above["request"]["ceilingExceedances"],
         serde_json::json!([{
@@ -432,15 +426,17 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
             "requested": [{"host": "feeds.example.org", "port": 443}],
             "ceiling": [
                 {"host": "advisories.example.com", "port": 443},
-                {"host": "retired.example.com", "port": 443}
+                {"host": "mirror.example.com", "port": 443}
             ],
         }])
     );
 
-    let (status, outside) = request(&["other.example.net"], "outside").await?;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{outside}");
-    assert_eq!(outside["error"], "capability_not_available");
-    assert_eq!(outside["fields"], serde_json::json!(["egressHosts"]));
+    let (status, malformed) = request(&["*.example.com"], "malformed").await?;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a malformed host is still refused: {malformed}"
+    );
     Ok(())
 }
 

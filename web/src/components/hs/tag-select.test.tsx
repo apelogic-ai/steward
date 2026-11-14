@@ -13,12 +13,12 @@ describe("tag select", () => {
       onChange={() => {}}
       options={[
         { key: "advisories.example.com:443", kind: "neutral", label: "advisories.example.com:443" },
-        { disabled: true, key: "retired.example.com:443", kind: "neutral", label: "retired.example.com:443", note: "Not allowed in this installation" },
+        { disabled: true, key: "retired.example.com:443", kind: "neutral", label: "retired.example.com:443", note: "No longer available" },
       ]}
       value={["advisories.example.com:443", "retired.example.com:443"]}
     />);
-    expect(html).toContain("Not allowed in this installation");
-    expect(html.split("Not allowed in this installation")).toHaveLength(2);
+    expect(html).toContain("No longer available");
+    expect(html.split("No longer available")).toHaveLength(2);
     expect(html).toContain("ring-warn");
     expect(html).toContain('aria-label="Remove retired.example.com:443"');
   });

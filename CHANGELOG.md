@@ -7,6 +7,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Web access hosts are set on Envelope templates, and an administrator can
+  approve others; no installation-wide list limits them (#680).
+  - An administrator types any well-formed host in the template editor (a full
+    host name, with `:port` when it isn't 443), or sets it through the operator
+    API. Wildcards, IP addresses, URLs, `localhost`, port 0 and repeated hosts
+    are still refused.
+  - Requests, approval, browser and operator provisioning, legacy authoring and
+    the default template no longer check hosts against the capability catalog.
+    The "This installation doesn't allow web access to …" refusal is gone. A
+    host above the template, or on a request without a template, still waits
+    for an administrator.
+  - A run's sandbox gets exactly the Envelope's granted hosts. Before, hosts the
+    catalog didn't list were dropped.
+  - Request forms and provisioning offer every template host, none selected by
+    default. The provisioning page no longer loads
+    `GET /admin/api/v1/capabilities`.
+  - **Upgrade:** a host you removed from the catalog list but that is still on a
+    template or an Envelope takes effect again. New runs on that Envelope get
+    it, and requests for it within the template are provisioned automatically.
+    If you used the catalog list to withdraw a host, remove it from those
+    templates and revoke or replace those Envelopes before upgrading.
+  - **Rollback to v0.3.33:** hosts that the catalog list doesn't include are
+    dropped from new runs again, requests and approvals for them are refused,
+    and templates that name them can't be saved until you add them to the
+    list.
+- `GET /app/api/v1/capabilities` no longer returns `egressHosts` (added in
+  v0.3.33). It was optional and omitted when empty. The administrator
+  `GET /admin/api/v1/capabilities` still echoes a configured `egressHosts`.
+
+### Deprecated
+
+- `config.apiserver.capabilityCatalog.egressHosts` is ignored. It is still
+  accepted, so existing values keep working, and the apiserver logs one line at
+  startup when it is set. Its entries are still format-checked, so a malformed
+  entry still stops startup. Move the hosts to your Envelope templates and remove
+  the setting; a later release drops it.
+
 ### Fixed
 
 - Tasks that don't declare their own `requires` now start on an Envelope with
@@ -18,9 +57,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
     selected coding agent and Envelope."
 
   Published Workflow runs and Tasks that declare `requires` were not affected.
-  The run's sandbox gets the Envelope's web access hosts that the installation
-  still allows, the same as published Workflow runs. Task packages still don't
-  declare web access.
+  The run's sandbox gets the Envelope's web access hosts, the same as published
+  Workflow runs. Task packages still don't declare web access.
 - The same Tasks now start on an Envelope that sets no runner platforms. Before,
   they were refused with "Envelope cannot be projected: missing field
   `platforms`". The run keeps the Envelope's runner limits unchanged, as

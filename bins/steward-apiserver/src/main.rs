@@ -147,6 +147,13 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     store.migrate().await?;
     // Parsed once: every Envelope and template writer checks this same deployment catalog.
     let capability_catalog = load_capability_catalog()?;
+    if let Some(warning) = capability_catalog_egress_hosts_startup_warning(
+        capability_catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.egress_hosts.is_empty()),
+    ) {
+        eprintln!("{warning}");
+    }
     ensure_default_llm_template(&store, capability_catalog.as_ref()).await?;
     tokio::spawn(
         steward_apiserver::governed_connections::ConnectionOperationReconciler::new(store.clone())
@@ -227,13 +234,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     };
     let task_api_config = task_api_config
         .with_task_orchestration_mode(task_orchestration_mode)
-        .with_inference_mode(inference_mode)
-        .with_egress_ceiling(
-            capability_catalog
-                .as_ref()
-                .map(|catalog| catalog.egress_hosts.clone())
-                .unwrap_or_default(),
-        );
+        .with_inference_mode(inference_mode);
     let task_api_config = match managed_inference_cipher.clone() {
         Some(cipher) => task_api_config.with_managed_inference_cipher(cipher),
         None => task_api_config,
@@ -267,11 +268,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     )
     .merge(operator_admin::router(store.clone(), authenticator))
     .merge(task_auth_discovery_router(task_auth_discovery))
-    .merge(task_router(store.clone(), task_identities, task_api_config))
-    // Without a configured catalog the operator and legacy writers see no egress hosts.
-    .layer(axum::Extension(
-        capability_catalog.clone().unwrap_or_default(),
-    ));
+    .merge(task_router(store.clone(), task_identities, task_api_config));
     let app = match browser {
         Some(browser) => app.merge(browser),
         None => app,
@@ -743,6 +740,12 @@ fn configured_task_identity_resolver(
         ),
         task_identity_issuer: Some(issuer),
     })
+}
+
+fn capability_catalog_egress_hosts_startup_warning(configured: bool) -> Option<&'static str> {
+    configured.then_some(
+        "capabilityCatalog.egressHosts is no longer used and is ignored; set web access hosts on Envelope templates",
+    )
 }
 
 fn custom_envelope_safety_ceiling_startup_warning(configured: bool) -> Option<&'static str> {
@@ -1954,8 +1957,8 @@ async fn ensure_default_llm_template(
     Ok(())
 }
 
-/// The default template must select one available model, no tools, and only egress hosts the
-/// deployment catalog lists.
+/// The default template must select one available model and no tools. Its web access hosts, if
+/// any, must be well-formed; no deployment list limits them (#680).
 fn validate_default_template_ceiling(
     ceiling: &steward_admission::Envelope,
     capability_catalog: &browser_admin::CapabilityCatalog,
@@ -1968,10 +1971,12 @@ fn validate_default_template_ceiling(
             "default LLM smoke template requires one exact available model and empty tools",
         ));
     }
-    if steward_apiserver::user_envelopes::egress_hosts_unavailable(capability_catalog, ceiling) {
-        return Err(io::Error::other(
-            "default LLM smoke template egress hosts must be listed in the capability catalog egressHosts",
-        ));
+    if let Some(egress) = ceiling.spec.egress.as_ref()
+        && let Err(reason) = steward_types::validate_egress_hosts(&egress.hosts)
+    {
+        return Err(io::Error::other(format!(
+            "default LLM smoke template egress hosts are invalid: {reason}"
+        )));
     }
     Ok(())
 }
@@ -2293,13 +2298,13 @@ mod tests {
         BrowserUserTokenEnvironment, CodexTaskExecutionAdapter, KubernetesTokenReviewAudience,
         OPERATOR_EXIT_CONFLICT, OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND,
         OPERATOR_EXIT_UNAVAILABLE, OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig,
-        TlsListener, bootstrap_rbac_arguments, connection_auto_association_issuer,
-        custom_envelope_safety_ceiling_startup_warning, decode_tls_material,
-        default_template_threshold_is_rollback_compatible, format_effective_access_human,
-        github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
-        parse_browser_auto_create_users, parse_browser_user_token_config,
-        parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
-        personal_agent_configuration_from_values, rustls_crypto_provider,
+        TlsListener, bootstrap_rbac_arguments, capability_catalog_egress_hosts_startup_warning,
+        connection_auto_association_issuer, custom_envelope_safety_ceiling_startup_warning,
+        decode_tls_material, default_template_threshold_is_rollback_compatible,
+        format_effective_access_human, github_source_adapter_from_values,
+        kubernetes_token_review_audience, operator_exit_code, parse_browser_auto_create_users,
+        parse_browser_user_token_config, parse_execution_bindings_mode, parse_inference_mode,
+        parse_template_document, personal_agent_configuration_from_values, rustls_crypto_provider,
         stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
         with_claude_code_execution_adapter,
     };
@@ -2356,13 +2361,14 @@ mod tests {
     }
 
     #[test]
-    fn default_template_egress_hosts_must_be_in_the_capability_catalog() -> Result<(), String> {
+    fn default_template_takes_well_formed_egress_hosts_without_a_catalog_list() -> Result<(), String>
+    {
         let model = steward_types::ModelRef {
             provider: "provider-a".to_owned(),
             model: "model-a".to_owned(),
         };
         let host = steward_types::EgressHost {
-            host: "advisories.example.com".to_owned(),
+            host: "never-listed.example.com".to_owned(),
             port: 443,
         };
         let ceiling = steward_admission::Envelope {
@@ -2379,23 +2385,28 @@ mod tests {
                 ttl: steward_types::Duration("15m".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
                 workspace: None,
-                egress: Some(steward_types::EgressAuthority {
-                    hosts: vec![host.clone()],
-                }),
+                egress: Some(steward_types::EgressAuthority { hosts: vec![host] }),
             },
         };
-        let mut catalog = super::browser_admin::CapabilityCatalog {
+        let catalog = super::browser_admin::CapabilityCatalog {
             schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![model],
             ..super::browser_admin::CapabilityCatalog::default()
         };
-        assert!(
-            super::validate_default_template_ceiling(&ceiling, &catalog).is_err(),
-            "a host the catalog doesn't list must stop the default template"
-        );
-        catalog.egress_hosts = vec![host];
+        // No installation list exists (#680): the catalog lists no host and the template starts.
         super::validate_default_template_ceiling(&ceiling, &catalog)
             .map_err(|error| error.to_string())?;
+        let mut malformed = ceiling;
+        malformed.spec.egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "*.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        assert!(
+            super::validate_default_template_ceiling(&malformed, &catalog).is_err(),
+            "a malformed host stops the default template"
+        );
         Ok(())
     }
 
@@ -2597,6 +2608,17 @@ mod tests {
         );
 
         assert!(output.contains("  default@3\n"));
+    }
+
+    #[test]
+    fn configured_capability_catalog_egress_hosts_are_ignored_with_one_warning() {
+        assert_eq!(
+            capability_catalog_egress_hosts_startup_warning(true),
+            Some(
+                "capabilityCatalog.egressHosts is no longer used and is ignored; set web access hosts on Envelope templates"
+            )
+        );
+        assert_eq!(capability_catalog_egress_hosts_startup_warning(false), None);
     }
 
     #[test]
