@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.33"
+          test "$version" = "0.3.34"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -971,15 +971,15 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.33 makes Envelope web access (public egress) hosts manageable in the browser. Administrators add and remove a template\x27s web access hosts in the template editor, choosing only from the capability catalog\x27s egressHosts. A host the catalog no longer lists is marked on the template and must be removed before the template can be saved. Browser provisioning now preselects no host and grants only the hosts the administrator picks, instead of every template host. The Envelope request form offers only template hosts the catalog still lists. The web app labels these hosts Web access.\n\n'
-            printf 'A refused web access request (422 capability_not_available, field egressHosts) now names each refused host, on every write path. A request that needs review gets the capability refusal before it is asked for a justification. Browser provisioning refuses a malformed host with 422 invalid_egress_hosts before checking the catalog. Capability refusal reasons now say \x22This installation doesn\x27t provide the requested ...\x22, and web access refusals say \x22This installation doesn\x27t allow web access to <host>:<port>.\x22, instead of \x22This deployment does not provide the requested ...\x22. GET /app/api/v1/capabilities now includes the catalog\x27s egressHosts for signed-in users, omitted when the catalog lists none.\n\n'
+            printf 'Steward v0.3.34 fixes runs on Envelopes with web access hosts and makes those hosts a template setting. Since v0.3.32, every Task without its own requires (Run now, inline and saved browser runs, repository Tasks through POST /v1/tasks) and every personal agent turn was refused on an Envelope that grants web access hosts. The same Tasks were also refused on an Envelope that sets no runner platforms. Both now start, and the sandbox gets the Envelope\x27s web access hosts. Published Workflow runs and Tasks that declare requires were not affected.\n\n'
+            printf 'Web access hosts are now set on Envelope templates, and administrators approve others; the capability catalog no longer limits them (#680). Administrators type any well-formed host in the template editor or through the operator API; wildcards, IP addresses, URLs, localhost, port 0 and repeated hosts are still refused. Requests, approval, provisioning, template authoring and the default template no longer check hosts against the catalog, and the \x22This installation doesn\x27t allow web access to ...\x22 refusal is gone. A host above the template, or on a request without a template, still waits for an administrator. A run\x27s sandbox gets exactly the Envelope\x27s granted hosts. Request and provisioning forms offer every template host, none selected by default. config.apiserver.capabilityCatalog.egressHosts is deprecated: still accepted and format-checked, ignored, with one startup warning when set. GET /app/api/v1/capabilities no longer returns egressHosts; the administrator GET /admin/api/v1/capabilities still echoes a configured list.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Back up the database. v0.3.33 adds no migration, CRD change, or chart value. The AgentRuntime CRD is unchanged since v0.3.32, which added spec.egress: an installation upgrading from v0.3.31 or earlier must still apply the updated CRD (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, for example with kubectl apply --server-side, because Helm never updates CRDs. Run the v0.3.33 platform preflight first.\n\n'
+            printf 'Back up the database. v0.3.34 adds no migration, CRD change, or chart value. An installation upgrading from v0.3.31 or earlier must still apply the AgentRuntime CRD updated in v0.3.32 (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, for example with kubectl apply --server-side, because Helm never updates CRDs. Run the v0.3.34 platform preflight first. Before upgrading, check every web access host that is on a template or an Envelope but that you removed from capabilityCatalog.egressHosts: from v0.3.34 it takes effect again, so remove it from those templates and revoke or replace those Envelopes first. Leaving egressHosts unset no longer prevents web access: anyone who can edit templates or approve requests can grant any public host, so review who holds those roles.\n\n'
             printf 'Deploy the chart, component images, and reference runtimes as one release unit. The provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later.\n\n'
-            printf 'Rolling back to v0.3.32 needs no database restore, because v0.3.33 adds no migration. Rolling back to v0.3.31 or earlier needs the database backup taken before migration 0077 was applied, because v0.3.31 does not start against a database with 0077: restore it to a new database target as the v0.3.32 release notes describe, preserve any audit or decision records written since, and leave the updated CRD in place.\n\n'
+            printf 'Rolling back to v0.3.33 or v0.3.32 needs no database restore, because v0.3.34 adds no migration. Before rolling back, set capabilityCatalog.egressHosts to include every host your templates, Envelopes and default template use: v0.3.32 and v0.3.33 refuse to start when the default template names a host the list does not include. After such a rollback, hosts the list does not include are dropped from new runs again, requests and approvals for them are refused, and templates that name them cannot be saved; Tasks without their own requires and personal agent turns are refused again on Envelopes with web access hosts, and those Tasks on Envelopes without runner platforms. Rolling back to v0.3.31 or earlier needs the database backup taken before migration 0077 was applied, because v0.3.31 does not start against a database with 0077: restore it to a new database target as the v0.3.32 release notes describe, preserve any audit or decision records written since, and leave the updated CRD in place.\n\n'
             printf '## Required action\n\n'
-            printf 'Clients that match on capability refusal reason text must match on the error code and fields instead. Administrators who provision Envelopes from templates with web access hosts now pick those hosts explicitly. After deployment, update mirrored v0.3.32 reference runtimes and execution bindings to the v0.3.33 artifacts.\n\n'
+            printf 'Hosts already on your templates keep working. Add a host to a template only if its users should get it without review. After upgrading, and once you no longer need to roll back, remove capabilityCatalog.egressHosts; a later release drops it. Clients that read egressHosts from GET /app/api/v1/capabilities must stop relying on it. After deployment, update mirrored v0.3.33 reference runtimes and execution bindings to the v0.3.34 artifacts.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, exact command-route and signed-target refusals, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1059,7 +1059,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.33.json
+          subject-path: dist/steward-product-compatibility-0.3.34.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1069,7 +1069,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.33.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.34.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
