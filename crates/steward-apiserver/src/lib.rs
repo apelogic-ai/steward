@@ -13808,25 +13808,31 @@ mod tests {
         Ok(())
     }
 
-    async fn submit_inline_run_with_web_access(
+    fn api_example_host() -> steward_types::EgressHost {
+        steward_types::EgressHost {
+            host: "api.example.com".to_owned(),
+            port: 443,
+        }
+    }
+
+    /// Submits the inline Run now fixture on the fixture Envelope after `adjust` changes its
+    /// approved authority.
+    async fn submit_inline_run_on_envelope(
+        adjust: impl FnOnce(&mut steward_admission::EnvelopeSpec),
         catalog_hosts: Vec<steward_types::EgressHost>,
     ) -> Result<(StatusCode, serde_json::Value, FakeLedger), String> {
         let ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&ledger, true)?;
-        ledger
-            .user_envelopes
-            .lock()
-            .map_err(|_| "fake User Envelope ledger lock was poisoned")?
-            .first_mut()
-            .and_then(|envelope| envelope.approved_envelope.as_mut())
-            .ok_or_else(|| "fixture requires approved authority".to_owned())?
-            .spec
-            .egress = Some(steward_types::EgressAuthority {
-            hosts: vec![steward_types::EgressHost {
-                host: "api.example.com".to_owned(),
-                port: 443,
-            }],
-        });
+        adjust(
+            &mut ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?
+                .first_mut()
+                .and_then(|envelope| envelope.approved_envelope.as_mut())
+                .ok_or_else(|| "fixture requires approved authority".to_owned())?
+                .spec,
+        );
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
@@ -13840,43 +13846,59 @@ mod tests {
                     .header(header::ORIGIN, origin)
                     .header("sec-fetch-site", "same-origin")
                     .header("x-steward-csrf", csrf)
-                    .header("idempotency-key", "browser-inline-web-access")
+                    .header("idempotency-key", "browser-inline-envelope")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(inline_browser_task_body().to_string()))
-                    .map_err(|error| format!("build web access Run request: {error}"))?,
+                    .map_err(|error| format!("build Run request: {error}"))?,
             )
             .await
-            .map_err(|error| format!("submit web access Run request: {error}"))?;
+            .map_err(|error| format!("submit Run request: {error}"))?;
         let status = response.status();
         let body = to_bytes(response.into_body(), 64 * 1024)
             .await
-            .map_err(|error| format!("read web access Run response: {error}"))?;
+            .map_err(|error| format!("read Run response: {error}"))?;
         let body = serde_json::from_slice(&body)
-            .map_err(|error| format!("decode web access Run response: {error}"))?;
+            .map_err(|error| format!("decode Run response: {error}"))?;
         Ok((status, body, ledger))
     }
 
-    fn reserved_runtime_egress(
+    async fn submit_inline_run_with_web_access(
+        catalog_hosts: Vec<steward_types::EgressHost>,
+    ) -> Result<(StatusCode, serde_json::Value, FakeLedger), String> {
+        submit_inline_run_on_envelope(
+            |spec| {
+                spec.egress = Some(steward_types::EgressAuthority {
+                    hosts: vec![api_example_host()],
+                });
+            },
+            catalog_hosts,
+        )
+        .await
+    }
+
+    /// The runtime spec of the Task the response reports, looked up by its UID.
+    fn reserved_runtime_spec(
         ledger: &FakeLedger,
-    ) -> Result<Option<steward_types::EgressAuthority>, String> {
+        response: &serde_json::Value,
+    ) -> Result<steward_types::AgentRuntimeSpec, String> {
+        let task_uid = response["taskUid"]
+            .as_str()
+            .ok_or_else(|| format!("response omitted the Task UID: {response}"))?;
         ledger
             .tasks
             .lock()
             .map_err(|_| "fake Task ledger lock was poisoned")?
-            .first()
-            .map(|task| task.runtime_spec.egress.clone())
-            .ok_or_else(|| "Task was not reserved".to_owned())
+            .iter()
+            .find(|task| task.task_uid.to_string() == task_uid)
+            .map(|task| task.runtime_spec.clone())
+            .ok_or_else(|| format!("Task {task_uid} was not reserved"))
     }
 
     #[tokio::test]
     async fn browser_run_on_an_envelope_with_web_access_is_admitted_with_the_granted_hosts()
     -> Result<(), String> {
-        let granted = steward_types::EgressHost {
-            host: "api.example.com".to_owned(),
-            port: 443,
-        };
         let (status, body, ledger) = submit_inline_run_with_web_access(vec![
-            granted.clone(),
+            api_example_host(),
             steward_types::EgressHost {
                 host: "mirror.example.com".to_owned(),
                 port: 443,
@@ -13885,9 +13907,9 @@ mod tests {
         .await?;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         assert_eq!(
-            reserved_runtime_egress(&ledger)?,
+            reserved_runtime_spec(&ledger, &body)?.egress,
             Some(steward_types::EgressAuthority {
-                hosts: vec![granted]
+                hosts: vec![api_example_host()]
             }),
             "the sandbox must receive exactly the Envelope's granted web access hosts"
         );
@@ -13899,7 +13921,87 @@ mod tests {
     -> Result<(), String> {
         let (status, body, ledger) = submit_inline_run_with_web_access(Vec::new()).await?;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        assert_eq!(reserved_runtime_egress(&ledger)?, None);
+        assert_eq!(reserved_runtime_spec(&ledger, &body)?.egress, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_run_on_an_envelope_without_runner_platforms_keeps_the_envelope_runner()
+    -> Result<(), String> {
+        let mut envelope_runner = None;
+        let (status, body, ledger) = submit_inline_run_on_envelope(
+            |spec| {
+                spec.runner.platforms.clear();
+                envelope_runner = Some(spec.runner.clone());
+            },
+            Vec::new(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            Some(reserved_runtime_spec(&ledger, &body)?.runner),
+            envelope_runner,
+            "a run on an Envelope without platforms keeps exactly the Envelope's runner limits"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_package_on_an_envelope_with_web_access_is_admitted_with_the_granted_hosts()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        ledger
+            .user_envelopes
+            .lock()
+            .map_err(|_| "fake User Envelope ledger lock was poisoned")?
+            .first_mut()
+            .and_then(|envelope| envelope.approved_envelope.as_mut())
+            .ok_or_else(|| "fixture requires approved authority".to_owned())?
+            .spec
+            .egress = Some(steward_types::EgressAuthority {
+            hosts: vec![api_example_host()],
+        });
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_git_hosting_plane(same_repository_direct_git_fixture()?)
+                .with_egress_ceiling(vec![api_example_host()]),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "repository-package-web-access")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "packagePath": "task-definition.json"
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build repository package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit repository package request: {error}"))?;
+        let status = response.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("read repository package response: {error}"))?,
+        )
+        .map_err(|error| format!("decode repository package response: {error}"))?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            reserved_runtime_spec(&ledger, &body)?.egress,
+            Some(steward_types::EgressAuthority {
+                hosts: vec![api_example_host()]
+            }),
+            "the sandbox must receive exactly the Envelope's granted web access hosts"
+        );
         Ok(())
     }
 

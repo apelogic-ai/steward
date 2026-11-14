@@ -2144,7 +2144,7 @@ pub(crate) fn personal_agent_task_definition(
     envelope: &steward_admission::Envelope,
     model: &ModelRef,
 ) -> Result<DirectTaskDefinition, String> {
-    let mut requirements = direct_requirements_from_envelope_with_platform_default(&envelope.spec)
+    let mut requirements = direct_requirements_from_envelope(&envelope.spec)
         .map_err(|error| format!("personal agent Envelope cannot be projected: {error:?}"))?;
     requirements.authority.tools.clear();
     let selected_model = steward_types::direct_package::ModelRequirement {
@@ -6786,19 +6786,6 @@ fn verified_git_file(file: GitFile, request: &GitFileRequest) -> Result<Vec<u8>,
 }
 
 fn direct_requirements_from_envelope(spec: &EnvelopeSpec) -> Result<DirectRequirements, ApiError> {
-    direct_requirements_from_envelope_inner(spec, false)
-}
-
-fn direct_requirements_from_envelope_with_platform_default(
-    spec: &EnvelopeSpec,
-) -> Result<DirectRequirements, ApiError> {
-    direct_requirements_from_envelope_inner(spec, true)
-}
-
-fn direct_requirements_from_envelope_inner(
-    spec: &EnvelopeSpec,
-    include_empty_platforms: bool,
-) -> Result<DirectRequirements, ApiError> {
     let mut authority = serde_json::to_value(spec)
         .map_err(|error| ApiError::Admission(format!("Envelope cannot be projected: {error}")))?;
     let authority = authority
@@ -6821,11 +6808,10 @@ fn direct_requirements_from_envelope_inner(
         .ok_or_else(|| {
             ApiError::Admission("Envelope runner requirements are invalid".to_owned())
         })?;
-    if include_empty_platforms {
-        runner
-            .entry("platforms".to_owned())
-            .or_insert_with(|| serde_json::json!([]));
-    }
+    // An Envelope without platforms omits the field; requirements state the same as an empty list.
+    runner
+        .entry("platforms".to_owned())
+        .or_insert_with(|| serde_json::json!([]));
     for field in ["memory", "compute", "storage"] {
         runner
             .entry(field.to_owned())
@@ -7439,14 +7425,15 @@ mod workflow_request_tests {
         browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
         browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
-        direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches,
-        format_workspace_bytes, personal_agent_task_definition, prepare_task_input_archive,
-        resolve_scratch_workspace_entry, resolve_versioned_task_plan, runtime_egress,
-        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        direct_requirements_for_task, direct_requirements_from_envelope, direct_runtime_spec,
+        direct_task_evidence_matches, format_workspace_bytes, personal_agent_task_definition,
+        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
+        runtime_egress, source_port_error, source_port_error_with_reporter,
+        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
+        versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -9224,6 +9211,68 @@ mod workflow_request_tests {
         };
         personal_agent_task_definition("example-agent@1.0.0", "Check egress.", &ceiling, &model)
             .map_err(|error| format!("project personal agent requirements: {error}"))?;
+        Ok(())
+    }
+
+    /// Every Envelope field is set, and the literals are exhaustive (no `..`): adding a field to
+    /// the Envelope fails this build until the projection handles it, instead of refusing every
+    /// direct Task at run time.
+    #[test]
+    fn envelopes_with_every_field_project_into_requirements_without_web_access_or_workspace()
+    -> Result<(), String> {
+        let quantity = |value: &str| Some(steward_types::KubernetesQuantity(value.to_owned()));
+        let full = EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "openai".to_owned(),
+                model: "gpt-5.4".to_owned(),
+            }],
+            tools: vec![ToolGrant {
+                provider: "github".to_owned(),
+                resource: "repository".to_owned(),
+                action: "read".to_owned(),
+            }],
+            budget: Budget {
+                monthly_limit: "25.00".to_owned(),
+                single_run_limit: Some("5.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("60".to_owned()),
+            ttl: Duration("4h".to_owned()),
+            runner: RunnerRequirements {
+                platforms: vec![steward_types::RunnerPlatform::Linux],
+                memory: quantity("1Gi"),
+                compute: quantity("500m"),
+                storage: quantity("2Gi"),
+            },
+            workspace: Some(WorkspaceAuthority {
+                allowed_types: vec![WorkspaceEntryType::Git],
+                max_total_size: Some(
+                    steward_types::direct_package::ResourceQuantity::parse("1Gi")
+                        .map_err(|error| error.to_string())?,
+                ),
+                max_files: Some(1_000),
+                max_history_depth: Some(100),
+                max_submodule_depth: Some(1),
+            }),
+            egress: Some(EgressAuthority {
+                hosts: vec![EgressHost {
+                    host: "advisories.example.com".to_owned(),
+                    port: 443,
+                }],
+            }),
+        };
+        let without_workspace_or_web_access = EnvelopeSpec {
+            workspace: None,
+            egress: None,
+            ..full.clone()
+        };
+        assert_eq!(
+            direct_requirements_from_envelope(&full)
+                .map_err(|error| format!("project the full Envelope: {error:?}"))?,
+            direct_requirements_from_envelope(&without_workspace_or_web_access)
+                .map_err(|error| format!("project the reduced Envelope: {error:?}"))?,
+            "only workspace and web access are left out of the requirements"
+        );
         Ok(())
     }
 

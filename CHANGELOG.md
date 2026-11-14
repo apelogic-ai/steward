@@ -9,12 +9,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
-- Runs on an Envelope with web access hosts no longer fail. Since v0.3.32, every
-  Run now, inline, saved and personal agent run on such an Envelope was refused
-  with "Envelope cannot be projected: unknown field `egress`"
-  (`task.admission_rejected`). The run now starts, and its sandbox gets the
-  Envelope's web access hosts that the installation still allows, as before.
-  Task packages are unchanged: they still don't declare web access.
+- Tasks that don't declare their own `requires` now start on an Envelope with
+  web access hosts. Since v0.3.32 they were refused:
+  - Run now, inline and saved browser runs, and repository Tasks submitted with
+    `POST /v1/tasks`, failed with "Envelope cannot be projected: unknown
+    field `egress`" (`task.admission_rejected`);
+  - personal agent turns failed with "This turn could not start with the
+    selected coding agent and Envelope."
+
+  Published Workflow runs and Tasks that declare `requires` were not affected.
+  The run's sandbox gets the Envelope's web access hosts that the installation
+  still allows, the same as published Workflow runs. Task packages still don't
+  declare web access.
+- The same Tasks now start on an Envelope that sets no runner platforms. Before,
+  they were refused with "Envelope cannot be projected: missing field
+  `platforms`". The run keeps the Envelope's runner limits unchanged, as
+  personal agent turns already did.
 
 ## [0.3.33] - 2026-11-14
 
