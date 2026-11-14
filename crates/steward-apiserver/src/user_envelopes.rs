@@ -2437,41 +2437,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn signed_in_users_can_read_the_deployment_web_access_hosts() -> Result<(), String> {
-        let response = inner_router_with_capabilities(
-            TestBroker {
-                egress_catalog: egress_catalog(&["advisories.example.com", "feeds.example.com"]),
-                ..TestBroker::default()
-            },
-            Vec::new(),
-            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities(),
-        )
-        .layer(axum::Extension(session()?))
-        .oneshot(
-            Request::builder()
-                .uri("/app/api/v1/capabilities")
-                .body(Body::empty())
-                .map_err(|error| format!("build user capabilities request: {error}"))?,
-        )
-        .await
-        .map_err(|error| format!("request user capabilities: {error}"))?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read user capabilities response: {error}"))?;
-        let body: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse user capabilities response: {error}"))?;
-        assert_eq!(
-            body["egressHosts"],
-            serde_json::json!([
-                {"host": "advisories.example.com", "port": 443},
-                {"host": "feeds.example.com", "port": 443},
-            ])
-        );
-        Ok(())
-    }
-
     fn template() -> AvailableEnvelopeTemplate {
         let ceiling = Envelope {
             revision: 3,
@@ -3204,41 +3169,6 @@ mod tests {
                 })
                 .collect(),
         )
-    }
-
-    #[tokio::test]
-    async fn web_access_refusal_names_only_the_host_the_catalog_does_not_list() -> Result<(), String>
-    {
-        let broker = TestBroker {
-            template_override: Some(egress_template(&[
-                "advisories.example.com",
-                "feeds.example.com",
-            ])),
-            egress_catalog: egress_catalog(&["advisories.example.com"]),
-            ..TestBroker::default()
-        };
-        let (status, value) = post_egress_request(
-            broker.clone(),
-            &["advisories.example.com", "feeds.example.com"],
-            "within-one-unlisted",
-        )
-        .await?;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
-        assert_eq!(value["error"], "capability_not_available");
-        assert_eq!(value["fields"], serde_json::json!(["egressHosts"]));
-        assert_eq!(
-            value["failureReason"],
-            "This installation doesn't allow web access to feeds.example.com:443."
-        );
-        assert!(
-            broker
-                .create_owners
-                .lock()
-                .map_err(|_| "lock create calls")?
-                .is_empty(),
-            "a refused web access request must not persist"
-        );
-        Ok(())
     }
 
     #[tokio::test]

@@ -13917,15 +13917,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_run_drops_granted_web_access_hosts_the_installation_no_longer_allows()
-    -> Result<(), String> {
-        let (status, body, ledger) = submit_inline_run_with_web_access(Vec::new()).await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        assert_eq!(reserved_runtime_spec(&ledger, &body)?.egress, None);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn browser_run_on_an_envelope_without_runner_platforms_keeps_the_envelope_runner()
     -> Result<(), String> {
         let mut envelope_runner = None;

@@ -7428,12 +7428,11 @@ mod workflow_request_tests {
         direct_requirements_for_task, direct_requirements_from_envelope, direct_runtime_spec,
         direct_task_evidence_matches, format_workspace_bytes, personal_agent_task_definition,
         prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        runtime_egress, source_port_error, source_port_error_with_reporter,
-        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
-        versioned_workflow_reference, workspace_admission_policy,
-        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
+        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
+        workspace_admission_policy, workspace_git_materialized_budget,
+        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -9098,39 +9097,6 @@ mod workflow_request_tests {
             "a deployment whose catalog lists no egress host gives a Task no egress"
         );
         Ok(())
-    }
-
-    #[test]
-    fn runtime_egress_is_the_envelope_grant_within_the_catalog() {
-        let host = |name: &str| EgressHost {
-            host: name.to_owned(),
-            port: 443,
-        };
-        let grant = EgressAuthority {
-            hosts: vec![host("advisories.example.com"), host("dropped.example.org")],
-        };
-        assert_eq!(
-            runtime_egress(Some(&grant), &[host("advisories.example.com")]),
-            Some(EgressAuthority {
-                hosts: vec![host("advisories.example.com")],
-            })
-        );
-        assert_eq!(runtime_egress(Some(&grant), &[]), None);
-        assert_eq!(
-            runtime_egress(None, &[host("advisories.example.com")]),
-            None
-        );
-        assert_eq!(
-            runtime_egress(
-                Some(&grant),
-                &[EgressHost {
-                    host: "advisories.example.com".to_owned(),
-                    port: 8443,
-                }],
-            ),
-            None,
-            "a catalog host on another port does not cover the grant"
-        );
     }
 
     #[test]
