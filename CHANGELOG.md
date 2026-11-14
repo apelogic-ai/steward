@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.33] - 2026-11-14
+
+Steward v0.3.33 makes Envelope web access (public egress) hosts manageable in the browser:
+administrators choose a template's hosts and the hosts they provision, and refusals name the
+host. It adds no migration, CRD change or chart value.
+
 ### Changed
 
 - Web access (Envelope egress) hosts can be managed in the browser, labelled
@@ -35,6 +41,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - `GET /app/api/v1/capabilities` includes the catalog's `egressHosts` for
   signed-in users. It is omitted when the catalog lists none.
+
+### Upgrade and rollback
+
+- Back up the database, run the v0.3.33 platform preflight, and deploy the chart, component
+  images and reference runtimes as one release unit. There is no migration, CRD change or chart
+  value change.
+- An installation upgrading from v0.3.31 or earlier must still apply the `AgentRuntime` CRD that
+  v0.3.32 introduced before upgrading the chart (see v0.3.32 below), because Helm never updates
+  CRDs.
+- Clients that match on capability refusal reason text must match on the error code and fields
+  instead.
+- Rolling back to v0.3.32 needs no database restore. Rolling back to v0.3.31 or earlier needs the
+  pre-v0.3.32 backup, because v0.3.31 does not start against a database with migration 0077
+  applied.
 
 ## [0.3.32] - 2026-11-13
 
@@ -2000,7 +2020,9 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.31...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.33...HEAD
+[0.3.33]: https://github.com/apelogic-ai/steward/compare/v0.3.32...v0.3.33
+[0.3.32]: https://github.com/apelogic-ai/steward/compare/v0.3.31...v0.3.32
 [0.3.31]: https://github.com/apelogic-ai/steward/compare/v0.3.30...v0.3.31
 [0.3.30]: https://github.com/apelogic-ai/steward/compare/v0.3.29...v0.3.30
 [0.3.29]: https://github.com/apelogic-ai/steward/compare/v0.3.28...v0.3.29

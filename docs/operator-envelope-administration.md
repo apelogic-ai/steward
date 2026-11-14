@@ -1,6 +1,6 @@
 # User Envelope and RBAC administration
 
-Status: current Steward v0.3.32 contract.
+Status: current Steward v0.3.33 contract.
 
 This guide covers the catalog-backed User Envelope model and the supported
 day-two operator commands introduced after Steward 0.2.6. Canonical user IDs,
@@ -61,8 +61,8 @@ and tools:
 - an Envelope without `egress` grants no public egress, even when the catalog
   lists hosts.
 
-In the web app, where these hosts are labelled **Web access** (from the release
-after v0.3.32):
+In the web app, where these hosts are labelled **Web access** (Steward v0.3.33
+and later):
 
 - an administrator adds and removes a template's hosts in the template editor,
   choosing from the catalog's `egressHosts`. A host the catalog no longer lists
