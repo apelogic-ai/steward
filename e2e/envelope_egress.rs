@@ -1,5 +1,6 @@
 //! Envelope egress grants through the real request endpoint, the Postgres-backed request broker
-//! and a real deployment capability catalog.
+//! and a real deployment capability catalog, and a browser run on the granted Envelope through
+//! the real Task path.
 
 use std::env;
 use std::error::Error;
@@ -24,7 +25,9 @@ use steward_apiserver::browser_auth::{
     VerifiedOrganizationClaims, browser_auth_router,
 };
 use steward_apiserver::user_envelopes::{PgEnvelopeRequestBroker, protected_router};
-use steward_apiserver::{StewardRunRelease, StewardRunWorkflowInstallationMode, TaskApiConfig};
+use steward_apiserver::{
+    StewardRunRelease, StewardRunWorkflowInstallationMode, TaskApiConfig, browser_task_router,
+};
 use steward_store::{EnvelopeRequestReservationRequest, EnvelopeTemplatePublication, PgStore};
 use steward_types::direct_package::{WorkspaceAuthority, WorkspaceEntryType};
 use steward_types::{
@@ -135,12 +138,11 @@ fn hosts(names: &[&str]) -> EgressAuthority {
 async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_broker()
 -> Result<(), Box<dyn Error>> {
     super::install_rustls_crypto_provider()?;
-    let store = PgStore::new(
-        PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&env::var("STEWARD_TEST_DATABASE_URL")?)
-            .await?,
-    );
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&env::var("STEWARD_TEST_DATABASE_URL")?)
+        .await?;
+    let store = PgStore::new(pool.clone());
     store.migrate().await?;
     let suffix = Uuid::new_v4().simple().to_string();
     let role = format!("egress-{suffix}");
@@ -181,7 +183,10 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
             runtime_minutes_limit: None,
             workspace: None,
             ttl: Duration("1h".to_owned()),
-            runner: RunnerRequirements::default(),
+            runner: RunnerRequirements {
+                platforms: vec![RunnerPlatform::Linux],
+                ..RunnerRequirements::default()
+            },
             egress: Some(hosts(&["advisories.example.com", "retired.example.com"])),
         },
     };
@@ -323,6 +328,89 @@ async fn envelope_egress_requests_use_the_deployment_catalog_through_the_real_br
     let (status, within) = request(&["advisories.example.com"], "within").await?;
     assert_eq!(status, StatusCode::CREATED, "{within}");
     assert_eq!(within["request"]["status"], "provisioned");
+
+    // Run now with that Envelope: a direct Task through the real browser run path and store.
+    // The sandbox receives exactly the granted host the catalog still lists.
+    let envelope_digest = within["request"]["envelopeDigest"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("provisioned request omitted the Envelope digest"))?;
+    // The browser qualifies the request's digest the same way before it submits a run.
+    let envelope_digest = if envelope_digest.starts_with("steward:") {
+        envelope_digest.to_owned()
+    } else {
+        format!("steward:{envelope_digest}")
+    };
+    let task_config = super::published_workflow_task_config("example")?
+        .with_egress_ceiling(catalog.egress_hosts.clone());
+    let run = browser_auth_router(auth.clone())
+        .merge(browser_task_router(
+            store.clone(),
+            task_config,
+            auth.clone(),
+        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, ORIGIN)
+                .header("sec-fetch-site", "same-origin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-steward-csrf", &csrf)
+                .header("idempotency-key", format!("web-access-run-{suffix}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "inline",
+                            "path": "task-definition.json",
+                            "files": {
+                                "task-definition.json": serde_json::json!({
+                                    "schemaVersion": "steward.task-definition/v2",
+                                    "name": "web-access",
+                                    "version": 1,
+                                    "runtime": {
+                                        "agentRef": "example-agent@1",
+                                        "model": {"provider": "example", "model": "model-a"}
+                                    },
+                                    "promptText": "Read one public advisory.",
+                                    "outputs": [
+                                        {"path": "out", "kind": "directory", "required": true}
+                                    ]
+                                })
+                                .to_string()
+                            }
+                        },
+                        "envelopeDigest": envelope_digest,
+                        "inputs": {}
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let run_status = run.status();
+    let run = to_bytes(run.into_body(), 1 << 20).await?;
+    assert_eq!(
+        run_status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&run)
+    );
+    let run = serde_json::from_slice::<serde_json::Value>(&run)?;
+    let task_uid = Uuid::parse_str(
+        run["taskUid"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("run response omitted the Task UID"))?,
+    )?;
+    let (runtime_spec,): (serde_json::Value,) =
+        sqlx::query_as("SELECT runtime_spec FROM task_submissions WHERE task_uid = $1")
+            .bind(task_uid)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        runtime_spec["egress"],
+        serde_json::json!({"hosts": [{"host": "advisories.example.com", "port": 443}]}),
+        "the Task runtime must carry the Envelope's granted web access hosts"
+    );
 
     let (status, retired) = request(&["retired.example.com"], "retired").await?;
     assert_eq!(

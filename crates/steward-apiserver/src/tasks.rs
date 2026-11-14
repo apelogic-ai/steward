@@ -6805,6 +6805,9 @@ fn direct_requirements_from_envelope_inner(
         .as_object_mut()
         .ok_or_else(|| ApiError::Admission("Envelope authority is invalid".to_owned()))?;
     authority.remove("workspace");
+    // Web access is not a package requirement. Admission gives the runtime the Envelope's grant
+    // within the catalog through `runtime_egress`, so it is left out of the projection.
+    authority.remove("egress");
     let budget = authority
         .get_mut("budget")
         .and_then(serde_json::Value::as_object_mut)
@@ -7437,13 +7440,13 @@ mod workflow_request_tests {
         browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
         default_workspace_name, direct_authority_spec, direct_effective_requirements,
         direct_requirements_for_task, direct_runtime_spec, direct_task_evidence_matches,
-        format_workspace_bytes, prepare_task_input_archive, resolve_scratch_workspace_entry,
-        resolve_versioned_task_plan, runtime_egress, source_port_error,
-        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
-        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
-        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        format_workspace_bytes, personal_agent_task_definition, prepare_task_input_archive,
+        resolve_scratch_workspace_entry, resolve_versioned_task_plan, runtime_egress,
+        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
+        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
+        workspace_admission_policy, workspace_git_materialized_budget,
+        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -9184,6 +9187,43 @@ mod workflow_request_tests {
         let spec = direct_runtime_spec(&identity, &definition, &requirements, None)
             .map_err(|error| format!("project runtime without egress: {error:?}"))?;
         assert_eq!(spec.egress, None);
+        Ok(())
+    }
+
+    #[test]
+    fn envelopes_with_web_access_project_into_direct_and_personal_agent_requirements()
+    -> Result<(), String> {
+        let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        let mut ceiling = provisioned_envelope(identity.canonical_user_id.as_str())?
+            .approved_envelope
+            .ok_or_else(|| "approved Envelope is missing".to_owned())?;
+        ceiling.spec.runner.platforms = vec![steward_types::RunnerPlatform::Linux];
+        ceiling.spec.egress = Some(EgressAuthority {
+            hosts: vec![EgressHost {
+                host: "advisories.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let definition: DirectTaskDefinition = serde_json::from_value(serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "egress-check",
+            "version": 1,
+            "runtime": {
+                "agentRef": "example-agent@1.0.0",
+                "model": {"provider": "openai", "model": "gpt-5.4"}
+            },
+            "promptText": "Check egress.",
+            "outputs": []
+        }))
+        .map_err(|error| error.to_string())?;
+        direct_requirements_for_task(&definition, &ceiling.spec)
+            .map_err(|error| format!("project direct requirements: {error:?}"))?;
+        let model = ModelRef {
+            provider: "openai".to_owned(),
+            model: "gpt-5.4".to_owned(),
+        };
+        personal_agent_task_definition("example-agent@1.0.0", "Check egress.", &ceiling, &model)
+            .map_err(|error| format!("project personal agent requirements: {error}"))?;
         Ok(())
     }
 

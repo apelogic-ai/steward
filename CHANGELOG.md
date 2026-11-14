@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Runs on an Envelope with web access hosts no longer fail. Since v0.3.32, every
+  Run now, inline, saved and personal agent run on such an Envelope was refused
+  with "Envelope cannot be projected: unknown field `egress`"
+  (`task.admission_rejected`). The run now starts, and its sandbox gets the
+  Envelope's web access hosts that the installation still allows, as before.
+  Task packages are unchanged: they still don't declare web access.
+
 ## [0.3.33] - 2026-11-14
 
 Steward v0.3.33 makes Envelope web access (public egress) hosts manageable in the browser:

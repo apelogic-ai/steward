@@ -13808,6 +13808,101 @@ mod tests {
         Ok(())
     }
 
+    async fn submit_inline_run_with_web_access(
+        catalog_hosts: Vec<steward_types::EgressHost>,
+    ) -> Result<(StatusCode, serde_json::Value, FakeLedger), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        ledger
+            .user_envelopes
+            .lock()
+            .map_err(|_| "fake User Envelope ledger lock was poisoned")?
+            .first_mut()
+            .and_then(|envelope| envelope.approved_envelope.as_mut())
+            .ok_or_else(|| "fixture requires approved authority".to_owned())?
+            .spec
+            .egress = Some(steward_types::EgressAuthority {
+            hosts: vec![steward_types::EgressHost {
+                host: "api.example.com".to_owned(),
+                port: 443,
+            }],
+        });
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let config = task_api_config()?.with_egress_ceiling(catalog_hosts);
+        let response = browser_task_router(ledger.clone(), config, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-inline-web-access")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(inline_browser_task_body().to_string()))
+                    .map_err(|error| format!("build web access Run request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit web access Run request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read web access Run response: {error}"))?;
+        let body = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode web access Run response: {error}"))?;
+        Ok((status, body, ledger))
+    }
+
+    fn reserved_runtime_egress(
+        ledger: &FakeLedger,
+    ) -> Result<Option<steward_types::EgressAuthority>, String> {
+        ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?
+            .first()
+            .map(|task| task.runtime_spec.egress.clone())
+            .ok_or_else(|| "Task was not reserved".to_owned())
+    }
+
+    #[tokio::test]
+    async fn browser_run_on_an_envelope_with_web_access_is_admitted_with_the_granted_hosts()
+    -> Result<(), String> {
+        let granted = steward_types::EgressHost {
+            host: "api.example.com".to_owned(),
+            port: 443,
+        };
+        let (status, body, ledger) = submit_inline_run_with_web_access(vec![
+            granted.clone(),
+            steward_types::EgressHost {
+                host: "mirror.example.com".to_owned(),
+                port: 443,
+            },
+        ])
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            reserved_runtime_egress(&ledger)?,
+            Some(steward_types::EgressAuthority {
+                hosts: vec![granted]
+            }),
+            "the sandbox must receive exactly the Envelope's granted web access hosts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_run_drops_granted_web_access_hosts_the_installation_no_longer_allows()
+    -> Result<(), String> {
+        let (status, body, ledger) = submit_inline_run_with_web_access(Vec::new()).await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(reserved_runtime_egress(&ledger)?, None);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn browser_run_refuses_a_stored_zero_per_run_requirement_before_reservation()
     -> Result<(), String> {
