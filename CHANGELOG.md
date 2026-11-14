@@ -7,10 +7,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.34] - 2026-11-14
+
+Steward v0.3.34 fixes runs on Envelopes with web access hosts or without runner platforms, and
+makes web access hosts a template setting that no installation-wide list limits. It adds no
+migration, CRD change or chart value.
+
 ### Changed
 
 - Web access hosts are set on Envelope templates, and an administrator can
-  approve others; no installation-wide list limits them (#680).
+  approve others; no installation-wide list limits them (#680, #682).
   - An administrator types any well-formed host in the template editor (a full
     host name, with `:port` when it isn't 443), or sets it through the operator
     API. Wildcards, IP addresses, URLs, `localhost`, port 0 and repeated hosts
@@ -25,15 +31,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - Request forms and provisioning offer every template host, none selected by
     default. The provisioning page no longer loads
     `GET /admin/api/v1/capabilities`.
-  - **Upgrade:** a host you removed from the catalog list but that is still on a
-    template or an Envelope takes effect again. New runs on that Envelope get
-    it, and requests for it within the template are provisioned automatically.
-    If you used the catalog list to withdraw a host, remove it from those
-    templates and revoke or replace those Envelopes before upgrading.
-  - **Rollback to v0.3.33:** hosts that the catalog list doesn't include are
-    dropped from new runs again, requests and approvals for them are refused,
-    and templates that name them can't be saved until you add them to the
-    list.
 - `GET /app/api/v1/capabilities` no longer returns `egressHosts` (added in
   v0.3.33). It was optional and omitted when empty. The administrator
   `GET /admin/api/v1/capabilities` still echoes a configured `egressHosts`.
@@ -43,13 +40,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `config.apiserver.capabilityCatalog.egressHosts` is ignored. It is still
   accepted, so existing values keep working, and the apiserver logs one line at
   startup when it is set. Its entries are still format-checked, so a malformed
-  entry still stops startup. Move the hosts to your Envelope templates and remove
-  the setting; a later release drops it.
+  entry still stops startup. Hosts already on your templates keep working. After
+  upgrading, and once you no longer need to roll back, remove the setting; a
+  later release drops it.
 
 ### Fixed
 
 - Tasks that don't declare their own `requires` now start on an Envelope with
-  web access hosts. Since v0.3.32 they were refused:
+  web access hosts (#681). Since v0.3.32 they were refused:
   - Run now, inline and saved browser runs, and repository Tasks submitted with
     `POST /v1/tasks`, failed with "Envelope cannot be projected: unknown
     field `egress`" (`task.admission_rejected`);
@@ -63,6 +61,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   they were refused with "Envelope cannot be projected: missing field
   `platforms`". The run keeps the Envelope's runner limits unchanged, as
   personal agent turns already did.
+
+### Upgrade and rollback
+
+- Back up the database, run the v0.3.34 platform preflight, and deploy the chart, component
+  images and reference runtimes as one release unit. There is no migration, CRD change or chart
+  value change.
+- An installation upgrading from v0.3.31 or earlier must still apply the `AgentRuntime` CRD
+  updated in v0.3.32 (see v0.3.32 below) before upgrading the chart, because Helm never updates
+  CRDs.
+- A web access host you removed from `capabilityCatalog.egressHosts` but that is still on a
+  template or an Envelope takes effect again on upgrade: new runs on that Envelope get it, and
+  requests for it within the template are provisioned automatically. If you used the catalog list
+  to withdraw a host, remove it from those templates and revoke or replace those Envelopes before
+  upgrading. Hosts already on your templates keep working; add a host to a template only if its
+  users should get it without review.
+- Leaving `egressHosts` unset no longer prevents web access: anyone who can edit templates or
+  approve requests can grant any public host. Review who holds those roles.
+- Clients that read `egressHosts` from `GET /app/api/v1/capabilities` must stop relying on it.
+- Rolling back to v0.3.33 or v0.3.32 needs no database restore. Before rolling back, set
+  `capabilityCatalog.egressHosts` to include every host your templates, Envelopes and default
+  template use: v0.3.32 and v0.3.33 refuse to start when the default template names a host the
+  list doesn't include. After such a rollback, hosts the list doesn't include are dropped from new
+  runs again, requests and approvals for them are refused, and templates that name them can't be
+  saved. The two fixed refusals also return: Tasks without their own `requires` and personal agent
+  turns on Envelopes with web access hosts, and those Tasks on Envelopes without runner platforms.
+- Remove `capabilityCatalog.egressHosts` only after upgrading and once you no longer need to roll
+  back.
+  Rolling back to v0.3.31 or earlier needs the database backup taken before migration 0077 was
+  applied, restored to a new database target as described under v0.3.32 below; preserve audit and
+  decision records written since, and leave the updated CRD in place.
 
 ## [0.3.33] - 2026-11-14
 
@@ -2079,7 +2107,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.33...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.34...HEAD
+[0.3.34]: https://github.com/apelogic-ai/steward/compare/v0.3.33...v0.3.34
 [0.3.33]: https://github.com/apelogic-ai/steward/compare/v0.3.32...v0.3.33
 [0.3.32]: https://github.com/apelogic-ai/steward/compare/v0.3.31...v0.3.32
 [0.3.31]: https://github.com/apelogic-ai/steward/compare/v0.3.30...v0.3.31
