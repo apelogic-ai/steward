@@ -6,14 +6,29 @@ export function webAccessHostKey(host: EgressHost): string {
   return `${host.host}:${host.port ?? 443}`;
 }
 
-function hostKeys(hosts: ReadonlyArray<EgressHost> | null | undefined): Set<string> {
-  return new Set((hosts ?? []).map(webAccessHostKey));
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/**
+ * Reads a typed web access host: an exact public DNS name, with `:port` when it isn't 443. Returns
+ * null for anything else (wildcards, IP addresses, URLs, `localhost`, port 0). The server checks
+ * the same rules.
+ */
+export function parseWebAccessHost(input: string): EgressHost | null {
+  const match = /^([^:]+)(?::(\d{1,5}))?$/.exec(input.trim().toLowerCase());
+  if (!match) return null;
+  const [, host, portText] = match;
+  const port = portText === undefined ? 443 : Number(portText);
+  if (port < 1 || port > 65535 || host.length > 253) return null;
+  const labels = host.split(".");
+  if (labels.length < 2 || !labels.every((label) => DNS_LABEL.test(label))) return null;
+  const topLevel = labels[labels.length - 1];
+  if (!/^[a-z]/.test(topLevel) || topLevel === "localhost") return null;
+  return { host, port };
 }
 
-/** The template's web access hosts that this installation still allows, in template order. */
-export function allowedWebAccessHosts(templateHosts: ReadonlyArray<EgressHost> | null | undefined, installationHosts: ReadonlyArray<EgressHost> | null | undefined): Array<EgressHost> {
-  const allowed = hostKeys(installationHosts);
-  return (templateHosts ?? []).filter((host) => allowed.has(webAccessHostKey(host)));
+/** Every host as a neutral option: a grant allows every HTTP method, so hosts carry no access-class badge. */
+export function webAccessHostOptions(hosts: ReadonlyArray<EgressHost>): Array<TagSelectOption> {
+  return hosts.map((host) => ({ key: webAccessHostKey(host), kind: "neutral" as const, label: webAccessHostKey(host) }));
 }
 
 /** The chosen hosts as an Envelope grant, or nothing when none are chosen. */
@@ -27,31 +42,4 @@ export function provisionedEnvelope(template: BrowserEnvelope, selected: Readonl
   const { egress: templateEgress, ...spec } = template.spec;
   const egress = webAccessGrant(templateEgress?.hosts ?? [], selected);
   return { ...template, spec: egress ? { ...spec, egress } : spec };
-}
-
-/** Template editor options: every host this installation allows, plus selected hosts it no longer allows, which can only be removed. */
-export function templateWebAccessOptions(installationHosts: ReadonlyArray<EgressHost> | null | undefined, selectedHosts: ReadonlyArray<EgressHost>): Array<TagSelectOption> {
-  const allowed = (installationHosts ?? []).map((host) => ({ key: webAccessHostKey(host), kind: "neutral" as const, label: webAccessHostKey(host) }));
-  const dropped = unavailableWebAccessHosts(selectedHosts, installationHosts).map((host) => ({
-    disabled: true,
-    key: webAccessHostKey(host),
-    kind: "neutral" as const,
-    label: webAccessHostKey(host),
-    note: "Not allowed in this installation",
-  }));
-  return [...allowed, ...dropped];
-}
-
-/** The selected hosts this installation doesn't allow. */
-export function unavailableWebAccessHosts(selectedHosts: ReadonlyArray<EgressHost>, installationHosts: ReadonlyArray<EgressHost> | null | undefined): Array<EgressHost> {
-  const allowed = hostKeys(installationHosts);
-  return selectedHosts.filter((host) => !allowed.has(webAccessHostKey(host)));
-}
-
-/** Why no web access host is offered, or null when some are. Undefined installation hosts mean they haven't loaded. */
-export function webAccessEmptyMessage(templateHosts: ReadonlyArray<EgressHost> | null | undefined, offeredHosts: ReadonlyArray<EgressHost>, installationHosts: ReadonlyArray<EgressHost> | null | undefined, loading: boolean): string | null {
-  if (offeredHosts.length) return null;
-  if (!templateHosts?.length) return "This template allows no web access.";
-  if (installationHosts === undefined || installationHosts === null) return loading ? "Loading web access hosts…" : "Web access hosts couldn't be loaded. Reload the page to try again.";
-  return "This installation no longer allows this template's web access hosts.";
 }

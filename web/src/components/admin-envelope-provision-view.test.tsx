@@ -10,10 +10,10 @@ describe("administrator envelope provisioning", () => {
     expect(source).not.toContain("requestedEnvelope: template.envelope,");
   });
 
-  test("offers only template hosts this installation still allows", () => {
-    expect(source).toContain("getAdminCapabilities");
-    expect(source).toContain("allowedWebAccessHosts(template.envelope.spec.egress?.hosts, options.webAccessHosts)");
+  test("offers every template host, with no installation list (#680)", () => {
+    expect(source).not.toContain("getAdminCapabilities");
+    expect(source).toContain("webAccessHostOptions(template.envelope.spec.egress?.hosts ?? [])");
     expect(source).toContain('label="Web access hosts"');
-    expect(source).toContain('kind: "neutral" as const, label: webAccessHostKey(host)');
+    expect(source).toContain("This template allows no web access.");
   });
 });

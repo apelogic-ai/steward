@@ -10144,7 +10144,7 @@
             "items": {
               "$ref": "#/components/schemas/EgressHost"
             },
-            "description": "Public hosts this deployment allows Envelopes to grant for egress. Empty means\nno public egress is available; omitted when empty."
+            "description": "Deprecated and ignored (#680): web access hosts are set on Envelope templates. Still\naccepted, and still format-checked, so existing configurations keep starting; omitted\nwhen empty."
           },
           "models": {
             "type": "array",
@@ -14538,13 +14538,6 @@
           },
           "apiVersion": {
             "type": "string"
-          },
-          "egressHosts": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/EgressHost"
-            },
-            "description": "Public hosts this deployment allows Envelopes to grant for web access. Omitted when the\ndeployment allows none."
           },
           "workspace": {
             "$ref": "#/components/schemas/WorkspaceDeploymentCapabilities"

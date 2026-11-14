@@ -20,32 +20,14 @@ function authoredEnvelope() {
 }
 
 describe("template web access", () => {
-  const validFields = {
-    allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
-    allowedTools: new Set<string>(),
-    displayName: "Engineer",
-    memberRoles: ["engineer"],
-    models: [{ provider: "provider-a", model: "model-a" }],
-    monthlyLimit: "10.00",
-    singleRunLimit: "1.00",
-    templateId: "engineer",
-    tools: [],
-  };
-
-  test("refuses to save a web access host this installation doesn't allow", () => {
-    const envelope = { ...authoredEnvelope(), spec: { ...authoredEnvelope().spec, egress: { hosts: [{ host: "retired.example.com", port: 443 }] } } };
-    expect(validateTemplateFields({ ...validFields, envelope, installationWebAccessHosts: [{ host: "advisories.example.com", port: 443 }] }).egressHosts)
-      .toBe("Remove every web access host this installation doesn't allow.");
-    expect(validateTemplateFields({ ...validFields, envelope, installationWebAccessHosts: [{ host: "retired.example.com", port: 443 }] }).egressHosts)
-      .toBeUndefined();
-    expect(validateTemplateFields({ ...validFields, envelope: authoredEnvelope(), installationWebAccessHosts: [] }).egressHosts)
-      .toBeUndefined();
-  });
-
-  test("edits web access hosts from the installation list and saves only the chosen hosts", () => {
-    expect(source).toContain("templateWebAccessOptions(capabilities.egressHosts, webAccessHosts)");
+  test("takes any typed host name and saves only the chosen hosts", () => {
+    // No installation list limits web access hosts (#680): the administrator types them.
+    expect(source).toContain("allowCreate");
+    expect(source).toContain("parseWebAccessHost(key)");
+    expect(source).toContain("options={webAccessHostOptions(webAccessHosts)}");
     expect(source).toContain("...(webAccessHosts.length ? { egress: { hosts: webAccessHosts } } : {})");
-    expect(source).not.toContain("...(template.spec.egress ? { egress: template.spec.egress } : {})");
+    expect(source).not.toContain("capabilities.egressHosts");
+    expect(source).not.toContain("Not allowed in this installation");
     expect(source).not.toContain("Change them through the operator API");
     expect(source).toContain('title="Web access"');
     expect(source).toContain('"workspace", "egressHosts"] as const');

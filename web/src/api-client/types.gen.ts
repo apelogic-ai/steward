@@ -854,8 +854,9 @@ export type CanonicalUserId = string;
 export type CapabilityCatalog = {
     catalogs: Array<CapabilityProviderCatalog>;
     /**
-     * Public hosts this deployment allows Envelopes to grant for egress. Empty means
-     * no public egress is available; omitted when empty.
+     * Deprecated and ignored (#680): web access hosts are set on Envelope templates. Still
+     * accepted, and still format-checked, so existing configurations keep starting; omitted
+     * when empty.
      */
     egressHosts?: Array<EgressHost>;
     models: Array<ModelRef>;
@@ -2004,11 +2005,6 @@ export type UserCapabilitiesResponse = {
      */
     agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
-    /**
-     * Public hosts this deployment allows Envelopes to grant for web access. Omitted when the
-     * deployment allows none.
-     */
-    egressHosts?: Array<EgressHost>;
     workspace: WorkspaceDeploymentCapabilities;
 };
 

@@ -50,13 +50,14 @@ describe("envelope run history", () => {
 
   test("requests only the template web access hosts the person selects, none by default", () => {
     expect(source).toContain("useState<ReadonlySet<string>>(() => new Set())");
-    expect(source).toContain("egress: webAccessGrant(offeredWebAccessHosts, egressHosts)");
+    expect(source).toContain("egress: webAccessGrant(templateWebAccessHosts, egressHosts)");
     expect(source).toContain('rejectedFields.includes("egressHosts")');
   });
 
-  test("offers only template web access hosts this installation still allows", () => {
-    expect(source).toContain("allowedWebAccessHosts(template.ceiling.spec.egress?.hosts, webAccessHosts)");
-    expect(source).toContain("capabilitiesState.value.egressHosts");
+  test("offers every template web access host, with no installation list (#680)", () => {
+    expect(source).toContain("webAccessHostOptions(templateWebAccessHosts)");
+    expect(source).not.toContain("egressHosts ?? []");
+    expect(source).toContain("This template allows no web access.");
   });
 
   test("loads deployment workspace capabilities for template and custom requests", () => {

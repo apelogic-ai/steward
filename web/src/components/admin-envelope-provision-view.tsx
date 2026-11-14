@@ -4,15 +4,13 @@ import Link from "next/link";
 import { useCallback, useRef, useState, type FormEvent } from "react";
 
 import {
-  getAdminCapabilities,
   listAdminEnvelopeTemplates,
   provisionAdminEnvelope,
   type BrowserEnvelopeTemplateListItem,
-  type EgressHost,
 } from "@/api-client";
 import { TagSelect } from "@/components/hs";
 import { formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
-import { allowedWebAccessHosts, provisionedEnvelope, webAccessEmptyMessage, webAccessHostKey } from "@/components/web-access";
+import { provisionedEnvelope, webAccessHostOptions } from "@/components/web-access";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -20,19 +18,13 @@ import { useSession } from "@/session/session-context";
 
 type ProvisionOptions = {
   templates: Array<BrowserEnvelopeTemplateListItem>;
-  /** The web access hosts this installation allows. */
-  webAccessHosts: Array<EgressHost>;
 };
 
 async function loadProvisionOptions(): Promise<{ data?: ProvisionOptions; response?: Response }> {
-  const [templates, capabilities] = await Promise.all([
-    listAdminEnvelopeTemplates({ cache: "no-store", credentials: "same-origin" }),
-    getAdminCapabilities({ cache: "no-store", credentials: "same-origin" }),
-  ]);
+  const templates = await listAdminEnvelopeTemplates({ cache: "no-store", credentials: "same-origin" });
   if (!templates.data || !templates.response?.ok) return { response: templates.response };
-  if (!capabilities.data || !capabilities.response?.ok) return { response: capabilities.response };
   return {
-    data: { templates: templates.data.templates, webAccessHosts: capabilities.data.egressHosts ?? [] },
+    data: { templates: templates.data.templates },
     response: templates.response,
   };
 }
@@ -69,8 +61,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
   const [webAccessHosts, setWebAccessHosts] = useState<ReadonlySet<string>>(() => new Set());
   const idempotencyKey = useRef<string | null>(null);
   const template = options.templates.find((item) => item.id === templateId) ?? options.templates[0];
-  const webAccessOptions = allowedWebAccessHosts(template.envelope.spec.egress?.hosts, options.webAccessHosts)
-    .map((host) => ({ key: webAccessHostKey(host), kind: "neutral" as const, label: webAccessHostKey(host) }));
+  const webAccessOptions = webAccessHostOptions(template.envelope.spec.egress?.hosts ?? []);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -132,7 +123,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
         {webAccessOptions.length ? <>
           <TagSelect addPlaceholder="Add a host…" disabled={status === "submitting"} emptyPlaceholder="Search hosts…" label="Web access hosts" noResultsMessage={(query) => `No hosts in this template match “${query}”`} onChange={(next) => { setWebAccessHosts(new Set(next)); idempotencyKey.current = null; setStatus("idle"); }} options={webAccessOptions} value={[...webAccessHosts]} />
           <p className="text-sm text-muted-ink">Choose only the websites this person&apos;s agents need. Nothing is granted unless you add it.</p>
-        </> : <p className="text-sm text-muted-ink">{webAccessEmptyMessage(template.envelope.spec.egress?.hosts, [], options.webAccessHosts, false)}</p>}
+        </> : <p className="text-sm text-muted-ink">This template allows no web access.</p>}
       </section>
       <p className="text-sm text-muted-ink">The selected user remains the owner. Your administrator identity is recorded as the person who made this change.</p>
       {status === "provisioned" ? <p className="rounded-md bg-notice p-4 text-sm" role="status"><strong>Envelope provisioned.</strong>{provisionedId ? ` Instance ${provisionedId}.` : ""}</p> : null}

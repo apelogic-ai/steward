@@ -45,42 +45,45 @@ but ignored for one release and emits one startup warning when set.
 
 An Envelope may grant HTTPS access to named public hosts with
 `spec.egress.hosts`, a list of `{"host": "<exact DNS name>", "port": <1-65535>}`
-entries (the port defaults to 443). The grant follows the same rules as models
-and tools:
+entries (the port defaults to 443). From Steward v0.3.34, these hosts come from
+Envelope templates, or from an administrator approving a request above its
+template or without one. No installation-wide list limits them (#680).
 
-- the deployment capability catalog's `egressHosts` is the ceiling, and an
-  installation that lists none offers no public egress;
-- a template may grant only hosts the catalog lists, whether it is authored in
-  the browser or applied through the operator API;
-- a request whose hosts are all in its template is provisioned automatically, a
-  host outside the template but in the catalog waits for an administrator, and a
-  host the catalog doesn't list is refused with `422 capability_not_available`
-  (field `egressHosts`), even when its template lists that host;
-- approval, browser and operator provisioning, legacy Envelope authoring and the
-  optional default template check the same catalog, parsed once at startup;
-- an Envelope without `egress` grants no public egress, even when the catalog
-  lists hosts.
+- An administrator sets a template's hosts, in the browser or through the
+  operator API. Any well-formed host can be added.
+- A request whose hosts are all in its template is provisioned automatically. A
+  host outside the template waits for an administrator, with an `egressHosts`
+  exceedance.
+- Requests, browser and operator provisioning, template authoring, legacy
+  Envelope authoring and the optional default template check the format only.
+  Approval grants exactly the hosts of the stored request, which passed that
+  check.
+- An Envelope without `egress` grants no public egress.
 
-In the web app, where these hosts are labelled **Web access** (Steward v0.3.33
-and later):
+`config.apiserver.capabilityCatalog.egressHosts` was the installation-wide list
+in v0.3.32 and v0.3.33. From v0.3.34 it is still accepted, so existing
+configurations keep starting, but it is ignored. The apiserver logs one line at
+startup when it is set, and a malformed entry still stops startup. Remove it
+from your values; a later release drops it.
 
-- an administrator adds and removes a template's hosts in the template editor,
-  choosing from the catalog's `egressHosts`. A host the catalog no longer lists
-  stays visible so it can be removed, and the template can't be saved until it
-  is;
+On upgrade to v0.3.34, a host that was removed from that list but is still on a
+template or an Envelope takes effect again: new runs on that Envelope get it.
+If you used the list to withdraw a host, remove it from those templates and
+revoke or replace those Envelopes first.
+
+In the web app, where these hosts are labelled **Web access**:
+
+- an administrator types each host in the template editor, as a full host name
+  with `:port` when it isn't 443. A malformed host is refused in the form and
+  by the server;
 - a person requesting an Envelope, and an administrator provisioning one, pick
-  from the template's hosts that the catalog still lists. None is selected by
-  default, so provisioning from a template grants no host unless the
-  administrator adds it;
+  from the template's hosts. None is selected by default, so provisioning from a
+  template grants no host unless the administrator adds it;
 - approvers see every requested host when reviewing a request.
 
-On every write path (browser, operator API and legacy authoring), the
-`422 capability_not_available` reason names each refused host, for example
-"This installation doesn't allow web access to api.example.com:443.". A request
-that needs review gets it before being asked for a justification. Browser
-provisioning refuses a malformed host with `422 invalid_egress_hosts` before
-checking the catalog. `GET /app/api/v1/capabilities` lists the catalog's
-`egressHosts` to signed-in users, omitted when the catalog lists none.
+Browser provisioning refuses a malformed host with `422 invalid_egress_hosts`;
+the operator API and legacy authoring refuse it with `422`, error
+`invalid egress hosts`.
 
 Hosts must be exact lowercase DNS names whose top-level domain starts with a
 letter. Wildcards, IP addresses, single-label names, `localhost`, URLs, port 0 and
@@ -90,9 +93,9 @@ the same host set always gives the same Envelope digest, and an Envelope without
 
 A Task's sandbox can reach exactly the hosts its Envelope grants:
 
-- when a Task is admitted, its runtime records the Envelope's `egress` hosts
-  that the capability catalog still lists; admission refuses a runtime that
-  names a host its Envelope doesn't grant;
+- when a Task is admitted, its runtime records exactly the Envelope's `egress`
+  hosts; admission refuses a runtime that names a host its Envelope doesn't
+  grant;
 - a sandbox with an egress grant is created with a Steward policy: OpenShell's
   restrictive default filesystem and landlock settings, the `sandbox` user and
   group, and one network rule, `steward-egress`, that allows each granted host
@@ -102,8 +105,7 @@ A Task's sandbox can reach exactly the hosts its Envelope grants:
 
 The policy is set when the sandbox is created and never changed. Like its models
 and tools, a Task keeps the egress it was admitted with until it ends. Revoking a
-host on the Envelope, or removing it from the catalog, applies to new Tasks, not
-to Tasks already running.
+host on the Envelope applies to new Tasks, not to Tasks already running.
 
 **Granting egress replaces the image's own sandbox policy for that sandbox,
 including the image's network rules.** Without a grant, OpenShell uses the policy
