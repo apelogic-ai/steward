@@ -157,6 +157,11 @@ express an explicit empty set. `budget.singleRunLimit` and the runner `memory`,
 legal optional maxima exactly. Partial objects are invalid. Steward snapshots the
 resulting complete effective requirements in evidence before runtime work.
 
+Web access is not a requirement. `requires` cannot declare it, and the requirements
+snapshot does not carry it. Whether or not `requires` is present, the run's sandbox
+receives the resolved Envelope's web access hosts that the installation still allows,
+and the Task's runtime record carries them.
+
 The package does not declare `shell`, `python3`, or other execution capabilities.
 `runtime.agentRef` selects the immutable deployment-owned execution binding, and the
 current binding and Envelope contracts expose no separate execution-capability
