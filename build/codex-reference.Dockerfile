@@ -1,3 +1,13 @@
+# The governed command helper is compiled from vendored mcp-gw v0.8.2 source
+# (third_party/mcp-gw-sandbox-helper) so that no prebuilt helper binary of ours
+# enters the image. It uses only Node built-ins, so the build needs no package
+# install. The compiled helper embeds the Bun runtime from this pinned image.
+FROM oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 AS sandbox-helper
+WORKDIR /src
+COPY third_party/mcp-gw-sandbox-helper/cff55e2b/sandbox-helper.ts third_party/mcp-gw-sandbox-helper/cff55e2b/shim.ts ./
+RUN bun build --compile --outfile /out/mcp-gw-sandbox-helper /src/sandbox-helper.ts \
+    && chmod 0755 /out/mcp-gw-sandbox-helper
+
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
 
 USER root
@@ -17,15 +27,8 @@ ARG TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e
 ARG UV_VERSION=0.11.15
 ARG UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
 RUN case "${TARGETARCH}" in \
-      amd64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-amd64.tar.gz"; \
-        helper_sha256="b539765dbc551a37d25faaeedf6027149f3bce99a362d275ad3d28ac5be27fdd" \
-        ;; \
-      arm64) \
-        helper_url="https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-arm64.tar.gz"; \
-        helper_sha256="ca62b90c1e73d3e6cf8e5f5e8a5a62c5f51adc1bff7f42b2f7eb00326a6a690c" \
-        ;; \
-      *) echo "unsupported sandbox helper architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+      amd64|arm64) ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
@@ -48,16 +51,12 @@ RUN case "${TARGETARCH}" in \
     && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location \
         "https://mirrors.edge.kernel.org/ubuntu/pool/universe/t/tree/tree_${TREE_VERSION}_amd64.deb" \
         --output /tmp/tree.deb \
-    && curl --fail --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 --silent --show-error --location "${helper_url}" \
-        --output /tmp/mcp-gw-sandbox-helper.tar.gz \
     && printf '%s  %s\n' "${RIPGREP_SHA256}" /tmp/ripgrep.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${JQ_SHA256}" /tmp/jq.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBJQ_SHA256}" /tmp/libjq1.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${LIBONIG_SHA256}" /tmp/libonig5.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${FD_FIND_SHA256}" /tmp/fd-find.deb | sha256sum --check --strict \
     && printf '%s  %s\n' "${TREE_SHA256}" /tmp/tree.deb | sha256sum --check --strict \
-    && printf '%s  %s\n' "${helper_sha256}" \
-        /tmp/mcp-gw-sandbox-helper.tar.gz | sha256sum --check --strict \
     && printf '%s  %s\n' "${UV_SHA256}" /tmp/uv.tar.gz | sha256sum --check --strict \
     && mkdir /tmp/uv-release \
     && tar --extract --gzip --file /tmp/uv.tar.gz --strip-components=1 --directory /tmp/uv-release \
@@ -75,10 +74,6 @@ RUN case "${TARGETARCH}" in \
     && rm /tmp/ripgrep.deb /tmp/libonig5.deb \
         /tmp/libjq1.deb /tmp/jq.deb /tmp/fd-find.deb /tmp/tree.deb \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
-    && tar --extract --gzip --file /tmp/mcp-gw-sandbox-helper.tar.gz \
-        --directory /usr/local/bin mcp-gw-sandbox-helper \
-    && rm /tmp/mcp-gw-sandbox-helper.tar.gz \
-    && chmod 0755 /usr/local/bin/mcp-gw-sandbox-helper \
     && printf '%s\n' '#!/bin/sh' \
         'exec /usr/local/bin/mcp-gw-sandbox-helper ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} ${SSL_CERT_FILE:+--ca-file "$SSL_CERT_FILE"} --run-token openshell-token-grant-placeholder --cli-url "$MCP_GW_CLI_URL" --operation kubectl "$@"' \
         >/usr/local/bin/kubectl \
@@ -104,6 +99,7 @@ RUN case "${TARGETARCH}" in \
     && test "$(uvx --version | cut -d ' ' -f 1-2)" = "uvx ${UV_VERSION}" \
     && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin apt-get purge --yes --auto-remove linux-libc-dev
 
+COPY --from=sandbox-helper /out/mcp-gw-sandbox-helper /usr/local/bin/mcp-gw-sandbox-helper
 USER sandbox
 RUN rg --version \
     && jq --version \

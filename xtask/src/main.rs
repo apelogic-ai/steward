@@ -5866,6 +5866,44 @@ mod tests {
     }
 
     #[test]
+    fn vendored_sandbox_helper_source_matches_its_pinned_release() -> Result<(), String> {
+        use sha2::Digest;
+        let directory = root().join("third_party/mcp-gw-sandbox-helper/cff55e2b");
+        for (file, expected) in [
+            (
+                "sandbox-helper.ts",
+                "22eca9be6fe9cb87f36a923364f19adda94a84c04c9d350c2e0f1808b4cd0589",
+            ),
+            (
+                "shim.ts",
+                "88c08c2822213311567cd2e3f319fb4fbb2ba0ce4d2eca66986689c8e924228e",
+            ),
+        ] {
+            let bytes = fs::read(directory.join(file))
+                .map_err(|error| format!("vendored sandbox helper {file} is required: {error}"))?;
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(&bytes)),
+                expected,
+                "vendored sandbox helper {file} must stay byte-identical to mcp-gw v0.8.2 (cff55e2b)"
+            );
+        }
+        let readme = fs::read_to_string(directory.join("README.md"))
+            .map_err(|error| format!("vendored sandbox helper README is required: {error}"))?;
+        assert!(
+            readme.contains("cff55e2b271273515722df0f619b9a8532b33b81"),
+            "the README must record the pinned mcp-gw commit"
+        );
+        let license = fs::read(directory.join("LICENSE"))
+            .map_err(|error| format!("vendored sandbox helper LICENSE is required: {error}"))?;
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&license)),
+            "cb1214bf664cc90a56b7584f8a758d83014ed55ff7f65cacf2078d8dea1d39b3",
+            "the vendored helper must carry mcp-gw's unmodified license"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn governed_command_helper_is_pinned_packaged_and_tested() -> Result<(), String> {
         let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
             .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
@@ -5895,12 +5933,18 @@ mod tests {
             "every runtime artifact download must retry transport failures"
         );
 
+        // The helper is compiled from vendored, pinned mcp-gw source in a pinned
+        // Bun stage, so no prebuilt helper binary enters the image.
+        assert!(
+            !container.contains("apelogic-ai/mcp-gw/releases"),
+            "runtime image must build the sandbox helper from source, not download a prebuilt release"
+        );
         for required in [
             "ARG TARGETARCH",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-amd64.tar.gz",
-            "https://github.com/apelogic-ai/mcp-gw/releases/download/v0.8.2/mcp-gw-sandbox-helper-linux-arm64.tar.gz",
-            "b539765dbc551a37d25faaeedf6027149f3bce99a362d275ad3d28ac5be27fdd",
-            "ca62b90c1e73d3e6cf8e5f5e8a5a62c5f51adc1bff7f42b2f7eb00326a6a690c",
+            "FROM oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0 AS sandbox-helper",
+            "WORKDIR /src\nCOPY third_party/mcp-gw-sandbox-helper/cff55e2b/sandbox-helper.ts third_party/mcp-gw-sandbox-helper/cff55e2b/shim.ts ./",
+            "bun build --compile --outfile /out/mcp-gw-sandbox-helper /src/sandbox-helper.ts",
+            "COPY --from=sandbox-helper /out/mcp-gw-sandbox-helper /usr/local/bin/mcp-gw-sandbox-helper",
             "sha256sum --check --strict",
             "/usr/local/bin/mcp-gw-sandbox-helper",
             "/usr/local/bin/kubectl",

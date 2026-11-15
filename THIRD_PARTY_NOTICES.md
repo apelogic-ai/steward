@@ -1,11 +1,12 @@
 # Third-party notices
 
 Steward's own source and chart are licensed under the root [MIT license](LICENSE).
-The following checked-in patch material retains its upstream license and
-copyright; the Steward MIT notice does not replace those terms.
+The following checked-in patch and source material retains its upstream license
+and copyright; the Steward MIT notice does not replace those terms.
 
 | Material | Pinned upstream source | License copy |
 |---|---|---|
+| MCP-GW sandbox helper source (compiled into the Codex reference runtime) | [apelogic-ai/mcp-gw `v0.8.2` (`cff55e2b`)](https://github.com/apelogic-ai/mcp-gw/tree/cff55e2b271273515722df0f619b9a8532b33b81/servers/governed-cli/src) | [MIT, Copyright (c) 2026 ApeLogic AI](third_party/mcp-gw-sandbox-helper/cff55e2b/LICENSE) |
 | MCP-GW verified-claims patch | [apelogic-ai/mcp-gw `c2af10d9`](https://github.com/apelogic-ai/mcp-gw/tree/c2af10d9c3dee898e368e6cf3d0f5a1ef6ad0dde) | [MIT, Copyright (c) 2026 ApeLogic AI](third_party/mcp-gw-patches/c2af10d9/LICENSE) |
 | agent-sandbox chart | [kubernetes-sigs/agent-sandbox `v0.5.0`](https://github.com/kubernetes-sigs/agent-sandbox/releases/tag/v0.5.0) | Apache-2.0; the source archive is verified by SHA-256 and its upstream license is packaged with the wrapper; the digest-safe version label is recorded in the chart's modification notice |
 | OpenShell chart dependency | [NVIDIA/OpenShell `v0.0.98`](https://github.com/NVIDIA/OpenShell/releases/tag/v0.0.98) | Apache-2.0; packaged from the pinned upstream OCI chart with its upstream license |
