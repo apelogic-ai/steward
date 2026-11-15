@@ -137,7 +137,7 @@ while IFS= read -r -d '' candidate; do
 done < <(find "${root}/.github" "${root}/build" "${root}/scripts" -type f -print0)
 
 check_surface '.github/actions/setup-tools/action.yml' 14 '*'
-check_surface 'build/codex-reference.Dockerfile' 8 '*'
+check_surface 'build/codex-reference.Dockerfile' 7 '*'
 check_surface 'build/claude-code-reference.Dockerfile' 7 '*'
 check_surface 'scripts/g1-upstream-conformance-inside.sh' 2 \
   'github.com/NVIDIA/OpenShell/releases/download'

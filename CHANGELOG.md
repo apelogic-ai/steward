@@ -7,6 +7,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- The Codex reference runtime image now builds the MCP-GW 0.8.2 sandbox helper
+  (`/usr/local/bin/mcp-gw-sandbox-helper`, used by the `kubectl` and
+  `remote-shell` wrappers) from source instead of downloading the prebuilt
+  binary from mcp-gw's GitHub releases. The source is vendored and pinned in
+  `third_party/mcp-gw-sandbox-helper/cff55e2b` and compiled in a pinned
+  `oven/bun:1.2.21` build stage (#684). Helper behaviour is unchanged. Like
+  the prebuilt binary, the compiled helper embeds the Bun 1.2.21 runtime, now
+  taken from that pinned image.
+  - Building the image no longer needs access to
+    `github.com/apelogic-ai/mcp-gw/releases`. It now pulls
+    `docker.io/oven/bun:1.2.21` (pinned by digest). Every other build-time
+    download is unchanged; the Codex runtime guide lists them all.
+
 ## [0.3.34] - 2026-11-14
 
 Steward v0.3.34 fixes runs on Envelopes with web access hosts or without runner platforms, and
