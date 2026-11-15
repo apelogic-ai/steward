@@ -1,6 +1,6 @@
 # Execution bindings
 
-Status: current Steward 0.3.34 installation contract, including the `remoteShellTargets`
+Status: current Steward 0.3.35 installation contract, including the `remoteShellTargets`
 extension described below
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
