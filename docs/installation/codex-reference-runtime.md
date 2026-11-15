@@ -45,7 +45,9 @@ installs it at `/usr/local/bin/mcp-gw-sandbox-helper`. The source is vendored
 and pinned in `third_party/mcp-gw-sandbox-helper/cff55e2b` (mcp-gw release
 v0.8.2), and a build stage compiles it with `bun build --compile` in the pinned
 `oven/bun:1.2.21` image, so no prebuilt helper binary is downloaded. The
-compiled helper embeds the Bun 1.2.21 runtime from that pinned image. The `kubectl` and `remote-shell`
+compiled helper embeds the Bun 1.2.21 runtime from that pinned image. Steward
+v0.3.34 and earlier downloaded the prebuilt helper from mcp-gw's GitHub
+releases instead. The `kubectl` and `remote-shell`
 wrappers select the matching helper operation explicitly and pass the
 placeholder run token and the matching route to the helper as options, because
 the sandbox supervisor can start the helper with an empty environment. For the
@@ -135,12 +137,13 @@ The build downloads only these pinned inputs:
 - the base image `ghcr.io/nvidia/openshell-community/sandboxes/base` and the build image
   `docker.io/oven/bun:1.2.21`, both by digest;
 - `uv` from `github.com/astral-sh/uv/releases`, checked by SHA-256;
-- Ubuntu packages (`ripgrep`, `jq`, `fd-find`, `tree`) from `mirrors.edge.kernel.org`, checked by
-  SHA-256;
+- Ubuntu packages (`ripgrep`, `jq` with `libjq1` and `libonig5`, `fd-find`, `tree`) from
+  `mirrors.edge.kernel.org`, checked by SHA-256;
 - `@openai/codex` and `tar` from the npm registry, at exact versions.
 
 The MCP-GW sandbox helper is compiled from the vendored source in the repository, so the build
-needs no access to mcp-gw's GitHub releases.
+needs no access to mcp-gw's GitHub releases. The build context must include
+`third_party/mcp-gw-sandbox-helper/`.
 
 Verify a private image's platform, non-root user, CLI version, and provider-profile compatibility
 before activation. It is independently built and operated; the released reference digest remains

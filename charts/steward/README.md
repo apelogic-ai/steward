@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.34` and application `0.3.34`.
+Current release contract: chart `0.3.35` and application `0.3.35`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web

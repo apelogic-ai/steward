@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.35] - 2026-11-15
+
+Steward v0.3.35 builds the MCP-GW sandbox helper in the Codex reference runtime image from source,
+so the image contains no prebuilt helper binary. It adds no migration, CRD change or chart value,
+and changes no API or product behaviour.
+
 ### Changed
 
 - The Codex reference runtime image now builds the MCP-GW 0.8.2 sandbox helper
@@ -21,6 +27,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
     `github.com/apelogic-ai/mcp-gw/releases`. It now pulls
     `docker.io/oven/bun:1.2.21` (pinned by digest). Every other build-time
     download is unchanged; the Codex runtime guide lists them all.
+
+### Upgrade and rollback
+
+- Back up the database, run the v0.3.35 platform preflight, and deploy the chart, component
+  images and reference runtimes as one release unit. There is no migration, CRD change or chart
+  value change.
+- After deployment, update mirrored reference runtimes and execution bindings to the v0.3.35
+  digests. The Codex runtime keeps `codex@0.140.0` and its version probe.
+- An installation that builds the Codex reference runtime image itself must allow
+  `docker.io/oven/bun:1.2.21` (by digest), and its build context must include
+  `third_party/mcp-gw-sandbox-helper/`. It no longer needs
+  `github.com/apelogic-ai/mcp-gw/releases`. The image's provenance now lists the Bun image as a
+  build input.
+- An installation upgrading from v0.3.33 or earlier must also follow the v0.3.34 upgrade steps
+  below, including the review of web access hosts removed from `capabilityCatalog.egressHosts`.
+- Rolling back to v0.3.34 needs no database restore. Redeploy the v0.3.34 chart, component images
+  and reference runtimes, and restore the v0.3.34 runtime digests in execution bindings. An
+  installation that rebuilds the v0.3.34 Codex image needs `github.com/apelogic-ai/mcp-gw/releases`
+  again. Rolling back further follows the v0.3.34 notes below.
 
 ## [0.3.34] - 2026-11-14
 
@@ -2122,7 +2147,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.34...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.35...HEAD
+[0.3.35]: https://github.com/apelogic-ai/steward/compare/v0.3.34...v0.3.35
 [0.3.34]: https://github.com/apelogic-ai/steward/compare/v0.3.33...v0.3.34
 [0.3.33]: https://github.com/apelogic-ai/steward/compare/v0.3.32...v0.3.33
 [0.3.32]: https://github.com/apelogic-ai/steward/compare/v0.3.31...v0.3.32
