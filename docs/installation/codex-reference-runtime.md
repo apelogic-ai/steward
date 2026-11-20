@@ -31,7 +31,7 @@ output processing:
 | Command | Version | Purpose |
 |---|---:|---|
 | `rg` | 14.1.0 | Fast recursive text search |
-| `jq` | 1.7.1 | JSON inspection and transformation |
+| `jq` | 1.7.1 | JSON inspection and transformation; also used by the launch step to read the model's context window |
 | `fd` | 9.0.0 | File and directory search |
 | `tree` | 2.1.1 | Directory-tree inspection |
 | `kubectl` | MCP-GW 0.8.2 helper | Governed Kubernetes commands |
@@ -146,5 +146,6 @@ needs no access to mcp-gw's GitHub releases. The build context must include
 `third_party/mcp-gw-sandbox-helper/`.
 
 Verify a private image's platform, non-root user, CLI version, and provider-profile compatibility
-before activation. It is independently built and operated; the released reference digest remains
+before activation. Include `curl` and `jq` so the launch step can read the selected model's context
+window from the model gateway; without them, Codex uses its own default. It is independently built and operated; the released reference digest remains
 the reproducible Steward artifact.

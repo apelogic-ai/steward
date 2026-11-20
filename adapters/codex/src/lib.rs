@@ -105,7 +105,7 @@ fn codex_config_command(model_info_url: &str) -> String {
             // Codex reads the window as a signed 64-bit integer.
             "case $context_window in ''|0*|*[!0-9]*|???????????????????*) context_window= ;; esac; ",
             "if [ -z \"$context_window\" ]; then ",
-            "echo 'The model gateway did not report a context window for this model; the coding agent uses its default.' >&2; fi; ",
+            "echo 'The model gateway did not report a context window for this model, so the coding agent uses its default. To set one, add max_input_tokens for this model in the model gateway settings.' >&2; fi; ",
             "{{ if [ -n \"$context_window\" ]; then printf 'model_context_window = %s\\n' \"$context_window\"; fi; ",
             "printf '%s' \"$adapter_config\"; }} > \"$CODEX_HOME/config.toml\"; ",
         ),
@@ -236,11 +236,12 @@ mod tests {
     }
 
     /// Runs the plan's config step in a real shell with real `jq` and a fake `curl` that answers
-    /// with `model_info` (or fails when it is `None`).
+    /// with `model_info` (or fails when it is `None`). `environment` adds sandbox variables.
     fn run_config_step(
         adapter_config: &str,
         model: &str,
         model_info: Option<&str>,
+        environment: &[(&str, &str)],
     ) -> Result<ConfigStep, String> {
         let root = std::env::temp_dir().join(format!(
             "steward-codex-config-{}-{}",
@@ -250,7 +251,7 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .as_nanos()
         ));
-        let result = run_config_step_in(&root, adapter_config, model, model_info);
+        let result = run_config_step_in(&root, adapter_config, model, model_info, environment);
         std::fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
         result
     }
@@ -260,6 +261,7 @@ mod tests {
         adapter_config: &str,
         model: &str,
         model_info: Option<&str>,
+        environment: &[(&str, &str)],
     ) -> Result<ConfigStep, String> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -304,6 +306,7 @@ mod tests {
             .env_clear()
             .env("PATH", path)
             .env("CODEX_HOME", &codex_home)
+            .envs(environment.iter().copied())
             .output()
             .map_err(|error| error.to_string())?;
         if !output.status.success() {
@@ -370,6 +373,10 @@ mod tests {
                     {"model_name":"hosted-alias","model_info":{"max_input_tokens":2000},"unknown_field":true}
                 ]}"#,
             ),
+            &[
+                ("HTTPS_PROXY", "http://proxy.example.test:3128"),
+                ("SSL_CERT_FILE", "/etc/openshell tls/ca.pem"),
+            ],
         )?;
 
         assert_eq!(
@@ -377,10 +384,18 @@ mod tests {
             format!("model_context_window = 2000\n{adapter_config}"),
             "the smallest reported window is a top-level key ahead of every table"
         );
+        let curl_arguments = step.curl_arguments.lines().collect::<Vec<_>>();
+        assert!(curl_arguments.contains(&MODEL_INFO_URL));
         assert!(
-            step.curl_arguments
-                .lines()
-                .any(|line| line == MODEL_INFO_URL)
+            curl_arguments
+                .windows(2)
+                .any(|pair| pair == ["--proxy", "http://proxy.example.test:3128"])
+        );
+        assert!(
+            curl_arguments
+                .windows(2)
+                .any(|pair| pair == ["--cacert", "/etc/openshell tls/ca.pem"]),
+            "the sandbox CA path stays one argument"
         );
         assert!(
             step.curl_arguments
@@ -423,7 +438,7 @@ mod tests {
                 r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":18446744073709551615}}]}"#,
             ),
         ] {
-            let step = run_config_step(adapter_config, "hosted-alias", model_info)?;
+            let step = run_config_step(adapter_config, "hosted-alias", model_info, &[])?;
             assert_eq!(&step.config, adapter_config, "{model_info:?}");
             assert_eq!(
                 step.stderr.lines().count(),

@@ -79,6 +79,12 @@ arguments, and implement the Codex-compatible configuration, `exec`, model, MCP,
 termination behavior used by the adapter. Obtain or build the image through the operator's normal
 source, scanning, signing, and promotion process, then configure its immutable manifest digest.
 
+Beginning with the release after Steward 0.3.35, the `codex-v1` launch step also uses `curl` and
+`jq`, when the image provides them, to read the selected model's context window from the model
+gateway before starting Codex; see `config.apiserver.inferenceEndpoint` below. They are optional:
+without them, Codex starts with its own default context window and the run's error output carries
+one line saying so.
+
 Every compatible Agent image must expose Linux procfs at `/proc` and provide `/bin/sh`, `awk`,
 `date`, `sleep`, `kill`, `mv`, `mkdir`, `cat`, `rm`, and `tar`. Steward uses those facilities for
 the common execution wrapper, liveness heartbeat, cancellation, and input/output staging. Full
@@ -204,6 +210,15 @@ or execution binding. Non-Helm installations set the corresponding
 `STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT` environment variable before activating any Claude Code
 binding. When it is absent, Codex remains available but an active Claude Code binding fails startup
 as unavailable.
+
+Beginning with the release after Steward 0.3.35, the `codex-v1` launch step sends one `GET` request
+to `<inferenceEndpoint>/model/info` (a trailing `/responses` is removed first) with the run's own
+gateway credential, before Codex starts. It reads `model_info.max_input_tokens` for the selected
+model, as LiteLLM's model info route reports it, and writes the smallest positive whole value across
+the gateway's deployments of that model as Codex's `model_context_window`. Codex 0.140.0 compacts its
+conversation at 90% of that window. When the route is missing, refuses the credential, reports no
+value, or does not answer within 30 seconds, Codex starts with its own default and the run's error
+output carries one line saying so.
 
 The chart validates the structure, writes it to an immutable content-addressed ConfigMap, mounts it
 read-only in the apiserver, sets `STEWARD_TASK_EXECUTION_BINDINGS_FILE`, and changes the pod-template
