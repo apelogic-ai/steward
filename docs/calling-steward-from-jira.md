@@ -1,6 +1,6 @@
 # Calling Steward from Jira webhook Triggers
 
-Status: **Current Steward v0.3.35 contract**
+Status: **Current Steward v0.3.36 contract**
 
 A Jira webhook Trigger starts one governed Workflow when a signed Jira event
 matches deployment-owned settings. The receiver is a separate, optional service.

@@ -146,6 +146,7 @@ needs no access to mcp-gw's GitHub releases. The build context must include
 `third_party/mcp-gw-sandbox-helper/`.
 
 Verify a private image's platform, non-root user, CLI version, and provider-profile compatibility
-before activation. Include `curl` and `jq` so the launch step can read the selected model's context
-window from the model gateway; without them, Codex uses its own default. It is independently built and operated; the released reference digest remains
-the reproducible Steward artifact.
+before activation. From Steward 0.3.36, include `curl` and `jq` so the launch step can read the
+selected model's context window from the model gateway; without them, Codex uses its own default.
+It is independently built and operated; the released reference digest remains the reproducible
+Steward artifact.

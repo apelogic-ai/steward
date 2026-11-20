@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.36] - 2026-11-20
+
+Steward v0.3.36 lets tenant administrators cancel any unfinished run and records who asked to
+cancel a run. It also gives Codex the selected model's context window from the model gateway, so
+Codex compacts before a smaller model's limit is reached, and it stops a running run when its
+Envelope's monthly minutes are used up. It adds migration 0078. There is no CRD change and no chart
+value change.
+
 ### Added
 
 - Tenant administrators can cancel any unfinished run from Admin → Runs → run
@@ -17,12 +25,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   finished run. Members still cancel only their own runs through
   `POST /app/api/v1/runs/{task_uid}/cancel`, and a member calling the admin
   endpoint gets `403`.
-- Runs record who asked to cancel them. Run responses carry an optional
-  `cancellation` object: `requestedBy` is `owner` or `administrator`, and
-  admin views also carry `requestedByDisplayEmail`. Run detail pages show a
-  line such as "An administrator asked to cancel this run." Runs cancelled
-  before this release, and runs cancelled by a service caller, have no
-  `cancellation`.
+- Runs record who asked to cancel them. Browser and administrator run views
+  carry an optional `cancellation` object: `requestedBy` is `owner` or
+  `administrator`, and admin views also carry `requestedByDisplayEmail`. Run
+  detail pages show a line such as "An administrator asked to cancel this
+  run." Runs cancelled before this release, and runs cancelled by a service
+  caller, have no `cancellation`.
 - Migration `0078_task_cancel_requested_by` adds a nullable
   `task_submissions.cancel_requested_by` column. It is set once, by the first
   browser cancel request, and a trigger rejects any later change. Existing
@@ -72,6 +80,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   "Stopped run … stopped at" line and banner. Spend escalations keep
   "Approve top-up and resume" and "Deny and cancel run", because those runs
   are still parked.
+
+### Upgrade and rollback
+
+- Back up the database before upgrading. Steward applies migration 0078 automatically. It adds
+  the nullable `task_submissions.cancel_requested_by` column, a check that it is set only on a
+  cancelled run, and a trigger that keeps it unchanged once set. It changes no existing rows.
+- Run the v0.3.36 platform preflight, then deploy the chart, component images and reference
+  runtimes as one release unit. There is no CRD change or chart value change.
+- After deployment, update mirrored reference runtimes and execution bindings to the v0.3.36
+  digests. The Codex runtime keeps `codex@0.140.0` and its version probe.
+- A custom Codex runtime image needs `curl` and `jq` for the context-window lookup; without them,
+  Codex starts with its own defaults and the run's error output says so. The reference image has
+  both. To give Codex a model's window, set `max_input_tokens` for that model in the model gateway.
+- A running run whose Envelope's monthly minutes are used up now fails instead of waiting for a
+  top-up. A top-up raises the limit for later runs only, so start such a run again after topping
+  up.
+- Clients of the browser and administrator run views can show the new optional `cancellation` object. Administrators
+  cancel through `POST /admin/api/v1/all-runs/{task_uid}/cancel`.
+- An installation upgrading from v0.3.34 or earlier must also follow the earlier upgrade steps
+  below.
+- Steward v0.3.35 does not start against a database with migration 0078 applied: the apiserver and
+  controller check the applied migrations at startup and refuse one they do not know. To roll
+  back, restore the pre-upgrade database backup to a new database target and point v0.3.35 at it.
+  Records written after the upgrade are not in the backup; preserve any audit or decision records
+  you must keep first. Then redeploy the v0.3.35 chart, component images and reference runtimes,
+  and restore the v0.3.35 runtime digests in execution bindings.
 
 ## [0.3.35] - 2026-11-15
 
@@ -2213,7 +2247,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.35...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.36...HEAD
+[0.3.36]: https://github.com/apelogic-ai/steward/compare/v0.3.35...v0.3.36
 [0.3.35]: https://github.com/apelogic-ai/steward/compare/v0.3.34...v0.3.35
 [0.3.34]: https://github.com/apelogic-ai/steward/compare/v0.3.33...v0.3.34
 [0.3.33]: https://github.com/apelogic-ai/steward/compare/v0.3.32...v0.3.33
