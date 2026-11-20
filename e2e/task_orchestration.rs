@@ -6086,9 +6086,57 @@ async fn two_reconcilers_scenario() -> Result<(), Box<dyn Error>> {
     );
 
     let starts_before_cancellation = task_runtime.starts.load(Ordering::SeqCst);
-    let cancelled = store
-        .request_task_finalization(cancelled_task_uid, &service, identity.user_id.as_str())
+    let administrator = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("orchestrator-admin-subject-{suffix}"),
+                "example.com",
+                &format!("bob-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
         .await?;
+    assert_eq!(
+        store
+            .cancel_agent_run(cancelled_task_uid, administrator.user_id.as_str())
+            .await?,
+        None,
+        "a member's own-run cancel must not reach another member's run"
+    );
+    let cancelled_run = store
+        .cancel_any_agent_run(cancelled_task_uid, administrator.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("administrator cancellation did not find the run"))?;
+    assert!(cancelled_run.finalize_requested);
+    assert_eq!(
+        cancelled_run.cancel_requested_by.as_deref(),
+        Some(administrator.user_id.as_str()),
+        "the run must record which administrator asked to cancel it"
+    );
+    assert_eq!(
+        cancelled_run.cancel_requested_by_display_email.as_deref(),
+        Some(format!("bob-{suffix}@example.com").as_str())
+    );
+    let retried_run = store
+        .cancel_agent_run(cancelled_task_uid, identity.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("owner cancellation retry did not find the run"))?;
+    assert_eq!(
+        retried_run.cancel_requested_by.as_deref(),
+        Some(administrator.user_id.as_str()),
+        "a later cancel request must not overwrite the first requester"
+    );
+    let cancelled = store
+        .task(cancelled_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
     assert!(cancelled.cancel_requested);
     assert_eq!(cancelled.phase, TaskPhase::Running);
     let cancellation_event = store

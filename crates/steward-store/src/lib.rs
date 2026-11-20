@@ -5212,10 +5212,34 @@ impl PgStore {
         task_uid: Uuid,
         owner_user_id: &str,
     ) -> Result<Option<AgentRunRecord>, StoreError> {
+        self.cancel_agent_run_requested_by(task_uid, Some(owner_user_id), owner_user_id)
+            .await
+    }
+
+    /// Request cancellation for any run in this deployment on behalf of a browser administrator.
+    /// The caller must already have proven the administrator role; `requested_by` is recorded.
+    pub async fn cancel_any_agent_run(
+        &self,
+        task_uid: Uuid,
+        requested_by: &str,
+    ) -> Result<Option<AgentRunRecord>, StoreError> {
+        self.cancel_agent_run_requested_by(task_uid, None, requested_by)
+            .await
+    }
+
+    async fn cancel_agent_run_requested_by(
+        &self,
+        task_uid: Uuid,
+        owner_scope: Option<&str>,
+        requested_by: &str,
+    ) -> Result<Option<AgentRunRecord>, StoreError> {
         let Some(record) = self.agent_run(task_uid).await? else {
             return Ok(None);
         };
-        if record.owner_user_id.as_deref() != Some(owner_user_id) {
+        let Some(owner_user_id) = record.owner_user_id.as_deref() else {
+            return Ok(None);
+        };
+        if owner_scope.is_some_and(|scope| scope != owner_user_id) {
             return Ok(None);
         }
         if matches!(
@@ -5226,8 +5250,13 @@ impl PgStore {
         ) {
             return Err(StoreError::InvalidTaskTransition);
         }
-        self.request_task_finalization(task_uid, &record.submitter_service, owner_user_id)
-            .await?;
+        self.request_task_finalization_requested_by(
+            task_uid,
+            &record.submitter_service,
+            owner_user_id,
+            Some(requested_by),
+        )
+        .await?;
         self.agent_run(task_uid).await
     }
 
@@ -11265,6 +11294,17 @@ impl PgStore {
         submitter_service: &str,
         owner_user_id: &str,
     ) -> Result<TaskRecord, StoreError> {
+        self.request_task_finalization_requested_by(task_uid, submitter_service, owner_user_id, None)
+            .await
+    }
+
+    async fn request_task_finalization_requested_by(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        owner_user_id: &str,
+        cancel_requested_by: Option<&str>,
+    ) -> Result<TaskRecord, StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let current = task_in_transaction_for_update(&mut transaction, task_uid).await?;
         if current.submitter_service != submitter_service
@@ -11286,6 +11326,11 @@ impl PgStore {
              SET finalize_requested = true, \
                  cancel_requested = cancel_requested \
                      OR phase NOT IN ('succeeded', 'failed', 'cancelled'), \
+                 cancel_requested_by = CASE \
+                     WHEN cancel_requested_by IS NULL \
+                      AND phase NOT IN ('succeeded', 'failed', 'cancelled') THEN $4::text \
+                     ELSE cancel_requested_by \
+                 END, \
                  phase = CASE \
                      WHEN phase IN ('submitted', 'parked', 'queued') THEN 'cancelled' \
                      ELSE phase \
@@ -11297,6 +11342,7 @@ impl PgStore {
         .bind(task_uid)
         .bind(submitter_service)
         .bind(owner_user_id)
+        .bind(cancel_requested_by)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -12722,6 +12768,9 @@ pub struct AgentRunRecord {
     pub runtime_spec: AgentRuntimeSpec,
     pub envelope_revision: Option<i64>,
     pub finalize_requested: bool,
+    /// Canonical user ID of the browser user who first asked to cancel the run.
+    pub cancel_requested_by: Option<String>,
+    pub cancel_requested_by_display_email: Option<String>,
     pub finalized: bool,
     pub failure_reason: Option<String>,
     pub created_at: String,
@@ -16362,6 +16411,8 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
             tasks.coding_agent_runtime, COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid, \
             tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
             tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
+            tasks.cancel_requested_by, \
+            cancellers.display_email AS cancel_requested_by_display_email, \
             tasks.failure_reason, tasks.direct_task_evidence, tasks.task_origin, \
             tasks.browser_task_evidence, \
             to_char(tasks.created_at AT TIME ZONE 'UTC', \
@@ -16377,6 +16428,7 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
             ) AS history_partial \
      FROM task_submissions tasks \
      LEFT JOIN canonical_users users ON users.user_id = tasks.owner_user_id \
+     LEFT JOIN canonical_users cancellers ON cancellers.user_id = tasks.cancel_requested_by \
      LEFT JOIN task_runtime_operations orchestration \
        ON orchestration.task_uid = tasks.task_uid \
      LEFT JOIN LATERAL ( \
@@ -16513,6 +16565,10 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
             .0,
         envelope_revision: row.try_get("envelope_revision").map_err(database_error)?,
         finalize_requested: row.try_get("finalize_requested").map_err(database_error)?,
+        cancel_requested_by: row.try_get("cancel_requested_by").map_err(database_error)?,
+        cancel_requested_by_display_email: row
+            .try_get("cancel_requested_by_display_email")
+            .map_err(database_error)?,
         finalized: row.try_get("finalized").map_err(database_error)?,
         failure_reason: row.try_get("failure_reason").map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
