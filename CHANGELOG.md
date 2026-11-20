@@ -66,6 +66,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   The runtime-minutes exhaustion record and the administrator top-up remain;
   a top-up raises the limit for later runs, but no longer resumes the stopped
   run. No limit values or admission checks change.
+- The administrator decision page for a runtime-minutes escalation now
+  says what a decision does: "Approve top-up" with "The stopped run doesn't
+  resume; the added minutes apply to new runs.", "Deny top-up", and a
+  "Stopped run … stopped at" line and banner. Spend escalations keep
+  "Approve top-up and resume" and "Deny and cancel run", because those runs
+  are still parked.
 
 ## [0.3.35] - 2026-11-15
 

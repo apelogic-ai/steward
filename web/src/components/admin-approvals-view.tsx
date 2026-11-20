@@ -147,6 +147,12 @@ export function requestReason(request: AdminRequestView): string {
       : request.kind === "within_ceiling" ? requestStateCopy[request.state].reason : "custom";
 }
 
+export function cumulativeEscalationHeadline(request: AdminRequestView): string {
+  return request.escalation?.meters[0]?.dimension === "runtime_minutes"
+    ? "Escalated: the Envelope's monthly minutes were used up and the run stopped"
+    : "Escalated: a cumulative limit was reached and the run is parked";
+}
+
 export function triggerLabel(request: AdminRequestView): [string, string] {
   if (request.kind === "ceiling_exceeded") return ["Above limits", request.deltas.map((delta) => {
     const summary = envelopeDeltaSummary(delta);
@@ -191,7 +197,7 @@ export function AdminRequestDetailView({ requestId }: Readonly<{ requestId: stri
   const loadCapabilities = useCallback(() => getAdminCapabilities({ cache: "no-store", credentials: "same-origin" }), []);
   const capabilitiesState = useApiResource<BrowserCapabilityCatalogResponse>(loadCapabilities);
   const workspaceDeployment = capabilitiesState.status === "ready" ? capabilitiesState.value.workspace ?? undefined : undefined;
-  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template limits</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">Escalated: a cumulative limit was reached and the run is parked</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} workspaceDeployment={workspaceDeployment} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
+  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template limits</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">{cumulativeEscalationHeadline(request)}</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} workspaceDeployment={workspaceDeployment} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
 }
 
 function deltaValue(value: unknown): string {
@@ -381,20 +387,24 @@ export function UnifiedRequestCard({ request, workspaceDeployment }: Readonly<{ 
   }
 
   if (request.source === "escalation" && request.escalation) {
+    // A run that used up its Envelope's monthly minutes has already stopped; a top-up only helps
+    // new runs. A spend top-up still resumes the parked run.
+    const runStopped = request.escalation.meters[0]?.dimension === "runtime_minutes";
     return (
       <li className="space-y-5">
         <SectionCard title="Cumulative usage this period">
           <ul className="space-y-5">{request.escalation.meters.map((meter) => <li key={meter.dimension}><Meter label={meter.dimension === "llm_spend" ? "LLM spend" : "Runtime limit per month"} limit={Number(meter.limit)} limitLabel={meter.dimension === "llm_spend" ? formatMoney(meter.limit, meter.unit) : formatDuration(meter.limit, "minutes", "m")} used={Number(meter.used)} usedLabel={meter.dimension === "llm_spend" ? formatMoney(meter.used, meter.unit) : formatDuration(meter.used, "minutes", "m")} /><p className="mt-1 text-xs text-muted-ink">Observed {new Date(meter.observedAt).toLocaleString()}</p></li>)}</ul>
-          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>Blocked run <span className="font-mono text-ink">{request.escalation.blockedTaskUid}</span> · parked since {new Date(request.escalation.parkedAt).toLocaleString()}</span><Link className="font-semibold text-ink" href={`/admin/runs/${encodeURIComponent(request.escalation.blockedTaskUid)}`}>Open run →</Link></div>
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>{runStopped ? "Stopped run" : "Blocked run"} <span className="font-mono text-ink">{request.escalation.blockedTaskUid}</span> · {runStopped ? "stopped at" : "parked since"} {new Date(request.escalation.parkedAt).toLocaleString()}</span><Link className="font-semibold text-ink" href={`/admin/runs/${encodeURIComponent(request.escalation.blockedTaskUid)}`}>Open run →</Link></div>
         </SectionCard>
         {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><form className="grid gap-3 sm:grid-cols-2" onSubmit={topUp}>
           <label className="grid gap-2 text-sm font-semibold">Top-up amount{request.escalation.meters[0]?.dimension === "llm_spend" ? <MoneyInput currency={request.escalation.meters[0].unit} onChange={setTopUpAmount} required value={topUpAmount} /> : <DurationInput mode="minutes" onChange={setTopUpAmount} required value={topUpAmount} />}</label>
           <label className="grid gap-2 text-sm font-semibold">Valid until (RFC 3339)<input className="min-h-11 rounded-md border px-3 font-normal" name="validUntil" placeholder="2026-08-25T17:00:00Z" required /></label>
           <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="rationale" placeholder="Why is this additional access appropriate?" required /></label>
-          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:justify-self-end" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Approve top-up and resume</button>
+          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:justify-self-end" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">{runStopped ? "Approve top-up" : "Approve top-up and resume"}</button>
+          {runStopped ? <p className="text-sm text-muted-ink sm:col-span-2">The stopped run doesn&apos;t resume; the added minutes apply to new runs.</p> : null}
         </form>
-        <form className="mt-4 grid gap-3 border-t border-line-soft pt-4" onSubmit={(event) => { event.preventDefault(); const fields = new FormData(event.currentTarget); setDenial(String(fields.get("denyRationale") ?? "").trim()); }}><label className="grid gap-2 text-sm font-semibold">Denial rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="denyRationale" required /></label><button className="min-h-11 rounded-md border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Deny and cancel run</button></form>
-        <ConfirmationDialog cancelLabel="Keep pending" confirmLabel="Deny and cancel run" description="The parked run will be cancelled and finalized. This action cannot be undone." onConfirm={() => void deny(denial ?? "")} onOpenChange={(open) => { if (!open) setDenial(null); }} open={denial !== null} pending={status === "approving"} title="Deny and cancel this run?" /></SectionCard>}
+        <form className="mt-4 grid gap-3 border-t border-line-soft pt-4" onSubmit={(event) => { event.preventDefault(); const fields = new FormData(event.currentTarget); setDenial(String(fields.get("denyRationale") ?? "").trim()); }}><label className="grid gap-2 text-sm font-semibold">Denial rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="denyRationale" required /></label><button className="min-h-11 rounded-md border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">{runStopped ? "Deny top-up" : "Deny and cancel run"}</button></form>
+        <ConfirmationDialog cancelLabel="Keep pending" confirmLabel={runStopped ? "Deny top-up" : "Deny and cancel run"} description={runStopped ? "No minutes are added. The run has already stopped. This action cannot be undone." : "The parked run will be cancelled and finalized. This action cannot be undone."} onConfirm={() => void deny(denial ?? "")} onOpenChange={(open) => { if (!open) setDenial(null); }} open={denial !== null} pending={status === "approving"} title={runStopped ? "Deny this top-up?" : "Deny and cancel this run?"} /></SectionCard>}
       </li>
     );
   }

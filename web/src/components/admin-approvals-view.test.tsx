@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { AdminRequestView, BrowserEnvelopeRequestView, WorkspaceDeploymentCapabilities } from "@/api-client";
 
-import { EnvelopeRequestCard, UnifiedRequestCard, requestReason, triggerLabel } from "./admin-approvals-view";
+import { EnvelopeRequestCard, UnifiedRequestCard, cumulativeEscalationHeadline, requestReason, triggerLabel } from "./admin-approvals-view";
 
 const source = readFileSync(new URL("./admin-approvals-view.tsx", import.meta.url), "utf8");
 
@@ -68,6 +68,55 @@ const workspaceDeployment: WorkspaceDeploymentCapabilities = {
   maxTreeReads: 2_000,
   scratchVolumeBytes: 8 * 1024 ** 3,
 };
+
+function escalationRequest(dimension: "llm_spend" | "runtime_minutes"): AdminRequestView {
+  return {
+    ...unifiedRequest,
+    escalation: {
+      blockedTaskUid: "00000000-0000-0000-0000-000000000009",
+      envelopeInstanceId: "env_example",
+      meters: [{
+        dimension,
+        exhausted: true,
+        limit: dimension === "llm_spend" ? "100.00" : "600",
+        observedAt: "2026-08-30T12:00:00Z",
+        unit: dimension === "llm_spend" ? "USD" : "min",
+        used: dimension === "llm_spend" ? "100.00" : "600",
+      }],
+      parkedAt: "2026-08-30T12:00:00Z",
+      period: { end: "2026-09-01T00:00:00Z", start: "2026-08-01T00:00:00Z" },
+    } as AdminRequestView["escalation"],
+    kind: "cumulative_exhausted",
+    source: "escalation",
+    state: "escalated",
+  };
+}
+
+describe("cumulative limit top-up decisions", () => {
+  test("a runtime-minutes top-up says the stopped run does not resume", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={escalationRequest("runtime_minutes")} />);
+    expect(html).toMatch(/<button[^>]*type="submit"[^>]*>Approve top-up<\/button>/);
+    expect(html).toContain("The stopped run doesn&#x27;t resume; the added minutes apply to new runs.");
+    expect(html).toMatch(/<button[^>]*>Deny top-up<\/button>/);
+    expect(html).toContain("Stopped run");
+    expect(html).not.toContain("and resume");
+    expect(html).not.toContain("cancel run");
+    expect(html).not.toContain("parked since");
+  });
+
+  test("the escalation banner says whether the run stopped or is parked", () => {
+    expect(cumulativeEscalationHeadline(escalationRequest("runtime_minutes"))).toBe("Escalated: the Envelope's monthly minutes were used up and the run stopped");
+    expect(cumulativeEscalationHeadline(escalationRequest("llm_spend"))).toBe("Escalated: a cumulative limit was reached and the run is parked");
+  });
+
+  test("a spend top-up still resumes the parked run", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={escalationRequest("llm_spend")} />);
+    expect(html).toMatch(/<button[^>]*type="submit"[^>]*>Approve top-up and resume<\/button>/);
+    expect(html).toMatch(/<button[^>]*>Deny and cancel run<\/button>/);
+    expect(html).toContain("parked since");
+    expect(html).not.toContain("doesn&#x27;t resume");
+  });
+});
 
 describe("envelope request approval controls", () => {
   test("uses plain request wording and consistent per-run labels", () => {
