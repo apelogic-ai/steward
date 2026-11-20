@@ -86,6 +86,37 @@ fn governed_command_urls(
     Ok((cli_url, shell_url))
 }
 
+/// Shell step that writes `$CODEX_HOME/config.toml` from `$adapter_config`.
+///
+/// It first asks the model gateway, with the same proxy-swapped credential Codex itself uses,
+/// for the selected model's input context window. A reported window becomes Codex's top-level
+/// `model_context_window`, from which Codex derives its own automatic compaction threshold.
+/// Otherwise Codex starts exactly as before and one line says so.
+fn codex_config_command(model_info_url: &str) -> String {
+    format!(
+        concat!(
+            "context_window=$(curl --silent --fail --max-time 30 ",
+            "${{HTTPS_PROXY:+--proxy \"$HTTPS_PROXY\"}} ${{SSL_CERT_FILE:+--cacert \"$SSL_CERT_FILE\"}} ",
+            "--header 'Authorization: Bearer openshell-token-grant-placeholder' {} 2>/dev/null ",
+            "| jq --raw-output --arg model \"$model\" ",
+            "'[.data[]? | select(.model_name == $model) | .model_info.max_input_tokens? ",
+            "| select(type == \"number\" and . > 0 and . == floor)] | min // empty' 2>/dev/null) ",
+            "|| context_window=; ",
+            // Codex reads the window as a signed 64-bit integer.
+            "case $context_window in ''|0*|*[!0-9]*|???????????????????*) context_window= ;; esac; ",
+            "if [ -z \"$context_window\" ]; then ",
+            "echo 'The model gateway did not report a context window for this model; the coding agent uses its default.' >&2; fi; ",
+            "{{ if [ -n \"$context_window\" ]; then printf 'model_context_window = %s\\n' \"$context_window\"; fi; ",
+            "printf '%s' \"$adapter_config\"; }} > \"$CODEX_HOME/config.toml\"; ",
+        ),
+        shell_single_quote(model_info_url),
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn invalid_inference_endpoint() -> PortError {
     PortError::Rejected {
         reason: "Codex inference endpoint must be an exact HTTP(S) URL".to_owned(),
@@ -154,7 +185,7 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 "export CODEX_HOME=/sandbox/steward-codex; ",
                 "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
                 "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
-                "printf '%s' \"$adapter_config\" > \"$CODEX_HOME/config.toml\"; ",
+                "{}",
                 "if [ \"$cli_url\" != \"-\" ]; then export MCP_GW_CLI_URL=\"$cli_url\"; fi; ",
                 "if [ \"$shell_url\" != \"-\" ]; then export MCP_GW_SHELL_URL=\"$shell_url\"; fi; ",
                 "{}",
@@ -163,6 +194,7 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 "--sandbox danger-full-access --model \"$model\" ",
                 "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$prompt\""
             ),
+            codex_config_command(&format!("{}/model/info", self.inference_endpoint)),
             tool_bearer_environment,
         );
         let mut command = vec![
@@ -191,7 +223,217 @@ mod tests {
         ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, ToolGrant,
     };
 
-    use super::{CODEX_V1_ADAPTER, CodexTaskExecutionAdapter};
+    use super::{
+        CODEX_V1_ADAPTER, CodexTaskExecutionAdapter, codex_config_command, shell_single_quote,
+    };
+
+    const MODEL_INFO_URL: &str = "https://inference.example.test/v1/model/info";
+
+    struct ConfigStep {
+        config: String,
+        curl_arguments: String,
+        stderr: String,
+    }
+
+    /// Runs the plan's config step in a real shell with real `jq` and a fake `curl` that answers
+    /// with `model_info` (or fails when it is `None`).
+    fn run_config_step(
+        adapter_config: &str,
+        model: &str,
+        model_info: Option<&str>,
+    ) -> Result<ConfigStep, String> {
+        let root = std::env::temp_dir().join(format!(
+            "steward-codex-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos()
+        ));
+        let result = run_config_step_in(&root, adapter_config, model, model_info);
+        std::fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
+        result
+    }
+
+    fn run_config_step_in(
+        root: &std::path::Path,
+        adapter_config: &str,
+        model: &str,
+        model_info: Option<&str>,
+    ) -> Result<ConfigStep, String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = root.join("bin");
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&bin).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&codex_home).map_err(|error| error.to_string())?;
+        let curl_arguments = root.join("curl-arguments");
+        let response = root.join("model-info.json");
+        let fake_curl = match model_info {
+            Some(body) => {
+                std::fs::write(&response, body).map_err(|error| error.to_string())?;
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\n",
+                    curl_arguments.display(),
+                    response.display()
+                )
+            }
+            None => format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho 'curl: (22) The requested URL returned error: 403' >&2\nexit 22\n",
+                curl_arguments.display()
+            ),
+        };
+        let curl = bin.join("curl");
+        std::fs::write(&curl, fake_curl).map_err(|error| error.to_string())?;
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").map_err(|error| error.to_string())?
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "set -eu; adapter_config=$1; model=$2; {}",
+                codex_config_command(MODEL_INFO_URL)
+            ))
+            .arg("codex-config-test")
+            .arg(adapter_config)
+            .arg(model)
+            .env_clear()
+            .env("PATH", path)
+            .env("CODEX_HOME", &codex_home)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "config step failed: {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(ConfigStep {
+            config: std::fs::read_to_string(codex_home.join("config.toml"))
+                .map_err(|error| error.to_string())?,
+            curl_arguments: std::fs::read_to_string(&curl_arguments).unwrap_or_default(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn tool_less_plan() -> Result<Vec<String>, String> {
+        let adapter =
+            CodexTaskExecutionAdapter::new("https://inference.example.test/v1".to_owned())
+                .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &ModelRef {
+                    provider: "example-model".to_owned(),
+                    model: "small".to_owned(),
+                },
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map(|plan| plan.command)
+            .map_err(|error| format!("render adapter plan: {error:?}"))
+    }
+
+    #[test]
+    fn model_info_url_reaches_the_shell_as_one_literal_word() -> Result<(), String> {
+        let url = "https://inference.example.test/it's $(id) `id`/model/info";
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_single_quote(url)))
+            .output()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(String::from_utf8_lossy(&output.stdout), url);
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_context_window_is_written_into_the_codex_config() -> Result<(), String> {
+        let plan = tool_less_plan()?;
+        assert!(plan[2].contains(&codex_config_command(MODEL_INFO_URL)));
+        let adapter_config = &plan[6];
+
+        let step = run_config_step(
+            adapter_config,
+            "hosted-alias",
+            Some(
+                r#"{"data":[
+                    {"model_name":"other-alias","model_info":{"max_input_tokens":1000}},
+                    {"model_name":"hosted-alias","model_info":{"max_input_tokens":3000,"max_tokens":999}},
+                    {"model_name":"hosted-alias","model_info":{}},
+                    {"model_name":"hosted-alias","model_info":{"max_input_tokens":2000},"unknown_field":true}
+                ]}"#,
+            ),
+        )?;
+
+        assert_eq!(
+            step.config,
+            format!("model_context_window = 2000\n{adapter_config}"),
+            "the smallest reported window is a top-level key ahead of every table"
+        );
+        assert!(
+            step.curl_arguments
+                .lines()
+                .any(|line| line == MODEL_INFO_URL)
+        );
+        assert!(
+            step.curl_arguments
+                .lines()
+                .any(|line| line == "Authorization: Bearer openshell-token-grant-placeholder"),
+            "the lookup uses the same proxy-swapped credential as Codex"
+        );
+        assert_eq!(step.stderr, "");
+        Ok(())
+    }
+
+    #[test]
+    fn codex_config_is_unchanged_without_a_reported_context_window() -> Result<(), String> {
+        let plan = tool_less_plan()?;
+        let adapter_config = &plan[6];
+
+        for model_info in [
+            None,
+            Some("not json"),
+            Some("{}"),
+            Some(
+                r#"{"data":[{"model_name":"other-alias","model_info":{"max_input_tokens":1000}}]}"#,
+            ),
+            Some(r#"{"data":[{"model_name":"hosted-alias"}]}"#),
+            Some(r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_tokens":1000}}]}"#),
+            Some(
+                r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":null}}]}"#,
+            ),
+            Some(r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":0}}]}"#),
+            Some(
+                r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":-1}}]}"#,
+            ),
+            Some(
+                r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":1.5}}]}"#,
+            ),
+            Some(
+                r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":"1000"}}]}"#,
+            ),
+            Some(
+                r#"{"data":[{"model_name":"hosted-alias","model_info":{"max_input_tokens":18446744073709551615}}]}"#,
+            ),
+        ] {
+            let step = run_config_step(adapter_config, "hosted-alias", model_info)?;
+            assert_eq!(&step.config, adapter_config, "{model_info:?}");
+            assert_eq!(
+                step.stderr.lines().count(),
+                1,
+                "exactly one line explains the default for {model_info:?}: {:?}",
+                step.stderr
+            );
+        }
+        Ok(())
+    }
 
     fn binding() -> DisposableExecutionBinding {
         DisposableExecutionBinding {

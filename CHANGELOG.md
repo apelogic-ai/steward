@@ -7,6 +7,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex runs now get the selected model's context window from the model
+  gateway, so Codex compacts its conversation automatically instead of running
+  without a limit when it does not know the model (#689). Before starting
+  Codex, the launch step reads the gateway's model info (`<inference
+  endpoint>/model/info`) with the run's own gateway credential, takes the
+  model's `max_input_tokens` (the smallest value when several gateway
+  deployments serve the model), and writes it as `model_context_window` in
+  Codex's configuration. Codex derives its own compaction threshold from it.
+  This works with deployment-managed and with people's own model keys. When
+  the gateway reports no positive whole number, or the lookup fails (including
+  a runtime image without `curl` or `jq`, or a lookup that takes more than 30
+  seconds), Codex starts with its defaults as before, and the run's error
+  output carries one line saying so. Custom Codex runtime images need `curl`
+  and `jq` for the lookup; the reference image has both. Codex still prints its
+  own "model metadata not found" warning for models outside its built-in list;
+  that warning no longer means compaction is off. No migration, CRD change,
+  chart value or API change.
+
 ## [0.3.35] - 2026-11-15
 
 Steward v0.3.35 builds the MCP-GW sandbox helper in the Codex reference runtime image from source,
