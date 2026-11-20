@@ -1,7 +1,7 @@
 # Steward browser session contract v1
 
 Status: Google code exchange and signed ID-token verification were released in Steward v0.3.20.
-Configured-issuer headless JWT access-token acceptance on the application API is Unreleased. Both
+Configured-issuer headless JWT access-token acceptance on the application API was released in v0.3.21. Both
 paths are disabled unless their reviewed configuration and secret inputs are present.
 
 ## Identity boundary
