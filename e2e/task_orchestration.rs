@@ -7504,13 +7504,12 @@ async fn administrator_cancels_and_requester_is_recorded(
         Some(administrator.user_id.as_str()),
         "a later cancel request must not overwrite the first requester"
     );
-    let overwrite = sqlx::query(
-        "UPDATE task_submissions SET cancel_requested_by = $2 WHERE task_uid = $1",
-    )
-    .bind(cancelled_task_uid)
-    .bind(owner_user_id)
-    .execute(pool)
-    .await;
+    let overwrite =
+        sqlx::query("UPDATE task_submissions SET cancel_requested_by = $2 WHERE task_uid = $1")
+            .bind(cancelled_task_uid)
+            .bind(owner_user_id)
+            .execute(pool)
+            .await;
     assert!(
         overwrite.is_err(),
         "the database must refuse to rewrite who asked to cancel a run"

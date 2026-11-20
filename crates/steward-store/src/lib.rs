@@ -11294,8 +11294,13 @@ impl PgStore {
         submitter_service: &str,
         owner_user_id: &str,
     ) -> Result<TaskRecord, StoreError> {
-        self.request_task_finalization_requested_by(task_uid, submitter_service, owner_user_id, None)
-            .await
+        self.request_task_finalization_requested_by(
+            task_uid,
+            submitter_service,
+            owner_user_id,
+            None,
+        )
+        .await
     }
 
     async fn request_task_finalization_requested_by(

@@ -2945,17 +2945,18 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         public_run_failure_reason(record.failure_reason.as_deref()).map(str::to_owned);
     let spending_limit_reached =
         public_spending_limit_failure_reason(record.failure_reason.as_deref()).is_some();
-    let cancellation = record
-        .cancel_requested_by
-        .as_deref()
-        .map(|requested_by| BrowserRunCancellation {
-            requested_by: if record.owner_user_id.as_deref() == Some(requested_by) {
-                BrowserRunCancelRequester::Owner
-            } else {
-                BrowserRunCancelRequester::Administrator
-            },
-            requested_by_display_email: None,
-        });
+    let cancellation =
+        record
+            .cancel_requested_by
+            .as_deref()
+            .map(|requested_by| BrowserRunCancellation {
+                requested_by: if record.owner_user_id.as_deref() == Some(requested_by) {
+                    BrowserRunCancelRequester::Owner
+                } else {
+                    BrowserRunCancelRequester::Administrator
+                },
+                requested_by_display_email: None,
+            });
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
@@ -3318,7 +3319,8 @@ mod tests {
             let Some(record) = records.iter_mut().find(|record| {
                 record.task_uid == task_uid
                     && record.owner_user_id.is_some()
-                    && owner_scope.is_none_or(|owner| record.owner_user_id.as_deref() == Some(owner))
+                    && owner_scope
+                        .is_none_or(|owner| record.owner_user_id.as_deref() == Some(owner))
             }) else {
                 return Ok(None);
             };
@@ -4283,7 +4285,10 @@ mod tests {
                 .map(|cancellation| cancellation.requested_by),
             Some(BrowserRunCancelRequester::Owner)
         );
-        assert_eq!(browser_run_view(running_run(task_uid, owner)).cancellation, None);
+        assert_eq!(
+            browser_run_view(running_run(task_uid, owner)).cancellation,
+            None
+        );
     }
 
     #[test]
@@ -4997,7 +5002,11 @@ mod tests {
         Ok(())
     }
 
-    fn cancel_request(uri: String, cookie: Option<&str>, csrf: &str) -> Result<Request<Body>, String> {
+    fn cancel_request(
+        uri: String,
+        cookie: Option<&str>,
+        csrf: &str,
+    ) -> Result<Request<Body>, String> {
         let mut request = Request::builder()
             .method("POST")
             .uri(uri)
@@ -5058,8 +5067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn members_cannot_cancel_other_members_runs_through_either_route() -> Result<(), String>
-    {
+    async fn members_cannot_cancel_other_members_runs_through_either_route() -> Result<(), String> {
         let other_member = "usr_abcdefabcdefabcdefabcdefabcdefab";
         let task_uid = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
             .map_err(|error| error.to_string())?;
