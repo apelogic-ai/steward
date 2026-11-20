@@ -1796,8 +1796,9 @@ where
 /// Mount browser-session-bound Runs APIs.
 ///
 /// `GET /app/api/v1/runs` and its detail/timeline descendants are exact-identity scoped to the
-/// browser principal. `GET /admin/api/v1/all-runs` and its descendants are browser-admin only
-/// and may optionally filter an opaque canonical owner identifier. Neither response exposes
+/// browser principal. `GET /admin/api/v1/all-runs` and its descendants, including the
+/// administrator cancel mutation, are browser-admin only and may optionally filter an opaque
+/// canonical owner identifier. Neither response exposes
 /// emails, provider credentials, commands, prompts or raw failure data.
 pub fn protected_router<L>(ledger: L, browser_auth: BrowserAuthService) -> Router
 where
