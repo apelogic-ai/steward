@@ -7,7 +7,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use steward_adapter_codex::{CODEX_V1_ADAPTER, CodexTaskExecutionAdapter};
+use steward_adapter_codex::{
+    CODEX_V1_ADAPTER, CONTEXT_WINDOW_FALLBACK_NOTICE, CodexTaskExecutionAdapter,
+};
 use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
 };
@@ -1436,7 +1438,9 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
                     transcript,
                     ..
                 } if transcript.stdout == b"task-stdout"
-                    && transcript.stderr == b"task-stderr"
+                    // The test sandbox has no model gateway, so the Codex launch step prints its
+                    // one fallback line before the agent's own output.
+                    && transcript.stderr == format!("{CONTEXT_WINDOW_FALLBACK_NOTICE}\ntask-stderr").as_bytes()
                     && live_transcript_grew =>
                 {
                     break output_payload(&run_dir, &output.archive);
