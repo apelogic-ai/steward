@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView, WorkspaceEvidence } from "@/api-client";
 
-import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunAttribution, RunCards, runCallerLabel, runOriginLabel, runtimeMinutesSummary, spendReportReasonText, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
+import { cancelFailureMessage, cancellationSummary, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunAttribution, RunCards, runCallerLabel, runOriginLabel, runtimeMinutesSummary, spendReportReasonText, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -338,4 +338,13 @@ describe("GitHub reruns", () => {
     expect(rerunFailureMessage("oauth-pending")).toBe("Finish the pending GitHub authorization, then retry the run.");
     expect(cancelFailureMessage("unavailable")).toBe("HyperShell couldn't cancel the run. Try again in a moment.");
   });
+});
+
+test("cancellation summary names who asked to cancel without exposing emails to members", () => {
+  expect(cancellationSummary(run({}), false)).toBeNull();
+  expect(cancellationSummary(run({ cancellation: { requestedBy: "owner" } }), false)).toBe("You asked to cancel this run.");
+  expect(cancellationSummary(run({ cancellation: { requestedBy: "administrator" } }), false)).toBe("An administrator asked to cancel this run.");
+  expect(cancellationSummary(run({ cancellation: { requestedBy: "owner" } }), true)).toBe("The person who started this run asked to cancel it.");
+  expect(cancellationSummary(run({ cancellation: { requestedBy: "administrator", requestedByDisplayEmail: "bob@example.org" } }), true)).toBe("bob@example.org asked to cancel this run.");
+  expect(cancellationSummary(run({ cancellation: { requestedBy: "administrator" } }), true)).toBe("An administrator asked to cancel this run.");
 });

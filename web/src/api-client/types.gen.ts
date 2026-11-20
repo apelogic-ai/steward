@@ -558,6 +558,16 @@ export type BrowserRunCaller = {
     url?: string | null;
 };
 
+export type BrowserRunCancelRequester = 'owner' | 'administrator';
+
+export type BrowserRunCancellation = {
+    requestedBy: BrowserRunCancelRequester;
+    /**
+     * Admin views only: the email of the person who asked to cancel, when known.
+     */
+    requestedByDisplayEmail?: string | null;
+};
+
 export type BrowserRunEventSnapshot = {
     apiVersion: string;
     eventId: number;
@@ -688,6 +698,7 @@ export type BrowserRunTrigger = {
 
 export type BrowserRunView = {
     caller?: null | BrowserRunCaller;
+    cancellation?: null | BrowserRunCancellation;
     codingAgentRuntime: string;
     createdAt: string;
     envelopeRuntimeMinutesLimit?: string | null;
@@ -2242,6 +2253,47 @@ export type AllRunResponses = {
 };
 
 export type AllRunResponse = AllRunResponses[keyof AllRunResponses];
+
+export type CancelAnyRunData = {
+    body?: never;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/all-runs/{task_uid}/cancel';
+};
+
+export type CancelAnyRunErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Run was not found
+     */
+    404: unknown;
+    /**
+     * Run has already reached a terminal phase
+     */
+    409: unknown;
+    /**
+     * Run cancellation is unavailable
+     */
+    503: unknown;
+};
+
+export type CancelAnyRunResponses = {
+    200: BrowserRunResponse;
+};
+
+export type CancelAnyRunResponse = CancelAnyRunResponses[keyof CancelAnyRunResponses];
 
 export type AllRunExecutionLogData = {
     body?: never;

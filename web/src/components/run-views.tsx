@@ -7,6 +7,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react
 import {
   allRun,
   allRunTimeline,
+  cancelAnyRun,
   cancelMyRun,
   detectWorkflow,
   dispatchTask,
@@ -170,6 +171,17 @@ export function inferenceFailureGuidance(errorCategory: string | null | undefine
     return "The saved API key has no remaining budget. Replace it in Connections or ask an administrator to increase its budget.";
   }
   return null;
+}
+
+export function cancellationSummary(run: Pick<BrowserRunView, "cancellation">, admin: boolean): string | null {
+  const cancellation = run.cancellation;
+  if (!cancellation) return null;
+  if (cancellation.requestedBy === "owner") {
+    return admin ? "The person who started this run asked to cancel it." : "You asked to cancel this run.";
+  }
+  return admin && cancellation.requestedByDisplayEmail
+    ? `${cancellation.requestedByDisplayEmail} asked to cancel this run.`
+    : "An administrator asked to cancel this run.";
 }
 
 export function runtimeMinutesSummary(run: Pick<BrowserRunView,
@@ -667,7 +679,8 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   async function cancelRun() {
     if (session.status !== "authenticated") return;
     setCancelState("working");
-    const result = await cancelMyRun({ body: {} as never, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
+    const options = { body: {} as never, cache: "no-store" as const, credentials: "same-origin" as const, headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } };
+    const result = admin ? await cancelAnyRun(options) : await cancelMyRun(options);
     if (result.response?.status === 409) {
       window.location.reload();
       return;
@@ -691,6 +704,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const inferenceGuidance = run.phase === "failed" ? inferenceFailureGuidance(run.errorCategory) : null;
         const failureReason = visibleRunFailureReason(run);
         const runtimeMinutes = runtimeMinutesSummary(run);
+        const cancellation = cancellationSummary(run, admin);
         return (
           <article className="space-y-6">
             <header className="flex flex-wrap items-start justify-between gap-5">
@@ -699,15 +713,16 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
                 <RunAttribution run={run} />
                 {runtimeMinutes ? <div className="mt-1 text-sm text-muted-ink">{runtimeMinutes}</div> : null}
+                {cancellation ? <div className="mt-1 text-sm text-muted-ink">{cancellation}</div> : null}
               </div>
-              {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : "This run cannot be re-run."} onClick={async () => {
+              {!admin || !isTerminalPhase(run.phase) ? <div className="flex flex-wrap gap-2">{!admin ? <button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : "This run cannot be re-run."} onClick={async () => {
                 if (session.status !== "authenticated") return;
                 setRerunState("working");
                 const idempotencyKey = crypto.randomUUID();
                 const outcome = await pollRerun(() => rerunMyRun({ body: { idempotencyKey }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } }));
                 if ("taskUid" in outcome) router.push(`/runs/${outcome.taskUid}`);
                 else setRerunState(outcome.failure);
-              }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <details className="relative"><summary aria-label="More run actions" className="grid min-h-10 min-w-10 cursor-pointer list-none place-items-center rounded-control border bg-panel px-3 text-lg font-semibold">···</summary><div className="absolute right-0 z-10 mt-1 min-w-40 rounded-control border bg-panel p-1 shadow-lg"><button className="w-full rounded-control px-3 py-2 text-left text-sm font-semibold text-err hover:bg-err-soft" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={() => setCancelOpen(true)} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button></div></details> : null}</div> : null}
+              }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button> : null}{!isTerminalPhase(run.phase) ? <details className="relative"><summary aria-label="More run actions" className="grid min-h-10 min-w-10 cursor-pointer list-none place-items-center rounded-control border bg-panel px-3 text-lg font-semibold">···</summary><div className="absolute left-0 z-10 mt-1 min-w-40 sm:left-auto sm:right-0 rounded-control border bg-panel p-1 shadow-lg"><button className="w-full rounded-control px-3 py-2 text-left text-sm font-semibold text-err hover:bg-err-soft" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={() => setCancelOpen(true)} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button></div></details> : null}</div> : null}
             </header>
             {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}{rerunState === "inference-key-missing" ? <> <Link className="font-semibold underline" href="/connections">Open Connections</Link></> : null}</p> : null}
             {!run.rerunSupported ? <DiagnosticDetails items={[{ label: "Reason", value: run.rerunUnavailableReason }]} /> : null}

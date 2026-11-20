@@ -382,6 +382,7 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::my_run,
         agent_runs_ui::my_run_events,
         agent_runs_ui::cancel_my_run,
+        agent_runs_ui::cancel_any_run,
         agent_runs_ui::rerun_my_run,
         agent_runs_ui::my_run_timeline,
         agent_runs_ui::my_run_execution_log,
@@ -1578,6 +1579,15 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         _owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>>;
 
+    /// Cancel any run in this deployment for a caller already proven to be an administrator.
+    fn cancel_any_agent_run<'a>(
+        &'a self,
+        _task_uid: Uuid,
+        _requested_by: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn rerun_source<'a>(
         &'a self,
         _task_uid: Uuid,
@@ -1763,6 +1773,14 @@ impl AgentRunLedger for PgStore {
         owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
         Box::pin(async move { PgStore::cancel_agent_run(self, task_uid, owner_user_id).await })
+    }
+
+    fn cancel_any_agent_run<'a>(
+        &'a self,
+        task_uid: Uuid,
+        requested_by: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async move { PgStore::cancel_any_agent_run(self, task_uid, requested_by).await })
     }
 
     fn rerun_source<'a>(
@@ -19378,6 +19396,8 @@ mod tests {
             },
             envelope_revision: Some(7),
             finalize_requested: true,
+            cancel_requested_by: None,
+            cancel_requested_by_display_email: None,
             finalized: true,
             failure_reason: Some("provider returned secret diagnostic payload".to_owned()),
             created_at: created_at.to_owned(),

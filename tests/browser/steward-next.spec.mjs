@@ -1666,7 +1666,9 @@ async function guardedPage(browser, {
     headers: { "cache-control": "no-store" },
   }));
   await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...fixtureRun, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
-  await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
+  await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/cancel")
+    ? route.continue()
+    : route.request().url().endsWith("/timeline")
     ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
     : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } }));
   await context.route(`${origin}/admin/api/v1/all-runs/${taskUid}/logs/*`, async (route) => {
@@ -4290,6 +4292,36 @@ test("a running run can be cancelled with an empty JSON mutation body", async ({
     expect(cancellation.body).toEqual({});
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("an administrator cancels another member's running run from the admin run page", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { runPhase: "running", session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
+    await administrator.page.getByLabel("More run actions").click();
+    await administrator.page.getByRole("button", { name: "Cancel run", exact: true }).click();
+    await expect(administrator.page.getByRole("alertdialog")).toContainText("The agent will stop and its temporary credentials will be revoked.");
+    await administrator.page.getByRole("button", { name: "Cancel run", exact: true }).last().click();
+    await expect(administrator.page.getByRole("button", { name: "Cancellation requested" })).toBeDisabled();
+
+    const cancellation = administrator.mutations.find((mutation) => mutation.path.endsWith("/cancel"));
+    expect(cancellation.path).toBe(`/admin/api/v1/all-runs/${taskUid}/cancel`);
+    expectMutationProof(cancellation);
+    expect(cancellation.body).toEqual({});
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("an administrator sees no Cancel for a finished run", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { runPhase: "succeeded", session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
+    await expect(administrator.page.getByRole("heading", { name: "repository-review@1" })).toBeVisible();
+    await expect(administrator.page.getByLabel("More run actions")).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 

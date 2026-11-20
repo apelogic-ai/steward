@@ -2281,6 +2281,8 @@ mod tests {
             },
             envelope_revision: Some(1),
             finalize_requested: true,
+            cancel_requested_by: None,
+            cancel_requested_by_display_email: None,
             finalized: true,
             failure_reason: None,
             created_at: "2026-08-17T00:00:00.000000Z".to_owned(),
