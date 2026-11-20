@@ -410,6 +410,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "migration 0073 must not update historical Tasks, runs, or canonical identities"
     );
     let historical_spend_runtime = seed_agent_run_usage_upgrade_fixture(&store).await?;
+    let historical_before_cancel_requester = historical_task_identity_snapshot(&store).await?;
     migration_set(None)
         .run(store.pool())
         .await
@@ -418,6 +419,12 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
                 "Steward agent-run usage migration must complete over the required TLS session: {error}"
             ))
         })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_cancel_requester,
+        "migration 0078 must not update historical Tasks, runs, or canonical identities"
+    );
+    assert_task_cancel_requester_upgrade_result(&store, historical_task_count).await?;
     assert_agent_run_usage_upgrade_result(&store, &historical_spend_runtime).await?;
     assert_task_caller_reference_upgrade_result(&store, historical_task_count).await?;
     verify_browser_task_library_upgrade(&store).await?;
@@ -862,6 +869,42 @@ async fn assert_agent_run_usage_upgrade_result(
     assert!(
         mutation.is_err(),
         "migration 0076 must leave historical spend observations append-only"
+    );
+    Ok(())
+}
+
+async fn assert_task_cancel_requester_upgrade_result(
+    store: &PgStore,
+    historical_task_count: i64,
+) -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM task_submissions WHERE cancel_requested_by IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        historical_task_count,
+        "migration 0078 must not invent who cancelled a historical Task"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT tgenabled = 'O' FROM pg_trigger \
+             WHERE tgrelid = 'task_submissions'::regclass \
+               AND tgname = 'task_cancel_requested_by_is_immutable'",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        "migration 0078 must enable its set-once trigger"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'task_submissions'::regclass \
+               AND conname = 'task_submissions_cancel_requested_by_requires_cancel'",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        "migration 0078 must validate its constraint over historical Tasks"
     );
     Ok(())
 }
@@ -2549,7 +2592,8 @@ async fn historical_task_identity_snapshot(
              'tasks', (\
                  SELECT jsonb_agg( \
                      to_jsonb(task_row) || jsonb_build_object( \
-                         'caller_reference', to_jsonb(task_row) -> 'caller_reference' \
+                         'caller_reference', to_jsonb(task_row) -> 'caller_reference', \
+                         'cancel_requested_by', to_jsonb(task_row) -> 'cancel_requested_by' \
                      ) \
                      ORDER BY task_row.task_uid \
                  ) \

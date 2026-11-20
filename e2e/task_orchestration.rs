@@ -6086,53 +6086,15 @@ async fn two_reconcilers_scenario() -> Result<(), Box<dyn Error>> {
     );
 
     let starts_before_cancellation = task_runtime.starts.load(Ordering::SeqCst);
-    let administrator = store
-        .register_canonical_identity(
-            &OrganizationIdentityPolicy::new(
-                "https://accounts.google.com",
-                "example.com",
-                OrganizationId::parse("org_example")?,
-            )?
-            .validate(
-                "https://accounts.google.com",
-                &format!("orchestrator-admin-subject-{suffix}"),
-                "example.com",
-                &format!("bob-{suffix}@example.com"),
-                true,
-            )?,
-            "test-bootstrap",
-        )
-        .await?;
-    assert_eq!(
-        store
-            .cancel_agent_run(cancelled_task_uid, administrator.user_id.as_str())
-            .await?,
-        None,
-        "a member's own-run cancel must not reach another member's run"
-    );
-    let cancelled_run = store
-        .cancel_any_agent_run(cancelled_task_uid, administrator.user_id.as_str())
-        .await?
-        .ok_or_else(|| io::Error::other("administrator cancellation did not find the run"))?;
-    assert!(cancelled_run.finalize_requested);
-    assert_eq!(
-        cancelled_run.cancel_requested_by.as_deref(),
-        Some(administrator.user_id.as_str()),
-        "the run must record which administrator asked to cancel it"
-    );
-    assert_eq!(
-        cancelled_run.cancel_requested_by_display_email.as_deref(),
-        Some(format!("bob-{suffix}@example.com").as_str())
-    );
-    let retried_run = store
-        .cancel_agent_run(cancelled_task_uid, identity.user_id.as_str())
-        .await?
-        .ok_or_else(|| io::Error::other("owner cancellation retry did not find the run"))?;
-    assert_eq!(
-        retried_run.cancel_requested_by.as_deref(),
-        Some(administrator.user_id.as_str()),
-        "a later cancel request must not overwrite the first requester"
-    );
+    // Kept out of line: this scenario's poll frame is already close to the debug stack limit.
+    Box::pin(administrator_cancels_and_requester_is_recorded(
+        &store,
+        &pool,
+        cancelled_task_uid,
+        identity.user_id.as_str(),
+        &suffix,
+    ))
+    .await?;
     let cancelled = store
         .task(cancelled_task_uid)
         .await?
@@ -7486,6 +7448,74 @@ struct TaskProjectionFixture<'a> {
     phase: &'a str,
     output_archive: Option<&'a [u8]>,
     output_archive_contract: Option<&'a str>,
+}
+
+async fn administrator_cancels_and_requester_is_recorded(
+    store: &PgStore,
+    pool: &sqlx::PgPool,
+    cancelled_task_uid: Uuid,
+    owner_user_id: &str,
+    suffix: &str,
+) -> Result<(), Box<dyn Error>> {
+    let administrator = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("orchestrator-admin-subject-{suffix}"),
+                "example.com",
+                &format!("bob-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    assert_eq!(
+        store
+            .cancel_agent_run(cancelled_task_uid, administrator.user_id.as_str())
+            .await?,
+        None,
+        "a member's own-run cancel must not reach another member's run"
+    );
+    let cancelled_run = store
+        .cancel_any_agent_run(cancelled_task_uid, administrator.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("administrator cancellation did not find the run"))?;
+    assert!(cancelled_run.finalize_requested);
+    assert_eq!(
+        cancelled_run.cancel_requested_by.as_deref(),
+        Some(administrator.user_id.as_str()),
+        "the run must record which administrator asked to cancel it"
+    );
+    assert_eq!(
+        cancelled_run.cancel_requested_by_display_email.as_deref(),
+        Some(format!("bob-{suffix}@example.com").as_str())
+    );
+    let retried_run = store
+        .cancel_agent_run(cancelled_task_uid, owner_user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("owner cancellation retry did not find the run"))?;
+    assert_eq!(
+        retried_run.cancel_requested_by.as_deref(),
+        Some(administrator.user_id.as_str()),
+        "a later cancel request must not overwrite the first requester"
+    );
+    let overwrite = sqlx::query(
+        "UPDATE task_submissions SET cancel_requested_by = $2 WHERE task_uid = $1",
+    )
+    .bind(cancelled_task_uid)
+    .bind(owner_user_id)
+    .execute(pool)
+    .await;
+    assert!(
+        overwrite.is_err(),
+        "the database must refuse to rewrite who asked to cancel a run"
+    );
+    Ok(())
 }
 
 async fn insert_task_projection_fixture(
