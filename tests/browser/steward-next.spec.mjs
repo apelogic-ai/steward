@@ -4301,7 +4301,7 @@ test("an administrator cancels another member's running run from the admin run p
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
     await administrator.page.getByLabel("More run actions").click();
     await administrator.page.getByRole("button", { name: "Cancel run", exact: true }).click();
-    await expect(administrator.page.getByRole("dialog")).toContainText("The agent will stop and its temporary credentials will be revoked.");
+    await expect(administrator.page.getByRole("alertdialog")).toContainText("The agent will stop and its temporary credentials will be revoked.");
     await administrator.page.getByRole("button", { name: "Cancel run", exact: true }).last().click();
     await expect(administrator.page.getByRole("button", { name: "Cancellation requested" })).toBeDisabled();
 
