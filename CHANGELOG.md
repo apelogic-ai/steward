@@ -49,6 +49,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   runtime images need `curl` and `jq` for the lookup; the reference image has
   both. Codex still prints its own "model metadata not found" warning for such
   models. No migration, CRD change, chart value or API change.
+- Envelope monthly runtime minutes now count while a run executes and stop it
+  when they are used up (#688). The runtime controller measures them at the
+  start of every reconcile, before inference and spend steps. A failing later
+  step no longer skips the measurement. A running runtime with a minutes limit
+  (per run or Envelope) is reconciled at least every inference observation
+  interval (15 seconds by default) even when it has no models. Before, it
+  waited for its full TTL. The minutes shown on the run page therefore grow
+  while the run executes.
+
+### Changed
+
+- A running run whose Envelope has used up its monthly minutes now fails with
+  "This run stopped because the Envelope's monthly minutes were used up."
+  (also returned as `failureReason`) instead of being suspended and parked.
+  The runtime-minutes exhaustion record and the administrator top-up remain;
+  a top-up raises the limit for later runs, but no longer resumes the stopped
+  run. No limit values or admission checks change.
 
 ## [0.3.35] - 2026-11-15
 

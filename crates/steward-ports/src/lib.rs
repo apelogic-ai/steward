@@ -63,6 +63,10 @@ pub const TASK_AGENT_START_FAILURE: &str = "This run could not start its coding 
 /// Safe failure returned when an approved tool cannot complete an agent request.
 pub const TASK_TOOL_FAILURE: &str =
     "This run stopped because an approved tool could not complete the request.";
+/// Safe failure returned when a running Task is stopped because its Envelope instance has used
+/// up its monthly runtime minutes, including any active top-up.
+pub const ENVELOPE_RUNTIME_MINUTES_EXHAUSTED_FAILURE: &str =
+    "This run stopped because the Envelope's monthly minutes were used up.";
 /// Safe failure returned when a required Task output archive contains no regular files.
 pub const REQUIRED_OUTPUT_MISSING_FAILURE: &str =
     "This run finished without creating an output file.";

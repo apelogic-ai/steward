@@ -28,8 +28,9 @@ use steward_admission::{
     duration_seconds, evaluate, evaluate_with_grants,
 };
 use steward_ports::{
-    DecisionChannel, DecisionRequest, INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities,
-    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
+    DecisionChannel, DecisionRequest, ENVELOPE_RUNTIME_MINUTES_EXHAUSTED_FAILURE,
+    INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities, InferenceCredential,
+    InferenceObservation, InferencePlane, InferenceRequest, InferenceUsage,
     MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SANDBOX_EGRESS_REJECTION_PREFIX,
     SANDBOX_EGRESS_UNAVAILABLE_FAILURE, SandboxExecutionClass, SandboxTaskObservation,
     SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime, TASK_AGENT_START_FAILURE,
@@ -3358,6 +3359,28 @@ fn task_runtime_minutes_limit(task: &steward_store::TaskRecord) -> Option<&str> 
         .map(steward_types::direct_package::Decimal::as_str)
 }
 
+/// What a running runtime observes on each reconcile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RunningObservation {
+    /// Inference spend is read from the model gateway.
+    inference: bool,
+    /// The Task or its Envelope instance has a runtime-minutes limit.
+    runtime_minutes: bool,
+}
+
+/// How long a running runtime waits before its next reconcile.
+fn running_requeue(
+    ttl_requeue: StdDuration,
+    observation: RunningObservation,
+    observation_interval: StdDuration,
+) -> StdDuration {
+    if observation.inference || observation.runtime_minutes {
+        ttl_requeue.min(observation_interval)
+    } else {
+        ttl_requeue
+    }
+}
+
 fn task_runtime_limit_failure_reason(limit: &str, exhausted: bool) -> Option<String> {
     let unit = if limit == "1"
         || limit.strip_prefix("1.").is_some_and(|fraction| {
@@ -4391,6 +4414,108 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 } else {
                     (false, None, None, None, None, None, None)
                 };
+                // Meter runtime minutes before any other step, so a failing later step cannot
+                // stop a running Task's minutes from being recorded and enforced.
+                if let (
+                    Some(authority),
+                    Some(task_uid),
+                    Some(runtime_limit),
+                    Some(operation_generation),
+                ) = (
+                    context.authority.as_ref(),
+                    task_uid,
+                    task_runtime_minutes_limit.as_deref(),
+                    task_operation_generation,
+                ) {
+                    let runtime_uid =
+                        runtime
+                            .metadata
+                            .uid
+                            .as_deref()
+                            .ok_or(ControllerError::Reconcile(
+                                ReconcileError::MissingRuntimeUid,
+                            ))?;
+                    let observation = authority
+                        .observe_task_runtime_minutes(task_uid, runtime_uid, runtime_limit)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?;
+                    if let Some(reason) =
+                        task_runtime_limit_failure_reason(&observation.limit, observation.exhausted)
+                    {
+                        authority
+                            .enter_task_cleanup(
+                                task_uid,
+                                operation_generation,
+                                TaskCleanupCause::Failed(&reason),
+                                TASK_ORCHESTRATOR_ACTOR,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                }
+                if let (Some(authority), Some(instance_id), Some(task_uid), Some(base_limit)) = (
+                    context.authority.as_ref(),
+                    task_envelope_instance_id.as_deref(),
+                    task_uid,
+                    envelope_runtime_minutes_limit.as_deref(),
+                ) {
+                    let runtime_uid =
+                        runtime
+                            .metadata
+                            .uid
+                            .as_deref()
+                            .ok_or(ControllerError::Reconcile(
+                                ReconcileError::MissingRuntimeUid,
+                            ))?;
+                    let observation = authority
+                        .observe_envelope_instance_runtime_minutes(
+                            instance_id,
+                            task_uid,
+                            runtime_uid,
+                            base_limit,
+                        )
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?;
+                    if observation.exhausted {
+                        let Some(generation) = task_operation_generation else {
+                            return suspend_runtime_with_inference_cleanup(
+                                &runtime,
+                                &api,
+                                &context.sandbox_runtime,
+                                context.client.clone(),
+                                &context.inference,
+                                None,
+                                context.authority.as_ref(),
+                            )
+                            .await;
+                        };
+                        authority
+                            .enter_task_cleanup(
+                                task_uid,
+                                generation,
+                                TaskCleanupCause::Failed(
+                                    ENVELOPE_RUNTIME_MINUTES_EXHAUSTED_FAILURE,
+                                ),
+                                TASK_ORCHESTRATOR_ACTOR,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                }
                 if !is_pending_approval(&runtime) && !has_activation_condition(&runtime) {
                     let released_hold = runtime
                         .status
@@ -4798,88 +4923,6 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         }
                     }
                 }
-                if let (
-                    Some(authority),
-                    Some(task_uid),
-                    Some(runtime_limit),
-                    Some(operation_generation),
-                ) = (
-                    context.authority.as_ref(),
-                    task_uid,
-                    task_runtime_minutes_limit.as_deref(),
-                    task_operation_generation,
-                ) {
-                    let runtime_uid =
-                        runtime
-                            .metadata
-                            .uid
-                            .as_deref()
-                            .ok_or(ControllerError::Reconcile(
-                                ReconcileError::MissingRuntimeUid,
-                            ))?;
-                    let observation = authority
-                        .observe_task_runtime_minutes(task_uid, runtime_uid, runtime_limit)
-                        .await
-                        .map_err(|error| {
-                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?;
-                    if let Some(reason) =
-                        task_runtime_limit_failure_reason(&observation.limit, observation.exhausted)
-                    {
-                        authority
-                            .enter_task_cleanup(
-                                task_uid,
-                                operation_generation,
-                                TaskCleanupCause::Failed(&reason),
-                                TASK_ORCHESTRATOR_ACTOR,
-                            )
-                            .await
-                            .map_err(|error| {
-                                ControllerError::Reconcile(ReconcileError::Authority(
-                                    error.to_string(),
-                                ))
-                            })?;
-                        return Ok(Action::requeue(StdDuration::from_secs(2)));
-                    }
-                }
-                if let (Some(authority), Some(instance_id), Some(task_uid), Some(base_limit)) = (
-                    context.authority.as_ref(),
-                    task_envelope_instance_id.as_deref(),
-                    task_uid,
-                    envelope_runtime_minutes_limit.as_deref(),
-                ) {
-                    let runtime_uid =
-                        runtime
-                            .metadata
-                            .uid
-                            .as_deref()
-                            .ok_or(ControllerError::Reconcile(
-                                ReconcileError::MissingRuntimeUid,
-                            ))?;
-                    let observation = authority
-                        .observe_envelope_instance_runtime_minutes(
-                            instance_id,
-                            task_uid,
-                            runtime_uid,
-                            base_limit,
-                        )
-                        .await
-                        .map_err(|error| {
-                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?;
-                    if observation.exhausted {
-                        return suspend_runtime_with_inference_cleanup(
-                            &runtime,
-                            &api,
-                            &context.sandbox_runtime,
-                            context.client.clone(),
-                            &context.inference,
-                            None,
-                            context.authority.as_ref(),
-                        )
-                        .await;
-                    }
-                }
                 let remaining_instance_spend =
                     if let (Some(authority), Some(instance_id), Some(runtime_uid)) = (
                         &context.authority,
@@ -5172,11 +5215,15 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         .map_err(ControllerError::Kubernetes)?;
                 }
                 Ok(if running {
-                    Action::requeue(if runtime.spec.llms.is_empty() {
-                        ttl_requeue
-                    } else {
-                        ttl_requeue.min(context.config.inference_observation_interval())
-                    })
+                    Action::requeue(running_requeue(
+                        ttl_requeue,
+                        RunningObservation {
+                            inference: !runtime.spec.llms.is_empty(),
+                            runtime_minutes: envelope_runtime_minutes_limit.is_some()
+                                || task_runtime_minutes_limit.is_some(),
+                        },
+                        context.config.inference_observation_interval(),
+                    ))
                 } else {
                     Action::requeue(ttl_requeue.min(StdDuration::from_secs(2)))
                 })
@@ -6568,6 +6615,38 @@ mod tests {
             super::ReconcileError::DeletionTimedOut
         );
         Ok(())
+    }
+
+    #[test]
+    fn running_runtimes_with_minutes_limits_are_observed_at_the_observation_interval() {
+        let ttl = StdDuration::from_secs(3_600);
+        let interval = StdDuration::from_secs(15);
+        let minutes_only = super::RunningObservation {
+            inference: false,
+            runtime_minutes: true,
+        };
+        assert_eq!(
+            super::running_requeue(ttl, minutes_only, interval),
+            interval
+        );
+        let inference_only = super::RunningObservation {
+            inference: true,
+            runtime_minutes: false,
+        };
+        assert_eq!(
+            super::running_requeue(ttl, inference_only, interval),
+            interval
+        );
+        let neither = super::RunningObservation {
+            inference: false,
+            runtime_minutes: false,
+        };
+        assert_eq!(super::running_requeue(ttl, neither, interval), ttl);
+        assert_eq!(
+            super::running_requeue(StdDuration::from_secs(5), minutes_only, interval),
+            StdDuration::from_secs(5),
+            "an earlier TTL deadline still wins"
+        );
     }
 
     #[test]
