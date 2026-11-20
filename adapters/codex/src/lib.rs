@@ -6,6 +6,10 @@ use steward_ports::{
 };
 
 pub const CODEX_V1_ADAPTER: &str = "codex-v1";
+
+/// The one error-output line a Codex run prints when the model gateway reports no context window
+/// for the selected model.
+pub const CONTEXT_WINDOW_FALLBACK_NOTICE: &str = "The model gateway did not report a context window for this model, so the coding agent uses its default. To set one, add max_input_tokens for this model in the model gateway settings.";
 const ABSENT_COMMAND_URL: &str = "-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,11 +109,12 @@ fn codex_config_command(model_info_url: &str) -> String {
             // Codex reads the window as a signed 64-bit integer.
             "case $context_window in ''|0*|*[!0-9]*|???????????????????*) context_window= ;; esac; ",
             "if [ -z \"$context_window\" ]; then ",
-            "echo 'The model gateway did not report a context window for this model, so the coding agent uses its default. To set one, add max_input_tokens for this model in the model gateway settings.' >&2; fi; ",
+            "echo {notice} >&2; fi; ",
             "{{ if [ -n \"$context_window\" ]; then printf 'model_context_window = %s\\n' \"$context_window\"; fi; ",
             "printf '%s' \"$adapter_config\"; }} > \"$CODEX_HOME/config.toml\"; ",
         ),
         shell_single_quote(model_info_url),
+        notice = shell_single_quote(CONTEXT_WINDOW_FALLBACK_NOTICE),
     )
 }
 
@@ -224,7 +229,8 @@ mod tests {
     };
 
     use super::{
-        CODEX_V1_ADAPTER, CodexTaskExecutionAdapter, codex_config_command, shell_single_quote,
+        CODEX_V1_ADAPTER, CONTEXT_WINDOW_FALLBACK_NOTICE, CodexTaskExecutionAdapter,
+        codex_config_command, shell_single_quote,
     };
 
     const MODEL_INFO_URL: &str = "https://inference.example.test/v1/model/info";
@@ -441,10 +447,9 @@ mod tests {
             let step = run_config_step(adapter_config, "hosted-alias", model_info, &[])?;
             assert_eq!(&step.config, adapter_config, "{model_info:?}");
             assert_eq!(
-                step.stderr.lines().count(),
-                1,
-                "exactly one line explains the default for {model_info:?}: {:?}",
-                step.stderr
+                step.stderr,
+                format!("{CONTEXT_WINDOW_FALLBACK_NOTICE}\n"),
+                "exactly one line explains the default for {model_info:?}"
             );
         }
         Ok(())
