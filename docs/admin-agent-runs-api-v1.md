@@ -9,14 +9,17 @@ Applies to Steward 0.3.35.
 
 The always-visible execution-log additions described below are part of Steward
 0.3.27. The inference-usage additions are part of Steward 0.3.28. The
-`spendReportReason` addition is part of Steward 0.3.30.
+`spendReportReason` addition is part of Steward 0.3.30. Administrator cancel
+and the `cancellation` field are unreleased; they ship in the release after
+0.3.35.
 
 ## Authority and privacy boundary
 
 User operations are below `/app/api/v1/runs`; reads are restricted to the exact
 canonical owner and mutations additionally require the browser CSRF proof.
-Administrator reads are below `/admin/api/v1/all-runs` and require exact
-browser administrator authority. A member-role identity, Task identity,
+Administrator reads and the administrator cancel mutation are below
+`/admin/api/v1/all-runs` and require exact browser administrator authority;
+the mutation also requires the browser CSRF proof. A member-role identity, Task identity,
 runtime identity, provider credential, or Kubernetes bearer token is not
 browser authority.
 
@@ -157,8 +160,19 @@ indistinguishable from an absent Task. It does not grant browser or administrato
 ### Cancel and re-run
 
 `POST /app/api/v1/runs/{taskUid}/cancel` transitions the caller's eligible Task
-to `cancelled` and returns `409` if the Task is already terminal. Administrator
-run detail is read-only and exposes neither mutation. `POST
+to `cancelled` and returns `409` if the Task is already terminal; another
+member's run returns `404`. `POST /admin/api/v1/all-runs/{taskUid}/cancel`
+does the same for any run in the deployment and returns the administrator run
+view, `404` for an unknown run and `409` for a terminal one; a non-administrator
+session receives `403`. Administrator run detail does not expose re-run.
+
+The first browser request to cancel a run is recorded. Run views then carry
+`cancellation.requestedBy` (`owner` or `administrator`); administrator views
+also carry `cancellation.requestedByDisplayEmail` when the requester has a
+display email. Runs cancelled before this field existed, or cancelled only by a
+service caller, have no `cancellation`.
+
+`POST
 /app/api/v1/runs/{taskUid}/rerun` takes an idempotency key
 and creates a fresh Task against the same active Envelope instance for a
 versioned Steward workflow. For a direct GitHub Task, it invokes GitHub's re-run

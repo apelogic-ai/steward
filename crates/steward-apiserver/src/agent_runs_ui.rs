@@ -463,6 +463,9 @@ pub(crate) struct BrowserRunView {
     trigger: Option<BrowserRunTrigger>,
     #[serde(skip_serializing_if = "Option::is_none")]
     caller: Option<BrowserRunCaller>,
+    /// Present once someone asked to cancel the run from the browser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancellation: Option<BrowserRunCancellation>,
     execution_log: ExecutionLogMode,
     rerun_supported: bool,
     rerun_unavailable_reason: Option<&'static str>,
@@ -611,6 +614,22 @@ pub(crate) struct BrowserRunCaller {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunCancellation {
+    requested_by: BrowserRunCancelRequester,
+    /// Admin views only: the email of the person who asked to cancel, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_by_display_email: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum BrowserRunCancelRequester {
+    Owner,
+    Administrator,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -1754,6 +1773,10 @@ where
         .route("/admin/api/v1/all-runs", get(all_runs::<L>))
         .route("/admin/api/v1/all-runs/{task_uid}", get(all_run::<L>))
         .route(
+            "/admin/api/v1/all-runs/{task_uid}/cancel",
+            post(cancel_any_run::<L>),
+        )
+        .route(
             "/admin/api/v1/all-runs/{task_uid}/timeline",
             get(all_run_timeline::<L>),
         )
@@ -1773,8 +1796,9 @@ where
 /// Mount browser-session-bound Runs APIs.
 ///
 /// `GET /app/api/v1/runs` and its detail/timeline descendants are exact-identity scoped to the
-/// browser principal. `GET /admin/api/v1/all-runs` and its descendants are browser-admin only
-/// and may optionally filter an opaque canonical owner identifier. Neither response exposes
+/// browser principal. `GET /admin/api/v1/all-runs` and its descendants, including the
+/// administrator cancel mutation, are browser-admin only and may optionally filter an opaque
+/// canonical owner identifier. Neither response exposes
 /// emails, provider credentials, commands, prompts or raw failure data.
 pub fn protected_router<L>(ledger: L, browser_auth: BrowserAuthService) -> Router
 where
@@ -2444,6 +2468,52 @@ where
 }
 
 #[utoipa::path(
+    post,
+    operation_id = "cancelAnyRun",
+    path = "/admin/api/v1/all-runs/{task_uid}/cancel",
+    params(
+        ("task_uid" = String, Path, format = "uuid"),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    responses(
+        (status = 200, body = BrowserRunResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Run was not found"),
+        (status = 409, description = "Run has already reached a terminal phase"),
+        (status = 503, description = "Run cancellation is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn cancel_any_run<L>(
+    authority: Option<Extension<BrowserAdminAuthority>>,
+    _proof: Extension<BrowserMutationProof>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(authority)) = authority else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state
+        .ledger
+        .cancel_any_agent_run(task_uid, authority.principal().canonical_user_id.as_str())
+        .await
+    {
+        Ok(Some(record)) => Json(BrowserRunResponse {
+            api_version: BROWSER_AGENT_RUNS_API_VERSION,
+            run: admin_browser_run_view(record, state.inference_mode),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StoreError::InvalidTaskTransition) => StatusCode::CONFLICT.into_response(),
+        Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[utoipa::path(
     get,
     path = "/app/api/v1/runs/{task_uid}/logs/{stream}",
     params(
@@ -2757,9 +2827,17 @@ fn spend_report_reason(
 
 fn admin_browser_run_view(record: AgentRunRecord, inference_mode: InferenceMode) -> BrowserRunView {
     let reason = spend_report_reason(record.spend.as_ref(), inference_mode);
+    let canceller_email = record.cancel_requested_by_display_email.clone();
+    let view = browser_run_view(record);
     BrowserRunView {
         spend_report_reason: reason,
-        ..browser_run_view(record)
+        cancellation: view
+            .cancellation
+            .map(|cancellation| BrowserRunCancellation {
+                requested_by_display_email: canceller_email,
+                ..cancellation
+            }),
+        ..view
     }
 }
 
@@ -2868,6 +2946,18 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         public_run_failure_reason(record.failure_reason.as_deref()).map(str::to_owned);
     let spending_limit_reached =
         public_spending_limit_failure_reason(record.failure_reason.as_deref()).is_some();
+    let cancellation =
+        record
+            .cancel_requested_by
+            .as_deref()
+            .map(|requested_by| BrowserRunCancellation {
+                requested_by: if record.owner_user_id.as_deref() == Some(requested_by) {
+                    BrowserRunCancelRequester::Owner
+                } else {
+                    BrowserRunCancelRequester::Administrator
+                },
+                requested_by_display_email: None,
+            });
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
@@ -2902,6 +2992,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         failure_reason,
         trigger,
         caller,
+        cancellation,
         execution_log,
         rerun_supported,
         rerun_unavailable_reason: (!rerun_supported)
@@ -3211,6 +3302,47 @@ mod tests {
         github_queries: Arc<Mutex<Vec<GithubRerunQuery>>>,
         workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
         task_versions: Arc<Mutex<Vec<BrowserTaskVersionRecord>>>,
+    }
+
+    impl FakeLedger {
+        /// Mirrors `PgStore::cancel_agent_run_requested_by`: owner scope, terminal 409 and
+        /// first-requester recording.
+        fn cancel(
+            &self,
+            task_uid: Uuid,
+            owner_scope: Option<&str>,
+            requested_by: &str,
+        ) -> Result<Option<AgentRunRecord>, StoreError> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| StoreError::InvalidRunQuery)?;
+            let Some(record) = records.iter_mut().find(|record| {
+                record.task_uid == task_uid
+                    && record.owner_user_id.is_some()
+                    && owner_scope
+                        .is_none_or(|owner| record.owner_user_id.as_deref() == Some(owner))
+            }) else {
+                return Ok(None);
+            };
+            if matches!(
+                record.phase,
+                TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+            ) {
+                return Err(StoreError::InvalidTaskTransition);
+            }
+            record.finalize_requested = true;
+            record
+                .cancel_requested_by
+                .get_or_insert_with(|| requested_by.to_owned());
+            if matches!(
+                record.phase,
+                TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+            ) {
+                record.phase = TaskPhase::Cancelled;
+            }
+            Ok(Some(record.clone()))
+        }
     }
 
     impl AgentRunLedger for FakeLedger {
@@ -3524,32 +3656,15 @@ mod tests {
             task_uid: Uuid,
             owner_user_id: &'a str,
         ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
-            Box::pin(async move {
-                let mut records = self
-                    .records
-                    .lock()
-                    .map_err(|_| StoreError::InvalidRunQuery)?;
-                let Some(record) = records.iter_mut().find(|record| {
-                    record.task_uid == task_uid
-                        && record.owner_user_id.as_deref() == Some(owner_user_id)
-                }) else {
-                    return Ok(None);
-                };
-                if matches!(
-                    record.phase,
-                    TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
-                ) {
-                    return Err(StoreError::InvalidTaskTransition);
-                }
-                record.finalize_requested = true;
-                if matches!(
-                    record.phase,
-                    TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
-                ) {
-                    record.phase = TaskPhase::Cancelled;
-                }
-                Ok(Some(record.clone()))
-            })
+            Box::pin(async move { self.cancel(task_uid, Some(owner_user_id), owner_user_id) })
+        }
+
+        fn cancel_any_agent_run<'a>(
+            &'a self,
+            task_uid: Uuid,
+            requested_by: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+            Box::pin(async move { self.cancel(task_uid, None, requested_by) })
         }
 
         fn rerun_source<'a>(
@@ -3745,6 +3860,8 @@ mod tests {
             },
             envelope_revision: Some(1),
             finalize_requested: false,
+            cancel_requested_by: None,
+            cancel_requested_by_display_email: None,
             finalized: false,
             failure_reason: Some("provider returned private details".to_owned()),
             created_at: "2026-08-17T00:00:00.000000Z".to_owned(),
@@ -4131,6 +4248,48 @@ mod tests {
         );
         assert_eq!(view.execution_log, ExecutionLogMode::Full);
         Ok(())
+    }
+
+    #[test]
+    fn cancellation_names_the_administrator_email_only_in_admin_views() {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let admin = "usr_abcdef0123456789abcdef0123456789";
+        let task_uid = Uuid::nil();
+        let cancelled_by_admin = AgentRunRecord {
+            cancel_requested_by: Some(admin.to_owned()),
+            cancel_requested_by_display_email: Some("bob@example.org".to_owned()),
+            ..running_run(task_uid, owner)
+        };
+        let member_view = browser_run_view(cancelled_by_admin.clone());
+        assert_eq!(
+            member_view.cancellation,
+            Some(BrowserRunCancellation {
+                requested_by: BrowserRunCancelRequester::Administrator,
+                requested_by_display_email: None,
+            })
+        );
+        let admin_view = admin_browser_run_view(cancelled_by_admin, InferenceMode::Stock);
+        assert_eq!(
+            admin_view.cancellation,
+            Some(BrowserRunCancellation {
+                requested_by: BrowserRunCancelRequester::Administrator,
+                requested_by_display_email: Some("bob@example.org".to_owned()),
+            })
+        );
+        let cancelled_by_owner = AgentRunRecord {
+            cancel_requested_by: Some(owner.to_owned()),
+            ..running_run(task_uid, owner)
+        };
+        assert_eq!(
+            browser_run_view(cancelled_by_owner)
+                .cancellation
+                .map(|cancellation| cancellation.requested_by),
+            Some(BrowserRunCancelRequester::Owner)
+        );
+        assert_eq!(
+            browser_run_view(running_run(task_uid, owner)).cancellation,
+            None
+        );
     }
 
     #[test]
@@ -4841,6 +5000,143 @@ mod tests {
             .await
             .map_err(|error| format!("execute cancel request: {error}"))?;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    fn cancel_request(
+        uri: String,
+        cookie: Option<&str>,
+        csrf: &str,
+    ) -> Result<Request<Body>, String> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::ORIGIN, "http://127.0.0.1:33001")
+            .header("sec-fetch-site", "same-origin")
+            .header("x-steward-csrf", csrf)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        request
+            .body(Body::from("{}"))
+            .map_err(|error| format!("build cancel request: {error}"))
+    }
+
+    fn running_run(task_uid: Uuid, owner_user_id: &str) -> AgentRunRecord {
+        AgentRunRecord {
+            phase: TaskPhase::Running,
+            failure_reason: None,
+            ..run(task_uid, owner_user_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_cancels_another_members_running_run_and_records_who_cancelled()
+    -> Result<(), String> {
+        let member = "usr_0123456789abcdef0123456789abcdef";
+        let admin = "usr_abcdef0123456789abcdef0123456789";
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(running_run(task_uid, member));
+        let (service, cookie, csrf) = signed_in_cookie_and_csrf(LocalFakeIdentity::Admin).await?;
+        let response = protected_router(ledger.clone(), service)
+            .oneshot(cancel_request(
+                format!("/admin/api/v1/all-runs/{task_uid}/cancel"),
+                Some(&cookie),
+                &csrf,
+            )?)
+            .await
+            .map_err(|error| format!("execute admin cancel request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read admin cancel response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse admin cancel response: {error}"))?;
+        assert_eq!(value["run"]["finalizationRequested"], true);
+        assert_eq!(value["run"]["cancellation"]["requestedBy"], "administrator");
+        let records = ledger.records.lock().map_err(|_| "lock records")?;
+        assert!(records[0].finalize_requested);
+        assert_eq!(records[0].cancel_requested_by.as_deref(), Some(admin));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn members_cannot_cancel_other_members_runs_through_either_route() -> Result<(), String> {
+        let other_member = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let task_uid = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(running_run(task_uid, other_member));
+        let (service, cookie, csrf) = signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
+        let admin_route = protected_router(ledger.clone(), service.clone())
+            .oneshot(cancel_request(
+                format!("/admin/api/v1/all-runs/{task_uid}/cancel"),
+                Some(&cookie),
+                &csrf,
+            )?)
+            .await
+            .map_err(|error| format!("execute member admin-cancel request: {error}"))?;
+        assert_eq!(admin_route.status(), StatusCode::FORBIDDEN);
+        let own_route = protected_router(ledger.clone(), service)
+            .oneshot(cancel_request(
+                format!("/app/api/v1/runs/{task_uid}/cancel"),
+                Some(&cookie),
+                &csrf,
+            )?)
+            .await
+            .map_err(|error| format!("execute member cancel request: {error}"))?;
+        assert_eq!(own_route.status(), StatusCode::NOT_FOUND);
+        let records = ledger.records.lock().map_err(|_| "lock records")?;
+        assert!(!records[0].finalize_requested);
+        assert_eq!(records[0].phase, TaskPhase::Running);
+        assert_eq!(records[0].cancel_requested_by, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_refuses_terminal_unknown_and_unauthenticated_requests()
+    -> Result<(), String> {
+        let member = "usr_0123456789abcdef0123456789abcdef";
+        let finished = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let unknown = Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(run(finished, member));
+        let (service, cookie, csrf) = signed_in_cookie_and_csrf(LocalFakeIdentity::Admin).await?;
+        for (task_uid, cookie, expected) in [
+            (finished, Some(cookie.as_str()), StatusCode::CONFLICT),
+            (unknown, Some(cookie.as_str()), StatusCode::NOT_FOUND),
+            (finished, None, StatusCode::UNAUTHORIZED),
+        ] {
+            let response = protected_router(ledger.clone(), service.clone())
+                .oneshot(cancel_request(
+                    format!("/admin/api/v1/all-runs/{task_uid}/cancel"),
+                    cookie,
+                    &csrf,
+                )?)
+                .await
+                .map_err(|error| format!("execute admin cancel request: {error}"))?;
+            assert_eq!(response.status(), expected, "task {task_uid}");
+        }
+        let records = ledger.records.lock().map_err(|_| "lock records")?;
+        assert_eq!(records[0].phase, TaskPhase::Succeeded);
+        assert_eq!(records[0].cancel_requested_by, None);
         Ok(())
     }
 

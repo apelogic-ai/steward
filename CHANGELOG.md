@@ -7,6 +7,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Tenant administrators can cancel any unfinished run from Admin → Runs → run
+  detail (More run actions → Cancel run), with the same confirmation step
+  members see (#687). The new endpoint is
+  `POST /admin/api/v1/all-runs/{task_uid}/cancel`: browser administrator
+  session and CSRF proof required; `404` for an unknown run, `409` for a
+  finished run. Members still cancel only their own runs through
+  `POST /app/api/v1/runs/{task_uid}/cancel`, and a member calling the admin
+  endpoint gets `403`.
+- Runs record who asked to cancel them. Run responses carry an optional
+  `cancellation` object: `requestedBy` is `owner` or `administrator`, and
+  admin views also carry `requestedByDisplayEmail`. Run detail pages show a
+  line such as "An administrator asked to cancel this run." Runs cancelled
+  before this release, and runs cancelled by a service caller, have no
+  `cancellation`.
+- Migration `0078_task_cancel_requested_by` adds a nullable
+  `task_submissions.cancel_requested_by` column. It is set once, by the first
+  browser cancel request, and a trigger rejects any later change. Existing
+  rows keep `NULL`; there is no backfill.
+
 ### Fixed
 
 - Codex runs now get the selected model's context window from the model

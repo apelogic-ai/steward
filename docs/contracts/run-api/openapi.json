@@ -146,6 +146,65 @@
         ]
       }
     },
+    "/admin/api/v1/all-runs/{task_uid}/cancel": {
+      "post": {
+        "tags": [
+          "agent_runs_ui"
+        ],
+        "operationId": "cancelAnyRun",
+        "parameters": [
+          {
+            "name": "task_uid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-Steward-CSRF",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserRunResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Browser session is absent or invalid"
+          },
+          "403": {
+            "description": "Administrator role, origin, fetch metadata, or CSRF proof is invalid"
+          },
+          "404": {
+            "description": "Run was not found"
+          },
+          "409": {
+            "description": "Run has already reached a terminal phase"
+          },
+          "503": {
+            "description": "Run cancellation is unavailable"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/admin/api/v1/all-runs/{task_uid}/logs/{stream}": {
       "get": {
         "tags": [
@@ -8901,6 +8960,31 @@
           }
         }
       },
+      "BrowserRunCancelRequester": {
+        "type": "string",
+        "enum": [
+          "owner",
+          "administrator"
+        ]
+      },
+      "BrowserRunCancellation": {
+        "type": "object",
+        "required": [
+          "requestedBy"
+        ],
+        "properties": {
+          "requestedBy": {
+            "$ref": "#/components/schemas/BrowserRunCancelRequester"
+          },
+          "requestedByDisplayEmail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Admin views only: the email of the person who asked to cancel, when known."
+          }
+        }
+      },
       "BrowserRunEventSnapshot": {
         "type": "object",
         "required": [
@@ -9454,6 +9538,17 @@
               },
               {
                 "$ref": "#/components/schemas/BrowserRunCaller"
+              }
+            ]
+          },
+          "cancellation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BrowserRunCancellation",
+                "description": "Present once someone asked to cancel the run from the browser."
               }
             ]
           },
