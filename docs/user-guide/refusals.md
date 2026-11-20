@@ -70,6 +70,7 @@ message lists them all, separated by semicolons.
 | This run could not start because the monthly spending limit of … has been reached. | Wait for next month, or ask for a higher monthly limit. |
 | This run reached its spending limit of …. | Raise the per-run limit, within your Envelope. |
 | This run reached its limit of … minutes. | Raise the limit, or split the work. |
+| This run stopped because the Envelope's monthly minutes were used up. | Wait for next month, or ask an administrator for more minutes. |
 | The model service rejected your saved API key. … | Replace the key on the **Connections** page. |
 | The saved API key has no remaining budget. … | Replace the key, or ask an administrator to raise its budget. |
 | The workspace could not be prepared. … | Retry. If it happens again, tell an administrator. |

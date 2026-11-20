@@ -4231,11 +4231,53 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
 async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
 -> Result<(), Box<dyn Error>> {
     // The scenario's future is several MiB in debug builds; keep it on the heap, not the test
-    // thread's stack.
-    Box::pin(two_reconcilers_scenario()).await
+    // thread's stack. Later scenarios run after it returns so its poll frame is gone.
+    let fixture = Box::pin(two_reconcilers_scenario()).await?;
+    Box::pin(envelope_monthly_minutes_stop_a_running_task(
+        EnvelopeMinutesScenario {
+            store: &fixture.store,
+            pool: &fixture.pool,
+            client: &fixture.client,
+            task_runtime: &fixture.task_runtime,
+            kubernetes: &fixture.kubernetes,
+            service: &fixture.service,
+            owner_user_id: &fixture.owner_user_id,
+            member_role: &fixture.member_role,
+            suffix: &fixture.suffix,
+            envelope: &fixture.envelope,
+            spec: &fixture.spec,
+            execution_binding: &fixture.execution_binding,
+            agent_command: &fixture.agent_command,
+            admission_decision: &fixture.admission_decision,
+            workflow_digest: &fixture.workflow_digest,
+        },
+    ))
+    .await
 }
 
-async fn two_reconcilers_scenario() -> Result<(), Box<dyn Error>> {
+/// State a finished `two_reconcilers_scenario` hands to later scenarios. The server guards keep
+/// the fake Kubernetes and admission endpoints alive.
+struct TwoReconcilersFixture {
+    store: PgStore,
+    pool: sqlx::PgPool,
+    client: Client,
+    task_runtime: AmbiguousTaskRuntime,
+    kubernetes: AmbiguousKubernetes,
+    service: String,
+    owner_user_id: steward_types::CanonicalUserId,
+    member_role: String,
+    suffix: String,
+    envelope: Envelope,
+    spec: AgentRuntimeSpec,
+    execution_binding: TaskExecutionBinding,
+    agent_command: [String; 2],
+    admission_decision: AdmissionDecision,
+    workflow_digest: String,
+    _server: ServerGuard,
+    _admission_server: ServerGuard,
+}
+
+async fn two_reconcilers_scenario() -> Result<TwoReconcilersFixture, Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for orchestration fault injection")
@@ -6844,7 +6886,25 @@ async fn two_reconcilers_scenario() -> Result<(), Box<dyn Error>> {
     );
 
     assert_eq!(reservation.record.task_uid, task_uid);
-    Ok(())
+    Ok(TwoReconcilersFixture {
+        store,
+        pool,
+        client,
+        task_runtime,
+        kubernetes,
+        service,
+        owner_user_id: identity.user_id,
+        member_role,
+        suffix,
+        envelope,
+        spec,
+        execution_binding,
+        agent_command,
+        admission_decision,
+        workflow_digest,
+        _server,
+        _admission_server,
+    })
 }
 
 #[tokio::test]
@@ -7438,6 +7498,407 @@ struct TaskProjectionFixture<'a> {
     phase: &'a str,
     output_archive: Option<&'a [u8]>,
     output_archive_contract: Option<&'a str>,
+}
+
+struct EnvelopeMinutesScenario<'a> {
+    store: &'a PgStore,
+    pool: &'a sqlx::PgPool,
+    client: &'a Client,
+    task_runtime: &'a AmbiguousTaskRuntime,
+    kubernetes: &'a AmbiguousKubernetes,
+    service: &'a str,
+    owner_user_id: &'a steward_types::CanonicalUserId,
+    member_role: &'a str,
+    suffix: &'a str,
+    envelope: &'a Envelope,
+    spec: &'a AgentRuntimeSpec,
+    execution_binding: &'a TaskExecutionBinding,
+    agent_command: &'a [String],
+    admission_decision: &'a AdmissionDecision,
+    workflow_digest: &'a str,
+}
+
+/// A running Task whose Envelope instance has used up its monthly minutes is stopped by the
+/// runtime controller with a plain reason, and each reconcile records the minutes used so far.
+///
+/// Split into boxed steps: this runs inside an already deep scenario, and debug-build poll frames
+/// of the provisioning steps must not sit on the stack under the controller's reconcile.
+async fn envelope_monthly_minutes_stop_a_running_task(
+    scenario: EnvelopeMinutesScenario<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let (task_uid, instance_id) = Box::pin(reserve_envelope_minutes_task(&scenario)).await?;
+    let EnvelopeMinutesScenario {
+        store,
+        pool,
+        client,
+        task_runtime,
+        ..
+    } = scenario;
+    for _ in 0..5 {
+        Box::pin(reconcile_current(client, task_runtime, store, task_uid)).await?;
+    }
+    let inference = ActiveInference::default();
+    for _ in 0..2 {
+        Box::pin(reconcile_fixture_runtime(&scenario, &inference)).await?;
+    }
+    Box::pin(reconcile_current(client, task_runtime, store, task_uid)).await?;
+    let activated = operation(store, task_uid).await?;
+    let task = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(
+        activated.state,
+        TaskOrchestrationState::Active,
+        "the run must activate before it runs: phase={:?} reason={:?} error={:?}",
+        task.phase,
+        task.failure_reason,
+        activated.last_error_code
+    );
+    Box::pin(start_envelope_minutes_attempt(store, task_uid)).await?;
+    let minutes_used = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT (observed_seconds / 60)::text FROM runtime_minute_observations \
+             WHERE envelope_instance_id = $1 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(&instance_id)
+        .fetch_optional(pool)
+        .await
+    };
+    let reconcile_runtime = || Box::pin(reconcile_fixture_runtime(&scenario, &inference));
+
+    // Under the limit: the run keeps going and its minutes are recorded while it runs.
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) \
+         VALUES ($1, 'phase', 'running', 'recorded', now() - interval '1 minute')",
+    )
+    .bind(task_uid)
+    .execute(pool)
+    .await?;
+    reconcile_runtime().await?;
+    let first = minutes_used()
+        .await?
+        .ok_or_else(|| io::Error::other("a running Task recorded no Envelope minutes"))?
+        .parse::<f64>()?;
+    assert!(
+        first >= 1.0,
+        "one running minute must be recorded, got {first}"
+    );
+    assert_eq!(
+        operation(store, task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    reconcile_runtime().await?;
+    let second = minutes_used()
+        .await?
+        .ok_or_else(|| io::Error::other("the second reconcile recorded no Envelope minutes"))?
+        .parse::<f64>()?;
+    assert!(
+        second > first,
+        "the minutes shown for a running run must grow while it runs ({first} -> {second})"
+    );
+
+    // Past the limit: the run is stopped with a plain reason and the usage is kept.
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) \
+         VALUES ($1, 'phase', 'running', 'recorded', now() - interval '4 minutes')",
+    )
+    .bind(task_uid)
+    .execute(pool)
+    .await?;
+    reconcile_runtime().await?;
+    assert_eq!(
+        operation(store, task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "the runtime controller must stop a run once the Envelope's monthly minutes are used up"
+    );
+    let stopped = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(stopped.phase, TaskPhase::Failed);
+    assert_eq!(
+        stopped.failure_reason.as_deref(),
+        Some("This run stopped because the Envelope's monthly minutes were used up.")
+    );
+    let used = minutes_used()
+        .await?
+        .ok_or_else(|| io::Error::other("the stopping reconcile recorded no Envelope minutes"))?
+        .parse::<f64>()?;
+    assert!(
+        used >= 3.0,
+        "the Envelope must show the minutes used, got {used}"
+    );
+    let run = store
+        .agent_run(task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("stopped run is absent"))?;
+    assert!(
+        run.envelope_runtime_minutes_used
+            .as_deref()
+            .ok_or_else(|| io::Error::other("run shows no Envelope minutes used"))?
+            .parse::<f64>()?
+            >= 3.0
+    );
+    Box::pin(reconcile_current(client, task_runtime, store, task_uid)).await?;
+    Ok(())
+}
+
+async fn reconcile_fixture_runtime(
+    scenario: &EnvelopeMinutesScenario<'_>,
+    inference: &ActiveInference,
+) -> Result<(), io::Error> {
+    let runtime = scenario
+        .kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("envelope-minutes runtime fixture is absent"))?;
+    Box::pin(reconcile_agent_runtime_work_item(
+        scenario.client,
+        scenario.task_runtime.clone(),
+        inference.clone(),
+        scenario.store.clone(),
+        runtime,
+    ))
+    .await
+    .map(|_| ())
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
+async fn reserve_envelope_minutes_task(
+    scenario: &EnvelopeMinutesScenario<'_>,
+) -> Result<(Uuid, String), Box<dyn Error>> {
+    let EnvelopeMinutesScenario {
+        store,
+        kubernetes,
+        service,
+        owner_user_id,
+        member_role,
+        suffix,
+        envelope,
+        spec,
+        execution_binding,
+        agent_command,
+        admission_decision,
+        workflow_digest,
+        ..
+    } = *scenario;
+    let mut minutes_envelope = envelope.clone();
+    minutes_envelope.spec.runtime_minutes_limit = Some("3".to_owned());
+    let template_id = format!("{member_role}-minutes");
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: &template_id,
+            member_roles: &[member_role.to_owned()],
+            ceiling: &minutes_envelope,
+            auto_provision_threshold: None,
+            allow_inline_browser_tasks: true,
+            authored_by: "admin@example.com",
+        })
+        .await?;
+    let request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id,
+            template_id: Some(&template_id),
+            template_revision: Some(minutes_envelope.revision),
+            requested_envelope: &minutes_envelope,
+            idempotency_key: &format!("envelope-minutes-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
+            actor: "admin@example.com",
+        })
+        .await?
+        .record;
+    let approval_id = Uuid::new_v4();
+    let instance_id = format!("env_{}", request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&minutes_envelope)?)
+    );
+    for (from, to, provisioned) in [
+        (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Approved,
+            false,
+        ),
+        (
+            EnvelopeRequestStatus::Approved,
+            EnvelopeRequestStatus::Provisioned,
+            true,
+        ),
+    ] {
+        store
+            .append_envelope_request_status(
+                request.id,
+                EnvelopeRequestStatusUpdate {
+                    from,
+                    to,
+                    approval_id: Some(approval_id),
+                    envelope_instance_id: provisioned.then_some(instance_id.as_str()),
+                    envelope_digest: provisioned.then_some(envelope_digest.as_str()),
+                    reason: None,
+                    rationale: None,
+                    evidence_url: None,
+                    expires_at: None,
+                    approved_envelope: Some(&minutes_envelope),
+                    actor: "admin@example.com",
+                },
+            )
+            .await?;
+    }
+
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let inert_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &inert_spec(spec, &minutes_envelope),
+        "inert",
+        Some(execution_binding),
+    )?;
+    let active_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        spec,
+        "active",
+        Some(execution_binding),
+    )?;
+    // The Kubernetes fixture holds one runtime and one credential Secret; release the previous
+    // scenario's deleting runtime and its Secret first.
+    kubernetes
+        .credential_secret
+        .lock()
+        .map_err(|_| io::Error::other("credential Secret fixture was poisoned"))?
+        .take();
+    let previous = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .take();
+    assert!(
+        previous.is_none_or(|runtime| runtime.metadata.deletion_timestamp.is_some()),
+        "the previous scenario's runtime must already be deleting"
+    );
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-envelope-minutes".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &format!("envelope-minutes-task-{suffix}"),
+            submitter_service: service,
+            caller_reference: None,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(owner_user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: owner_user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(workflow_digest),
+            user_envelope_instance_id: Some(&instance_id),
+            user_envelope_revision: Some(minutes_envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: spec,
+            agent_command,
+            execution_binding: Some(execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Unknown,
+            browser_task_evidence: None,
+            user_envelope_snapshot: Some(&minutes_envelope),
+            candidate_digest: &digest(serde_json::to_value(spec))?,
+            admission_decision,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            task_uid,
+            service,
+            owner_user_id.as_str(),
+            b"envelope minutes input",
+        )
+        .await?;
+    store
+        .request_task_execution(task_uid, service, owner_user_id.as_str())
+        .await?;
+    Ok((task_uid, instance_id))
+}
+
+async fn start_envelope_minutes_attempt(
+    store: &PgStore,
+    task_uid: Uuid,
+) -> Result<(), Box<dyn Error>> {
+    let attempt = match store
+        .claim_task_execution_attempt(
+            task_uid,
+            &format!("sha256:{}", "f".repeat(64)),
+            &format!("sha256:{}", "0".repeat(64)),
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "envelope-minutes attempt was not created: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let attempt = match store
+        .authorize_task_execution_start(attempt.attempt_id, attempt.generation, "test-controller")
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "envelope-minutes start was not authorized: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    match store
+        .record_task_execution_observation(
+            attempt.attempt_id,
+            attempt.generation,
+            TaskExecutionObservation::Running {
+                adapter_observation_id: "envelope-minutes-running-attempt",
+                execution_stdout: Some(b"partial output"),
+                execution_stderr: Some(b""),
+            },
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(_) => {}
+        transition => {
+            return Err(io::Error::other(format!(
+                "envelope-minutes execution was not recorded as running: {transition:?}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 async fn insert_task_projection_fixture(

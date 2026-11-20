@@ -18,9 +18,10 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_ports::{
-    INFERENCE_REQUEST_REJECTED_FAILURE, REQUIRED_OUTPUT_MISSING_FAILURE,
-    SANDBOX_EGRESS_UNAVAILABLE_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
-    TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE, WORKSPACE_PREPARATION_FAILURE,
+    ENVELOPE_RUNTIME_MINUTES_EXHAUSTED_FAILURE, INFERENCE_REQUEST_REJECTED_FAILURE,
+    REQUIRED_OUTPUT_MISSING_FAILURE, SANDBOX_EGRESS_UNAVAILABLE_FAILURE,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE,
+    WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
@@ -2925,7 +2926,8 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     }
     if matches!(
         reason,
-        REQUIRED_OUTPUT_MISSING_FAILURE
+        ENVELOPE_RUNTIME_MINUTES_EXHAUSTED_FAILURE
+            | REQUIRED_OUTPUT_MISSING_FAILURE
             | SANDBOX_EGRESS_UNAVAILABLE_FAILURE
             | SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
             | TASK_AGENT_START_FAILURE
@@ -3193,6 +3195,12 @@ mod tests {
         assert_eq!(
             public_run_failure_reason(Some(steward_ports::TASK_TOOL_FAILURE)),
             Some("This run stopped because an approved tool could not complete the request.")
+        );
+        assert_eq!(
+            public_run_failure_reason(Some(
+                steward_ports::ENVELOPE_RUNTIME_MINUTES_EXHAUSTED_FAILURE
+            )),
+            Some("This run stopped because the Envelope's monthly minutes were used up.")
         );
         assert_eq!(
             bounded_task_error_category(Some(steward_ports::TASK_TOOL_FAILURE)),

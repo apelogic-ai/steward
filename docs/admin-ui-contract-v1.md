@@ -144,11 +144,14 @@ history.
 An Envelope revision may also constrain cumulative runtime minutes for each
 provisioned instance. This authority is stored in the immutable Envelope snapshot,
 not added to the AgentRuntime CRD. Steward derives current-period usage from
-append-only Task running-to-terminal lifecycle intervals, records observations and
-exhaustions append-only, and suspends execution when the effective limit is
-exhausted. Administrator top-ups are instance-scoped append-only grants; a
-successful grant must raise the effective limit above the recorded usage before
-the controller can resume the parked Task. Denial cancels the parked Task.
+append-only Task running-to-terminal lifecycle intervals, and records observations and
+exhaustions append-only. The controller measures a running Task's minutes on every
+reconcile, at least every inference observation interval (15 seconds by default),
+before any other runtime step. When the effective limit is used up, the running Task
+fails with "This run stopped because the Envelope's monthly minutes were used up."
+Administrator top-ups are instance-scoped append-only grants that raise the
+effective limit for later runs. Before the release after 0.3.35, exhaustion
+suspended the runtime and parked the Task until a top-up or denial.
 
 Capability metadata supplies tool access class and provider catalog
 availability. The browser must not infer either from display text. Unsupported
