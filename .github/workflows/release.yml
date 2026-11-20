@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.35"
+          test "$version" = "0.3.36"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           claude_code_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-claude-code-runtime"
@@ -963,7 +963,8 @@ jobs:
                 "0074_personal_agents.sql",
                 "0075_personal_agent_claim_attempts.sql",
                 "0076_agent_run_token_usage.sql",
-                "0077_envelope_request_egress_exceedances.sql"
+                "0077_envelope_request_egress_exceedances.sql",
+                "0078_task_cancel_requested_by.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -971,14 +972,14 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.35 builds the MCP-GW 0.8.2 sandbox helper in the Codex reference runtime image from source instead of downloading the prebuilt binary from the mcp-gw GitHub releases (#684), so the image contains no prebuilt helper binary. The helper source is vendored and pinned in third_party/mcp-gw-sandbox-helper/cff55e2b and compiled with bun build --compile in a pinned oven/bun:1.2.21 build stage. Helper behaviour is unchanged, and the compiled helper embeds the same Bun 1.2.21 runtime version. Building the image no longer needs access to github.com/apelogic-ai/mcp-gw/releases; it pulls docker.io/oven/bun:1.2.21 by digest instead. The release adds no API or other product change.\n\n'
+            printf 'Steward v0.3.36 lets tenant administrators cancel any unfinished run from administrator run detail (POST /admin/api/v1/all-runs/{task_uid}/cancel), with the same confirmation step members see, and records who asked to cancel a run in an optional cancellation object on browser and administrator run views (#687). Codex runs now get the selected model\x27s context window from the model gateway: before starting Codex, the launch step reads max_input_tokens for the model from <inference endpoint>/model/info with the run\x27s own gateway credential and writes it as model_context_window, so Codex compacts before a smaller model\x27s limit is reached (#689). Envelope monthly runtime minutes now count while a run executes, and a running run whose Envelope has used them up fails instead of being suspended until a top-up (#688). Migration 0078 adds the nullable task_submissions.cancel_requested_by column.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Back up the database. v0.3.35 adds no migration, CRD change, or chart value. Run the v0.3.35 platform preflight first. An installation upgrading from v0.3.33 or earlier must also follow the v0.3.34 upgrade prerequisites and required actions, including the review of web access hosts removed from capabilityCatalog.egressHosts and the removal of egressHosts from GET /app/api/v1/capabilities. An installation upgrading from v0.3.31 or earlier must still apply the AgentRuntime CRD updated in v0.3.32 (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, because Helm never updates CRDs.\n\n'
+            printf 'Back up the database. Steward applies migration 0078 automatically; it adds one nullable column with a check and an immutability trigger and changes no existing rows. v0.3.36 adds no CRD change or chart value. Run the v0.3.36 platform preflight first. An installation upgrading from v0.3.34 must also follow the v0.3.35 required actions: an installation that builds the Codex reference runtime image itself must allow docker.io/oven/bun:1.2.21 by digest, and its build context must include third_party/mcp-gw-sandbox-helper/. An installation upgrading from v0.3.33 or earlier must also follow the v0.3.34 upgrade prerequisites and required actions, including the review of web access hosts removed from capabilityCatalog.egressHosts and the removal of egressHosts from GET /app/api/v1/capabilities. An installation upgrading from v0.3.31 or earlier must still apply the AgentRuntime CRD updated in v0.3.32 (charts/steward/crds/agentruntimes.yaml, or crds/ in the published chart) before upgrading the chart, because Helm never updates CRDs.\n\n'
             printf 'Deploy the chart, component images, and reference runtimes as one release unit. The provider-profile bundle remains 1.3.0 and the gateway requirement for remote shell remains MCP-GW v0.8.0 or later.\n\n'
-            printf 'Rolling back to v0.3.34 needs no database restore. Redeploy the v0.3.34 chart, component images, and reference runtimes, and restore the v0.3.34 runtime digests in execution bindings. An installation that rebuilds the v0.3.34 Codex image needs github.com/apelogic-ai/mcp-gw/releases again. Rolling back further follows the v0.3.34 release notes.\n\n'
+            printf 'Steward v0.3.35 does not start against a database with migration 0078 applied, because the apiserver and controller refuse applied migrations they do not know. Records written after the upgrade are not in the pre-upgrade backup, so preserve any audit or decision records you must keep before restoring. To roll back, restore the pre-upgrade database backup to a new database target and point v0.3.35 at it, then redeploy the v0.3.35 chart, component images, and reference runtimes and restore the v0.3.35 runtime digests in execution bindings. Rolling back further follows the earlier release notes.\n\n'
             printf '## Required action\n\n'
-            printf 'After deployment, update mirrored v0.3.34 reference runtimes and execution bindings to the v0.3.35 artifacts; the Codex runtime keeps codex@0.140.0 and its version probe. An installation that builds the Codex reference runtime image itself must allow docker.io/oven/bun:1.2.21 by digest, and its build context must include third_party/mcp-gw-sandbox-helper/; it no longer needs github.com/apelogic-ai/mcp-gw/releases. The Codex image provenance now lists the Bun image as a build input.\n\n'
+            printf 'After deployment, update mirrored v0.3.35 reference runtimes and execution bindings to the v0.3.36 artifacts; the Codex runtime keeps codex@0.140.0 and its version probe. A custom Codex runtime image needs curl and jq for the context-window lookup; without them Codex starts with its own defaults and the run\x27s error output says so. To give Codex a model\x27s window, set max_input_tokens for that model in the model gateway. A run stopped because its Envelope used up its monthly minutes is not resumed by a top-up; start it again after topping up.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, exact command-route and signed-target refusals, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -1058,7 +1059,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.35.json
+          subject-path: dist/steward-product-compatibility-0.3.36.json
 
       - name: Archive product compatibility verification material
         env:
@@ -1068,7 +1069,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.35.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.36.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

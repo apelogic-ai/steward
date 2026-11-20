@@ -2,7 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.3.35.
+Applies to Steward 0.3.36.
 
 ## Presentation ownership
 
@@ -150,7 +150,7 @@ reconcile, at least every inference observation interval (15 seconds by default)
 before any other runtime step. When the effective limit is used up, the running Task
 fails with "This run stopped because the Envelope's monthly minutes were used up."
 Administrator top-ups are instance-scoped append-only grants that raise the
-effective limit for later runs. Before the release after 0.3.35, exhaustion
+effective limit for later runs. Before Steward 0.3.36, exhaustion
 suspended the runtime and parked the Task until a top-up or denial.
 
 Capability metadata supplies tool access class and provider catalog
@@ -272,8 +272,8 @@ category.
 The separate log endpoint supports bounded byte-offset reads while a Task is
 running and marks whether the stream is complete. Members cancel only their own
 runs; administrators cancel any unfinished run from administrator run detail
-through `POST /admin/api/v1/all-runs/{taskUid}/cancel` (unreleased; the release
-after 0.3.35). Both return `409` after a run is terminal and use the same
+through `POST /admin/api/v1/all-runs/{taskUid}/cancel` (Steward 0.3.36 and
+later). Both return `409` after a run is terminal and use the same
 confirmation step. Administrator run detail does not render re-run.
 Re-run creates a fresh Task for a versioned Steward workflow. For a direct
 GitHub Task, Steward invokes only the governed MCP-GW

@@ -1,6 +1,6 @@
 # Execution bindings
 
-Status: current Steward 0.3.35 installation contract, including the `remoteShellTargets`
+Status: current Steward 0.3.36 installation contract, including the `remoteShellTargets`
 extension described below
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
@@ -79,7 +79,7 @@ arguments, and implement the Codex-compatible configuration, `exec`, model, MCP,
 termination behavior used by the adapter. Obtain or build the image through the operator's normal
 source, scanning, signing, and promotion process, then configure its immutable manifest digest.
 
-Beginning with the release after Steward 0.3.35, the `codex-v1` launch step also uses `curl` and
+Beginning with Steward 0.3.36, the `codex-v1` launch step also uses `curl` and
 `jq`, when the image provides them, to read the selected model's context window from the model
 gateway before starting Codex; see `config.apiserver.inferenceEndpoint` below. They are optional:
 without them, Codex starts with its own default context window and the run's error output carries
@@ -211,7 +211,7 @@ or execution binding. Non-Helm installations set the corresponding
 binding. When it is absent, Codex remains available but an active Claude Code binding fails startup
 as unavailable.
 
-Beginning with the release after Steward 0.3.35, the `codex-v1` launch step sends one `GET` request
+Beginning with Steward 0.3.36, the `codex-v1` launch step sends one `GET` request
 to `<inferenceEndpoint>/model/info` (a trailing `/responses` is removed first) with the run's own
 gateway credential, before Codex starts. It reads `model_info.max_input_tokens` for the selected
 model, as LiteLLM's model info route reports it, and writes the smallest positive whole value across

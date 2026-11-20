@@ -10,18 +10,18 @@ installer="$root/target/debug/steward-provider-profile"
 installer_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 installer_architecture="$(uname -m)"
 "$root/scripts/package-provider-profile-bundle.sh" \
-  --version 0.3.35 \
+  --version 0.3.36 \
   --installer "$installer" \
   --installer-os "$installer_os" \
   --installer-architecture "$installer_architecture" \
   --output "$temporary/provider-release" >/dev/null
-tar -xzf "$temporary/provider-release/steward-runtime-providers-0.3.35.tar.gz" -C "$temporary"
+tar -xzf "$temporary/provider-release/steward-runtime-providers-0.3.36.tar.gz" -C "$temporary"
 provider_bundle="$temporary/provider-profile-bundle/v1.3.0"
 for name in first second; do
-  "$root/scripts/package-platform-preflight.sh" 0.3.35 "$temporary/$name"
+  "$root/scripts/package-platform-preflight.sh" 0.3.36 "$temporary/$name"
 done
-first="$temporary/first/steward-platform-preflight-0.3.35.tar.gz"
-second="$temporary/second/steward-platform-preflight-0.3.35.tar.gz"
+first="$temporary/first/steward-platform-preflight-0.3.36.tar.gz"
+second="$temporary/second/steward-platform-preflight-0.3.36.tar.gz"
 cmp "$first" "$second"
 cmp "$temporary/first/platform-preflight-bundle.digest" "$temporary/second/platform-preflight-bundle.digest"
 tar -xzf "$first" -C "$temporary"

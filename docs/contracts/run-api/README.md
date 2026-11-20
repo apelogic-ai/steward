@@ -1,6 +1,6 @@
 # Steward Run API contract
 
-Status: **Generated current Steward v0.3.35 contract**
+Status: **Generated current Steward v0.3.36 contract**
 
 The machine-readable contract is [`openapi.json`](openapi.json). The Steward
 server generates that document from `steward_apiserver::ApiDoc`; the Run API is
