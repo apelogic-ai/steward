@@ -1,7 +1,12 @@
 FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
 WORKDIR /workspace
 COPY . .
-RUN cargo build --locked --release \
+# The apiserver reports these from /admin/api/v1/about. RELEASE_COMMIT is the
+# git commit the image was built from; a build that does not pass it shows dev.
+ARG RELEASE_COMMIT=dev
+RUN STEWARD_RELEASE_COMMIT="${RELEASE_COMMIT}" \
+    STEWARD_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    cargo build --locked --release \
     --bin steward-apiserver-bin \
     --bin steward-controller-bin \
     --bin steward-mint-bin \

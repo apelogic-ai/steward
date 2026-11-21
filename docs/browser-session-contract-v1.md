@@ -76,6 +76,10 @@ exactly `/admin/auth/callback`.
 - `GET /admin/api/v1/session` returns `steward.browser-session/v1`: bounded canonical principal,
   `user` or `admin` role, the caller's locally assigned member roles, allowed surfaces, and the
   current per-session CSRF proof.
+- `GET /admin/api/v1/about` (next release; not in 0.3.36) returns the running apiserver's
+  `version`, `releaseCommit` (the git commit the release image was built from, or `dev` for a
+  build that did not record one), and `buildTime` (RFC 3339 UTC, or null). Any valid session may
+  read it; the account menu shows it.
 - `POST /admin/auth/logout` revokes the server-side session and expires its cookie.
 
 The cookie contains only an unguessable opaque server-side lookup value. Identity, role, provider

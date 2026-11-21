@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney } from "./presentation-values";
+import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney, formatUtcTimestamp } from "./presentation-values";
 
 describe("shared presentation values", () => {
   test("formats money with two decimals and its supplied currency", () => {
@@ -46,5 +46,17 @@ describe("shared presentation values", () => {
     expect(duration).toContain("aria-describedby");
     expect(duration).toContain("focus-within:");
     expect(duration).not.toContain('value="15m"');
+  });
+});
+
+describe("shared UTC timestamps", () => {
+  test("formats an RFC 3339 instant as a UTC date and time", () => {
+    expect(formatUtcTimestamp("2026-11-21T10:05:09Z")).toBe("2026-11-21 10:05:09 UTC");
+    expect(formatUtcTimestamp("2026-11-21T10:05:09.250+02:00")).toBe("2026-11-21 08:05:09 UTC");
+    expect(formatUtcTimestamp("2026-01-02T03:04:05Z")).toBe("2026-01-02 03:04:05 UTC");
+  });
+
+  test("leaves a value it cannot read unchanged", () => {
+    expect(formatUtcTimestamp("not a date")).toBe("not a date");
   });
 });

@@ -856,6 +856,7 @@ pub fn browser_auth_router(service: BrowserAuthService) -> Router {
         .route("/admin/auth/callback", get(callback))
         .route("/admin/auth/logout", post(logout))
         .route("/admin/api/v1/session", get(session))
+        .route("/admin/api/v1/about", get(about))
         .route("/admin/auth/fake/authorize", get(local_fake_authorize))
         .route_layer(middleware::from_fn(
             crate::browser_security::add_browser_security_headers,
@@ -1100,6 +1101,58 @@ pub(crate) async fn session(
         member_roles: &session.principal.member_roles,
         surfaces,
         csrf: &session.csrf,
+    })
+    .into_response()
+}
+
+/// Build facts compiled into this apiserver. The release image build sets
+/// `STEWARD_RELEASE_COMMIT` and `STEWARD_BUILD_TIME` (see
+/// `build/package.Dockerfile`); a build without them reports `dev` and no time.
+fn release_commit() -> &'static str {
+    match option_env!("STEWARD_RELEASE_COMMIT") {
+        Some(commit) if !commit.is_empty() => commit,
+        _ => "dev",
+    }
+}
+
+fn build_time() -> Option<&'static str> {
+    option_env!("STEWARD_BUILD_TIME").filter(|time| !time.is_empty())
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AboutResponse {
+    /// Version of the running apiserver.
+    version: &'static str,
+    /// Git commit the release was built from, or `dev` for a build that did not record one.
+    release_commit: &'static str,
+    /// When the binary was built, as an RFC 3339 UTC timestamp; null when the build did not record it.
+    #[schema(required, value_type = Option<String>)]
+    build_time: Option<&'static str>,
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getAbout",
+    path = "/admin/api/v1/about",
+    security(("browserSession" = [])),
+    responses(
+        (status = 200, description = "Version, release commit, and build time of the running apiserver", body = AboutResponse),
+        (status = 401, description = "Opaque browser session is missing, invalid, or expired"),
+        (status = 503, description = "Browser session registry is unavailable")
+    )
+)]
+pub(crate) async fn about(
+    State(service): State<BrowserAuthService>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = resolve_session(&service, &headers) {
+        return error.into_response();
+    }
+    Json(AboutResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        release_commit: release_commit(),
+        build_time: build_time(),
     })
     .into_response()
 }
@@ -2611,6 +2664,79 @@ mod tests {
             .map_err(|error| format!("issue post-restart session: {error:?}"))?;
         assert_ne!(replacement.token, session.token);
         assert_ne!(replacement.csrf, session.csrf);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn about_reports_the_running_build_to_any_signed_in_person() -> Result<(), String> {
+        let (service, flow_cookie, callback_uri) =
+            start_local_flow(LocalFakeIdentity::User).await?;
+        let callback = complete_local_flow(service.clone(), &flow_cookie, &callback_uri).await?;
+        let session_cookie = cookie_pair(&callback, "steward-local-session")?;
+
+        let anonymous = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/about")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build anonymous about request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute anonymous about request: {error}"))?;
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "build information is only shown to a signed-in person"
+        );
+
+        let about = browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/about")
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build about request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute about request: {error}"))?;
+        assert_eq!(about.status(), StatusCode::OK);
+        assert_eq!(
+            about.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store"))
+        );
+        let body = to_bytes(about.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read about body: {error}"))?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| format!("parse about body: {error}"))?;
+        assert_eq!(
+            json["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "version is the crate version of the running apiserver"
+        );
+        let release_commit = json["releaseCommit"]
+            .as_str()
+            .ok_or_else(|| "releaseCommit must be a string".to_owned())?;
+        assert!(
+            !release_commit.is_empty(),
+            "releaseCommit is the release's git commit, or dev for an unlabelled build"
+        );
+        assert!(
+            json["buildTime"].is_null() || json["buildTime"].is_string(),
+            "buildTime is an RFC 3339 UTC timestamp or null when the build did not record one"
+        );
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .ok_or_else(|| "about body must be an object".to_owned())?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["buildTime", "releaseCommit", "version"],
+            "the about response carries exactly these fields; adding one is a contract change"
+        );
         Ok(())
     }
 

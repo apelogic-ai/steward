@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { AccessPendingPanel, breadcrumbsForPath, hasDualRole, isAccessPending, isActive, signOut, workspaceLandingPath, type SignOutFetch } from "./app-shell";
+import { copyrightNotice } from "@/brand";
+import { AccessPendingPanel, BuildInfoBlock, breadcrumbsForPath, hasDualRole, isAccessPending, isActive, signOut, workspaceLandingPath, type SignOutFetch } from "./app-shell";
 
 const source = readFileSync(new URL("./app-shell.tsx", import.meta.url), "utf8");
 
@@ -151,5 +152,45 @@ describe("signing out", () => {
     const throwing: SignOutFetch = () => Promise.reject(new Error("offline"));
     expect(await signOut("test-csrf", { fetchImpl: throwing, navigate: (path) => navigated.push(path) })).toBe(false);
     expect(navigated).toEqual([]);
+  });
+});
+
+describe("account menu build information", () => {
+  const about = {
+    buildTime: "2026-11-21T10:05:09Z",
+    releaseCommit: "0123456789abcdef0123456789abcdef01234567",
+    version: "1.2.3",
+  };
+
+  test("shows the product, copyright holder, version with release commit, and UTC build date", () => {
+    const html = renderToStaticMarkup(<BuildInfoBlock about={about} />);
+    expect(html).toContain("HyperShell Steward");
+    expect(html).toContain("Copyright (c) 2026 ApeLogic Inc.");
+    expect(html).toContain("Version: 1.2.3 (0123456789abcdef0123456789abcdef01234567)");
+    expect(html).toContain("Build date 2026-11-21 10:05:09 UTC");
+  });
+
+  test("says when the build recorded no date", () => {
+    const html = renderToStaticMarkup(<BuildInfoBlock about={{ ...about, buildTime: null }} />);
+    expect(html).toContain("Version: 1.2.3 (0123456789abcdef0123456789abcdef01234567)");
+    expect(html).toContain("Build date unavailable");
+  });
+
+  test("says when build information could not be loaded", () => {
+    const html = renderToStaticMarkup(<BuildInfoBlock about={null} />);
+    expect(html).toContain("HyperShell Steward");
+    expect(html).toContain("Build information is unavailable.");
+    expect(html).not.toContain("Version:");
+  });
+
+  test("takes the product name and copyright notice from the shared brand module", () => {
+    expect(source).toContain('from "@/brand"');
+    expect(source).not.toMatch(/Copyright \(c\)/);
+  });
+
+  test("keeps the copyright notice identical to the repository license", () => {
+    const license = readFileSync(new URL("../../../LICENSE", import.meta.url), "utf8");
+    const noticeLine = license.split("\n").find((line) => line.startsWith("Copyright (c)"));
+    expect(noticeLine).toBe(copyrightNotice);
   });
 });

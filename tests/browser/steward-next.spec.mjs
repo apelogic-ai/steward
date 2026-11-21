@@ -74,6 +74,12 @@ const builtInStarterTaskFixture = {
 let web;
 let origin;
 
+const aboutResponse = {
+  buildTime: "2026-11-21T10:05:09Z",
+  releaseCommit: "0123456789abcdef0123456789abcdef01234567",
+  version: "1.2.3",
+};
+
 const developerSession = {
   apiVersion: "steward.browser-session/v1",
   principal: {
@@ -1063,6 +1069,17 @@ async function guardedPage(browser, {
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(session),
+    });
+  });
+  await context.route(`${origin}/admin/api/v1/about`, async (route) => {
+    if (session === null) {
+      await route.fulfill({ status: 401, body: "" });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(aboutResponse),
     });
   });
   await context.route(`${origin}/admin/api/v1/setup-status`, async (route) => {
@@ -2497,6 +2514,12 @@ test("the account menu identifies the user and exposes only server-authorized wo
     await account.getByRole("button", { name: "dark", exact: true }).click();
     await expect(developer.page.locator("html")).toHaveAttribute("data-theme", "dark");
     await expect(account.getByRole("button", { name: "light", exact: true })).toBeVisible();
+
+    const about = account.getByRole("note", { name: "About this installation" });
+    await expect(about.getByText("HyperShell Steward", { exact: true })).toBeVisible();
+    await expect(about.getByText("Copyright (c) 2026 ApeLogic Inc.", { exact: true })).toBeVisible();
+    await expect(about.getByText("Version: 1.2.3 (0123456789abcdef0123456789abcdef01234567)", { exact: true })).toBeVisible();
+    await expect(about.getByText("Build date 2026-11-21 10:05:09 UTC", { exact: true })).toBeVisible();
 
     const logoutButton = account.getByRole("button", { name: "Log out" });
     await expect(logoutButton).toHaveCSS("color", "rgb(255, 139, 125)");
