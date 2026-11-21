@@ -169,8 +169,41 @@ function StatePanel({ children, title }: Readonly<{ children: ReactNode; title: 
   );
 }
 
-function AccessPendingPanel({ email, userId }: Readonly<{ email: string; userId: string }>) {
+export type SignOutFetch = (input: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Ends the browser session and returns to the sign-in page. Resolves to
+ * `false` when the session could not be ended, so the caller can say so.
+ * A session the server no longer knows (401) counts as signed out.
+ */
+export async function signOut(csrf: string, options: Readonly<{
+  fetchImpl?: SignOutFetch;
+  navigate?: (path: string) => void;
+}> = {}): Promise<boolean> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const navigate = options.navigate ?? ((path: string) => window.location.replace(path));
+  try {
+    const response = await fetchImpl("/admin/auth/logout", {
+      body: "{}",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Steward-CSRF": csrf },
+      method: "POST",
+    });
+    if (response.status === 204 || response.status === 401) {
+      navigate("/admin/sign-in");
+      return true;
+    }
+  } catch {
+    // Fixed copy at the call sites deliberately avoids surfacing transport details.
+  }
+  return false;
+}
+
+export function AccessPendingPanel({ csrf, email, userId }: Readonly<{ csrf: string; email: string; userId: string }>) {
   const [copied, setCopied] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutFailed, setSignOutFailed] = useState(false);
   const copyUserId = async () => {
     try {
       await navigator.clipboard.writeText(userId);
@@ -179,6 +212,13 @@ function AccessPendingPanel({ email, userId }: Readonly<{ email: string; userId:
       setCopied(false);
     }
   };
+  const endSession = async () => {
+    setSigningOut(true);
+    setSignOutFailed(false);
+    if (await signOut(csrf)) return;
+    setSigningOut(false);
+    setSignOutFailed(true);
+  };
   return (
     <StatePanel title="Access pending">
       <p><strong>{email}</strong> is signed in, but an administrator has not assigned a member role yet.</p>
@@ -186,6 +226,11 @@ function AccessPendingPanel({ email, userId }: Readonly<{ email: string; userId:
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <code className="rounded-control border bg-canvas px-2.5 py-1.5 text-xs text-ink">{userId}</code>
         <button className="rounded-control border px-3 py-1.5 text-xs font-semibold text-ink hover:bg-canvas" onClick={() => void copyUserId()} type="button">{copied ? "Copied" : "Copy user ID"}</button>
+      </div>
+      <p className="mt-5">Once your role is assigned, sign out and sign in again to continue.</p>
+      <div className="mt-2 flex flex-wrap items-center gap-3">
+        <button className="rounded-control border px-3 py-1.5 text-xs font-semibold text-ink hover:bg-canvas disabled:cursor-wait disabled:opacity-60" disabled={signingOut} onClick={() => void endSession()} type="button">{signingOut ? "Signing out…" : "Sign out"}</button>
+        {signOutFailed ? <span className="text-xs text-err" role="status">Could not sign out. Try again.</span> : null}
       </div>
     </StatePanel>
   );
@@ -265,21 +310,7 @@ function ProfileMenu({ adminMode, session }: Readonly<{
   const logout = async () => {
     setLoggingOut(true);
     setLogoutFailed(false);
-    try {
-      const response = await fetch("/admin/auth/logout", {
-        body: "{}",
-        cache: "no-store",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json", "X-Steward-CSRF": session.value.csrf },
-        method: "POST",
-      });
-      if (response.status === 204 || response.status === 401) {
-        window.location.replace("/admin/sign-in");
-        return;
-      }
-    } catch {
-      // Fixed copy below deliberately avoids surfacing transport details.
-    }
+    if (await signOut(session.value.csrf)) return;
     setLoggingOut(false);
     setLogoutFailed(true);
   };
@@ -518,7 +549,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
             {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>HyperShell couldn&apos;t check your session. Try again shortly.</p></StatePanel> : null}
             {session.status === "error" ? <StatePanel title="Session error"><p>HyperShell couldn&apos;t verify your session. Sign in again or try later.</p></StatePanel> : null}
             {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? <StatePanel title="Administrator access required"><p>You don&apos;t have permission to open this page.</p></StatePanel> : null}
-            {session.status === "authenticated" && accessPending ? <AccessPendingPanel email={session.value.principal.displayEmail} userId={session.value.principal.userId} /> : null}
+            {session.status === "authenticated" && accessPending ? <AccessPendingPanel csrf={session.value.csrf} email={session.value.principal.displayEmail} userId={session.value.principal.userId} /> : null}
             {session.status === "authenticated" && workspaceAuthorized ? (
               <>
                 <Breadcrumbs items={breadcrumbsForPath(pathname)} />
