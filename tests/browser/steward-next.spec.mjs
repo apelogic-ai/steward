@@ -2454,6 +2454,13 @@ test("an unroled signed-in person sees access pending instead of a workspace", a
     await expect(unroled.page.getByText(developerSession.principal.displayEmail, { exact: true })).toBeVisible();
     await expect(unroled.page.getByRole("button", { name: "Copy user ID" })).toBeVisible();
     await expect(unroled.page.getByRole("navigation", { name: "Primary navigation" })).toHaveCount(0);
+
+    await unroled.page.getByRole("button", { name: "Sign out" }).click();
+    await expect(unroled.page).toHaveURL(`${origin}/admin/sign-in`);
+    await expect(unroled.page.getByRole("heading", { name: "Signed out" })).toBeVisible();
+    const logout = unroled.mutations.find((mutation) => mutation.path === "/admin/auth/logout");
+    expectMutationProof(logout);
+    expect(logout.body).toEqual({});
   } finally {
     await closeGuardedPage(unroled);
   }

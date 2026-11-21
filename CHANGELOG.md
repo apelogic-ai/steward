@@ -25,6 +25,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `RELEASE_COMMIT` yet, so released images show `dev` until it does (#699).
   No migration, CRD or chart change.
 
+### Fixed
+
+- The **Access pending** screen, shown to a signed-in person who has no role
+  yet, now has a **Sign out** button (#697). A session keeps the role it had
+  at sign-in, so a person who is granted a role (for example the first
+  administrator, after `bootstrap-rbac`) must sign out and in again to use it.
+  Before, the only sign-out control was in the workspace menu, which that
+  person cannot reach, so they had to clear cookies or use a private window
+  to sign in again. The button ends the session through
+  the existing `POST /admin/auth/logout` route and returns to `/admin/sign-in`;
+  if the session cannot be ended it says so and stays on the page. No API,
+  migration, CRD or chart change.
+
 ## [0.3.36] - 2026-11-20
 
 Steward v0.3.36 lets tenant administrators cancel any unfinished run and records who asked to

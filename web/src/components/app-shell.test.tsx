@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { copyrightNotice } from "@/brand";
-import { BuildInfoBlock, breadcrumbsForPath, hasDualRole, isAccessPending, isActive, workspaceLandingPath } from "./app-shell";
+import { AccessPendingPanel, BuildInfoBlock, breadcrumbsForPath, hasDualRole, isAccessPending, isActive, signOut, workspaceLandingPath, type SignOutFetch } from "./app-shell";
 
 const source = readFileSync(new URL("./app-shell.tsx", import.meta.url), "utf8");
 
@@ -106,6 +106,52 @@ describe("breadcrumbs", () => {
       { href: "/agents", label: "My agents" },
       { label: "agent-3c9e1b…", mono: true },
     ]);
+  });
+});
+
+describe("access pending panel", () => {
+  test("lets a signed-in person without a role sign out", () => {
+    const html = renderToStaticMarkup(
+      <AccessPendingPanel csrf="test-csrf" email="alice@example.com" userId="usr_abcdef0123456789abcdef0123456789" />,
+    );
+    expect(html).toContain("Access pending");
+    expect(html).toContain("Copy user ID");
+    expect(html).toContain(">Sign out<");
+  });
+});
+
+describe("signing out", () => {
+  type Call = { input: string; init: RequestInit | undefined };
+  const fetchReturning = (status: number, calls: Call[]): SignOutFetch => (input, init) => {
+    calls.push({ input, init });
+    return Promise.resolve(new Response(null, { status }));
+  };
+
+  test("ends the session with CSRF proof and returns to sign-in", async () => {
+    const calls: Call[] = [];
+    const navigated: string[] = [];
+    const signedOut = await signOut("test-csrf", { fetchImpl: fetchReturning(204, calls), navigate: (path) => navigated.push(path) });
+    expect(signedOut).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toBe("/admin/auth/logout");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(calls[0].init?.credentials).toBe("same-origin");
+    expect(new Headers(calls[0].init?.headers).get("X-Steward-CSRF")).toBe("test-csrf");
+    expect(navigated).toEqual(["/admin/sign-in"]);
+  });
+
+  test("treats an already-ended session as signed out", async () => {
+    const navigated: string[] = [];
+    expect(await signOut("test-csrf", { fetchImpl: fetchReturning(401, []), navigate: (path) => navigated.push(path) })).toBe(true);
+    expect(navigated).toEqual(["/admin/sign-in"]);
+  });
+
+  test("reports a failure and stays on the page", async () => {
+    const navigated: string[] = [];
+    expect(await signOut("test-csrf", { fetchImpl: fetchReturning(503, []), navigate: (path) => navigated.push(path) })).toBe(false);
+    const throwing: SignOutFetch = () => Promise.reject(new Error("offline"));
+    expect(await signOut("test-csrf", { fetchImpl: throwing, navigate: (path) => navigated.push(path) })).toBe(false);
+    expect(navigated).toEqual([]);
   });
 });
 
