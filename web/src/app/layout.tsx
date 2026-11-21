@@ -3,6 +3,7 @@ import { Inconsolata, Space_Grotesk } from "next/font/google";
 import { cookies, headers } from "next/headers";
 import type { ReactNode } from "react";
 
+import { brandName } from "@/brand";
 import { AppShell } from "@/components/app-shell";
 import { GithubRepositoriesProvider } from "@/data/github-repositories";
 import { SessionProvider } from "@/session/session-context";
@@ -21,8 +22,8 @@ const inconsolata = Inconsolata({
 
 export const metadata: Metadata = {
   title: {
-    default: "HyperShell",
-    template: "%s · HyperShell",
+    default: brandName,
+    template: `%s · ${brandName}`,
   },
   description: "Governed agent runs and access envelopes.",
   icons: { icon: "/brand/logo" },

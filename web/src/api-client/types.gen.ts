@@ -4,6 +4,21 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});
 };
 
+export type AboutResponse = {
+    /**
+     * When the binary was built, as an RFC 3339 UTC timestamp; null when the build did not record it.
+     */
+    buildTime: string | null;
+    /**
+     * Git commit the release was built from, or `dev` for a build that did not record one.
+     */
+    releaseCommit: string;
+    /**
+     * Version of the running apiserver.
+     */
+    version: string;
+};
+
 export type AdminRequestDecision = {
     decisionKey?: string | null;
     evidenceUrl?: string | null;
@@ -2180,6 +2195,33 @@ export type WorkspaceSubmoduleMode = 'none' | 'admitted';
 export type WorkspaceSubmoduleStatus = 'materialized' | 'skipped';
 
 export type WorkspaceTriggerRefSchema = 'trigger';
+
+export type GetAboutData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/about';
+};
+
+export type GetAboutErrors = {
+    /**
+     * Opaque browser session is missing, invalid, or expired
+     */
+    401: unknown;
+    /**
+     * Browser session registry is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAboutResponses = {
+    /**
+     * Version, release commit, and build time of the running apiserver
+     */
+    200: AboutResponse;
+};
+
+export type GetAboutResponse = GetAboutResponses[keyof GetAboutResponses];
 
 export type AllRunsData = {
     body?: never;

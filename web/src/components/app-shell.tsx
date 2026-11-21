@@ -5,12 +5,16 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
 import {
+  getAbout,
   getAdminRequestsSummary,
   getBrowserPreferences,
   updateBrowserPreferences,
+  type AboutResponse,
   type BrowserTheme,
 } from "@/api-client";
+import { brandName, copyrightNotice, productName } from "@/brand";
 import { Breadcrumbs, type BreadcrumbItem } from "@/components/hs/breadcrumbs";
+import { formatUtcTimestamp } from "@/components/presentation-values";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { authStartPath } from "@/session/auth-redirect";
 import { loadOnboardingProgress, ONBOARDING_PROGRESS_EVENT } from "@/data/onboarding-progress";
@@ -213,6 +217,22 @@ function WorkspaceSwitch({ adminMode }: Readonly<{ adminMode: boolean }>) {
   );
 }
 
+/** The product, copyright holder and build of the running installation, for the account menu. */
+export function BuildInfoBlock({ about }: Readonly<{ about: AboutResponse | null }>) {
+  return (
+    <div aria-label="About this installation" className="space-y-0.5 px-2 text-xs leading-5 text-muted-ink" role="note">
+      <p className="font-semibold text-ink">{productName}</p>
+      <p>{copyrightNotice}</p>
+      {about ? (
+        <>
+          <p className="break-all">Version: {about.version} ({about.releaseCommit})</p>
+          <p>{about.buildTime ? `Build date ${formatUtcTimestamp(about.buildTime)}` : "Build date unavailable"}</p>
+        </>
+      ) : <p>Build information is unavailable.</p>}
+    </div>
+  );
+}
+
 function ProfileMenu({ adminMode, session }: Readonly<{
   adminMode: boolean;
   session: Extract<SessionState, { status: "authenticated" }>;
@@ -221,6 +241,7 @@ function ProfileMenu({ adminMode, session }: Readonly<{
   const [selectedTheme, setSelectedTheme] = useState<BrowserTheme>("system");
   const [logoutFailed, setLogoutFailed] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [about, setAbout] = useState<AboutResponse | null | undefined>(undefined);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const displayEmail = session.value.principal.displayEmail;
   const verifiedDisplayName = session.value.principal.displayName?.trim();
@@ -239,6 +260,16 @@ function ProfileMenu({ adminMode, session }: Readonly<{
     });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (!open || about !== undefined) return;
+    let active = true;
+    void getAbout({ cache: "no-store", credentials: "same-origin" }).then((result) => {
+      if (!active) return;
+      setAbout(result.data && result.response?.ok ? result.data : null);
+    });
+    return () => { active = false; };
+  }, [about, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -305,6 +336,7 @@ function ProfileMenu({ adminMode, session }: Readonly<{
             </div>
           </div>
           <Link className="block rounded-control px-2 py-1.5 text-[13px] font-medium text-ink hover:bg-line-soft" href={adminMode ? "/admin/settings" : "/settings"} onClick={() => setOpen(false)}>Account settings</Link>
+          {about !== undefined ? <BuildInfoBlock about={about} /> : <p className="px-2 text-xs text-muted-ink" role="status">Loading build information…</p>}
           <button className="w-full rounded-control px-2 py-1.5 text-left text-[13px] font-semibold text-err hover:bg-err-soft disabled:cursor-wait disabled:opacity-60" disabled={loggingOut} onClick={() => void logout()} type="button">
             {loggingOut ? "Logging out…" : "Log out"}
           </button>
@@ -346,10 +378,10 @@ function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsActio
   const navigation = adminMode ? adminNavigation.filter((item) => !adminGuideDismissed || item.href !== "/admin/get-started") : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
   return (
     <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
-      <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
+      <Link aria-label={`${brandName} home`} className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img alt="HyperShell" className="size-8 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
-        <span className="text-[17px] font-semibold tracking-[-0.02em]">HyperShell</span>
+        <img alt={brandName} className="size-8 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
+        <span className="text-[17px] font-semibold tracking-[-0.02em]">{brandName}</span>
       </Link>
       <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-faint-ink">{adminMode ? "Admin workspace" : "User workspace"}</p>
       <nav aria-label="Primary navigation" className="space-y-0.5">
@@ -503,8 +535,8 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
         <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
         {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminGuideDismissed={adminGuideDismissed} adminMode={adminMode} needsAction={needsAction} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
-        {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label="HyperShell home" className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
-        <img alt="HyperShell" className="size-7 rounded-control bg-white object-cover" height="28" src="/brand/logo" width="28" /><span className="text-base font-semibold">HyperShell</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
+        {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label={`${brandName} home`} className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
+        <img alt={brandName} className="size-7 rounded-control bg-white object-cover" height="28" src="/brand/logo" width="28" /><span className="text-base font-semibold">{brandName}</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
         {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminGuideDismissed={adminGuideDismissed} adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">

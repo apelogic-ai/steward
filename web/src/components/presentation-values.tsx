@@ -102,6 +102,13 @@ export function formatDuration(value: string, source: "wire" | "minutes" = "wire
   return displayUnit ? formatSecondsInUnit(seconds, displayUnit) : formatSeconds(seconds);
 }
 
+/** Formats an RFC 3339 instant as `YYYY-MM-DD HH:MM:SS UTC`; a value that is not a date is returned as given. */
+export function formatUtcTimestamp(value: string): string {
+  const instant = new Date(value);
+  if (Number.isNaN(instant.getTime())) return value;
+  return `${instant.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
 export function formatCount(value: number, noun: string, plural = `${noun}s`): string {
   return `${value} ${value === 1 ? noun : plural}`;
 }

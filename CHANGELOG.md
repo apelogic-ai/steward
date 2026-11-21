@@ -7,6 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- The account menu (your name in the lower-left corner) now shows the product
+  name, copyright holder, version with release commit, and build date of the
+  running installation, between **Account settings** and **Log out** (#698).
+  The values come from the new `GET /admin/api/v1/about` endpoint, which any
+  signed-in browser session may read: `version` is the apiserver's version,
+  `releaseCommit` is the git commit the release image was built from, and
+  `buildTime` is an RFC 3339 UTC timestamp. The release image build records
+  the commit through the `RELEASE_COMMIT` build argument of
+  `build/package.Dockerfile` and the build time automatically; a build that
+  passes no commit reports `dev`, and a build outside that Dockerfile reports
+  no build time, which the menu shows as "Build date unavailable". Because the
+  build time is embedded, two image builds of the same commit no longer produce
+  identical binaries or digests. The release workflow does not pass
+  `RELEASE_COMMIT` yet, so released images show `dev` until it does (#699).
+  No migration, CRD or chart change.
+
 ## [0.3.36] - 2026-11-20
 
 Steward v0.3.36 lets tenant administrators cancel any unfinished run and records who asked to

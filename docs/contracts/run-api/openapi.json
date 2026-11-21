@@ -10,6 +10,37 @@
     "version": "0.3.36"
   },
   "paths": {
+    "/admin/api/v1/about": {
+      "get": {
+        "tags": [
+          "browser_auth"
+        ],
+        "operationId": "getAbout",
+        "responses": {
+          "200": {
+            "description": "Version, release commit, and build time of the running apiserver",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AboutResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Opaque browser session is missing, invalid, or expired"
+          },
+          "503": {
+            "description": "Browser session registry is unavailable"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/admin/api/v1/all-runs": {
       "get": {
         "tags": [
@@ -6716,6 +6747,31 @@
   },
   "components": {
     "schemas": {
+      "AboutResponse": {
+        "type": "object",
+        "required": [
+          "version",
+          "releaseCommit",
+          "buildTime"
+        ],
+        "properties": {
+          "buildTime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the binary was built, as an RFC 3339 UTC timestamp; null when the build did not record it."
+          },
+          "releaseCommit": {
+            "type": "string",
+            "description": "Git commit the release was built from, or `dev` for a build that did not record one."
+          },
+          "version": {
+            "type": "string",
+            "description": "Version of the running apiserver."
+          }
+        }
+      },
       "AdminRequestDecision": {
         "type": "object",
         "properties": {
